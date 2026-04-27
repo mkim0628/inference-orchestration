@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(schedule)",
+      "Skill(schedule:*)",
+      "Bash(gh repo *)",
+      "PowerShell(gh repo create mkim0628/kvcache-reuse-algorithm --public --description \"Non-Contiguous KV Cache Reuse Research Harness\" 2>&1)"
+    ]
+  }
+}

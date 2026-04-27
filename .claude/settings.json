@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch(*)",
+      "WebFetch(*)",
+      "Read(**)",
+      "Write(reports/**)",
+      "Write(Spec.md)",
+      "Write(IMPL_NOTES.md)",
+      "Write(src/**)",
+      "Write(tests/**)",
+      "Write(configs/experiments/**)",
+      "Bash(python *)",
+      "Bash(pytest *)"
+    ]
+  }
+}
