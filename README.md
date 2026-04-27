@@ -1,12 +1,35 @@
-# Non-Contiguous KV Cache Reuse
+# Orchestrating Non-Contiguous KV Cache Reuse with Accuracy-Preserving KV Cache Compression
 
-> **Autonomous research harness** that discovers, proposes, implements, and validates novel non-contiguous KV cache reuse algorithms — and ports the best ones to production-grade [vLLM](https://github.com/vllm-project/vllm).
+> **Autonomous research harness** that continuously discovers, proposes, implements, and validates novel KV cache optimization techniques — and ports the best ones to production-grade [vLLM](https://github.com/vllm-project/vllm).
 
 ---
 
-## What This Project Does
+## Research Goal
 
-Standard KV caches only reuse computation when prompt prefixes are **byte-identical**. This project researches and implements techniques that allow **non-contiguous** cache segments to be reused — so even prompts that share fragments at arbitrary positions can benefit from caching.
+Efficiently reuse and compress KV Caches to simultaneously increase **inference throughput** and **memory efficiency**, enabling long-context processing and long-term memory support within limited GPU memory budgets.
+
+| Goal Metric | Target |
+|-------------|--------|
+| Inference Throughput | +20% vs baseline |
+| KV Cache Memory Reduction | −30% vs baseline |
+| Non-Contiguous Cache Hit Rate | ≥30% of hits from non-contiguous segments |
+| Effective Context Length | 2× at same memory budget |
+| Compression Accuracy Delta | ±1% perplexity / task accuracy |
+| Scheduling Overhead | TTFT p50 +5% max |
+
+## Three Research Activities
+
+| Activity | Focus | Key Question |
+|----------|-------|-------------|
+| **A** | KV Cache-aware Scheduling / Orchestration | How to batch and order requests to maximize cache reuse? |
+| **B** | Non-Contiguous KV Cache Reuse | Can we reuse KV segments at arbitrary positions, not just shared prefixes? |
+| **C** | KV Cache Compression | How small can we make the KV cache while preserving accuracy? |
+
+Each daily cycle, the pipeline selects the highest-priority activity or combination (A+B, B+C, A+B+C) and implements it end-to-end.
+
+---
+
+## Daily Pipeline
 
 Every day, an autonomous multi-agent pipeline runs end-to-end:
 

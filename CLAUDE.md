@@ -1,10 +1,38 @@
-# Non-Contiguous KV Cache Reuse — Research Harness
+# Orchestrating Non-Contiguous KV Cache Reuse with Accuracy-Preserving KV Cache Compression
 
-## 프로젝트 목표
+## 연구 제목
 
-비연속(non-contiguous) KV 캐시 재사용률을 높이는 기법을 실험하고 측정한다.
-LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시를 재활용할 수 있는
-구조(세그먼트 해시, 트리 어텐션, 청크 캐싱 등)를 비교·평가한다.
+**Orchestrating Non-Contiguous KV Cache Reuse with Accuracy-Preserving KV Cache Compression**
+
+## 연구 목표
+
+KV Cache를 효율적으로 재사용하고 정확도를 보존하면서 압축함으로써,
+LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높인다.
+이를 통해 제한된 GPU 메모리 예산 안에서 더 긴 컨텍스트와 장기 기억(long-term memory)을 지원한다.
+
+### 목표 지표 (Goal Metrics)
+
+| 지표 | 설명 | 목표 방향 |
+|------|------|----------|
+| **Inference Throughput** | 초당 생성 토큰 수 (tokens/sec) | ↑ 베이스라인 대비 +20% 이상 |
+| **KV Cache Memory Reduction** | KV 캐시 메모리 점유율 감소 | ↓ 베이스라인 대비 −30% 이상 |
+| **Non-Contiguous Cache Hit Rate** | 비연속 세그먼트에서 발생한 히트 비율 | ↑ 전체 히트의 30% 이상 |
+| **Effective Context Length** | 동일 메모리 예산에서 지원 가능한 최대 컨텍스트 길이 | ↑ 2× 이상 |
+| **Compression Accuracy Delta** | 압축 전후 perplexity / 태스크 정확도 변화량 | ↔ ±1% 이내 |
+| **Scheduling Overhead** | 캐시 인식 스케줄링이 추가하는 지연 | ↓ TTFT p50 +5% 이내 |
+| **Cache Eviction Rate** | 불필요한 캐시 퇴거 비율 | ↓ 최소화 |
+
+### 세 가지 연구 활동 (Research Activities)
+
+본 연구는 세 개의 독립적이지만 상호 보완적인 활동으로 구성된다.
+
+| Activity | 이름 | 핵심 질문 |
+|----------|------|----------|
+| **A** | KV Cache-aware Scheduling / Orchestration | 어떤 요청을 어떤 순서로 배치해야 캐시 재사용률이 극대화되는가? |
+| **B** | Non-Contiguous KV Cache Reuse Algorithm | 접두사가 불일치해도 임의 위치의 KV 세그먼트를 재사용할 수 있는가? |
+| **C** | KV Cache Compression | 정확도 손실 없이 KV 캐시를 얼마나 작게 만들 수 있는가? |
+
+각 사이클에서 planner는 세 활동 중 우선순위가 높은 하나 또는 조합을 선택해 Spec.md를 작성한다.
 
 ---
 
@@ -153,7 +181,12 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 
 ## 핵심 개념
 
-### 비연속 KV 캐시 재사용이란?
+### Activity A — KV Cache-aware Scheduling / Orchestration
+
+요청 스케줄러가 캐시 상태를 인식하고, 캐시 히트율을 높이는 방향으로 배치 순서와 우선순위를 결정한다.
+관련 기법: prefix-aware batching, cache-locality-first scheduling, request reordering.
+
+### Activity B — Non-Contiguous KV Cache Reuse Algorithm
 
 표준 KV 캐시는 요청 간 **공통 접두사**가 byte-identical할 때만 재사용된다.
 비연속 재사용은 프롬프트 내 임의 위치의 세그먼트를 독립적으로 캐싱해
@@ -165,13 +198,22 @@ LLM 추론 시 프롬프트 접두사가 완전히 일치하지 않아도 캐시
 | Radix Attention | 공유 접두사를 Radix 트리로 관리 | `src/cache/radix.py` |
 | Chunk-level Reuse | 가변 길이 청크 + LRU 퇴거 | `src/cache/segmented.py` |
 
-### 측정 지표
+### Activity C — KV Cache Compression
 
-- **Cache Hit Rate** : 히트된 KV 토큰 수 / 전체 입력 토큰 수
-- **TTFT (Time-To-First-Token)** : 첫 토큰 생성까지 지연
-- **TBT (Time-Between-Tokens)** : 토큰 간 평균 지연
-- **KV Memory Footprint** : 캐시가 점유하는 GPU 메모리 (GB)
-- **Reuse Efficiency** : 절약된 FLOPs / 전체 어텐션 FLOPs
+KV 캐시의 물리적 크기를 줄여 동일 메모리에 더 많은 컨텍스트를 담는다.
+**정확도 보존(accuracy-preserving)**이 핵심 제약이다.
+관련 기법: quantization (INT8/FP8), token eviction (H2O, SnapKV, StreamingLLM),
+low-rank approximation, CacheBlend, positional-independent caching.
+
+### 측정 지표 요약
+
+- **Inference Throughput** : tokens/sec (핵심 목표)
+- **KV Memory Reduction** : 베이스라인 대비 메모리 감소율
+- **Cache Hit Rate** : 히트된 KV 토큰 / 전체 입력 토큰
+- **Compression Accuracy Delta** : perplexity / 태스크 정확도 변화 (±1% 이내)
+- **Effective Context Length** : 동일 메모리 예산에서 지원 가능한 최대 길이
+- **TTFT p50 / p99** : 첫 토큰 생성 지연
+- **Scheduling Overhead** : 스케줄러 추가 지연
 
 ---
 
