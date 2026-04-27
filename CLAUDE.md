@@ -28,7 +28,7 @@ LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높
 
 | Activity | 이름 | 핵심 질문 |
 |----------|------|----------|
-| **A** | KV Cache-aware Scheduling / Orchestration | 어떤 요청을 어떤 순서로 배치해야 캐시 재사용률이 극대화되는가? |
+| **A** | KV Cache-aware Scheduling / Orchestration | 어떤 요청을 어떤 순서로 배치해야 캐시 재사용률이 극대화되는가? (단일 노드 + 멀티 노드 포함) |
 | **B** | Non-Contiguous KV Cache Reuse Algorithm | 접두사가 불일치해도 임의 위치의 KV 세그먼트를 재사용할 수 있는가? |
 | **C** | KV Cache Compression | 정확도 손실 없이 KV 캐시를 얼마나 작게 만들 수 있는가? |
 
@@ -79,6 +79,7 @@ LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높
 | 5. 평가 | `.claude/agents/evaluator.md` | 구현 결과 + `evaluation_criteria.md` | 피드백 or **Report ①** |
 | 6. vLLM 이식 | `.claude/agents/vllm-porter.md` | Report ① + `src/cache/` + vLLM latest | `vllm_integration/` |
 | 7. vLLM 평가 | `.claude/agents/vllm-evaluator.md` | `vllm_integration/` + vLLM latest | 피드백 or **Report ②** |
+| 8. 누적 요약 | `.claude/agents/summarizer.md` | Report ①② + 과거 `SUMMARY.md` | `reports/summary/` 갱신 |
 
 ### 최종 산출물
 
@@ -184,7 +185,9 @@ LLM 추론의 **처리량(throughput)**과 **메모리 효율**을 동시에 높
 ### Activity A — KV Cache-aware Scheduling / Orchestration
 
 요청 스케줄러가 캐시 상태를 인식하고, 캐시 히트율을 높이는 방향으로 배치 순서와 우선순위를 결정한다.
-관련 기법: prefix-aware batching, cache-locality-first scheduling, request reordering.
+**단일 노드**와 **멀티 노드(Disaggregated Prefill, P/D 분리)** 환경을 모두 고려한다.
+관련 기법: prefix-aware batching, cache-locality-first scheduling, request reordering,
+multi-node KV migration routing, network-aware cache placement (InfiniBand/NVLink/RDMA).
 
 ### Activity B — Non-Contiguous KV Cache Reuse Algorithm
 

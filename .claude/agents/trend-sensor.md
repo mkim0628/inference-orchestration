@@ -30,6 +30,12 @@ vLLM/SGLang/TensorRT-LLM 릴리즈 노트, tech blog (Lmsys, Together AI, Anysca
 - "disaggregated prefill" KV cache
 - "preemption" KV cache eviction scheduling
 - "SplitWise" OR "DistServe" OR "Sarathi" serving system
+- "Mooncake" OR "DistKV" disaggregated KV cache
+- "multi-node KV cache" OR "distributed KV cache" LLM
+- "KV cache migration" multi-node inference
+- "KV transfer" prefill decode disaggregation
+- "network-aware" KV cache scheduling InfiniBand OR NVLink OR RDMA
+- "P/D disaggregation" KV routing
 - vLLM scheduler KV cache site:github.com OR site:arxiv.org
 
 ---
@@ -101,6 +107,8 @@ vLLM/SGLang/TensorRT-LLM 릴리즈 노트, tech blog (Lmsys, Together AI, Anysca
 |------|---------|------------|
 | Prefix-aware batching | ... | ... |
 | Cache-locality scheduling | ... | ... |
+| Multi-node KV routing | ... | ... |
+| Disaggregated prefill | ... | ... |
 
 ---
 

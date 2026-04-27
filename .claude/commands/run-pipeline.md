@@ -75,12 +75,24 @@
 
 ---
 
+### 8단계 — 누적 요약 갱신
+
+7단계 완료 후(또는 2단계에서 SIGNIFICANT_CHANGE: false로 중단된 경우에도) 실행한다.
+
+`summarizer` 에이전트를 호출한다.
+
+- 출력: `reports/summary/SUMMARY.md` (갱신)
+- 출력: `reports/summary/YYYY-MM-DD-delta.md` (신규)
+- "SUMMARY_UPDATED" 확인 후 최종 커밋 진행
+
+---
+
 ### 완료 — 결과물 커밋 & Push
 
 모든 단계 완료 후 변경 파일을 커밋한다:
 
 ```bash
-git add reports/ Spec.md vllm_integration/ src/ tests/ configs/
+git add reports/ Spec.md vllm_integration/ src/ tests/ configs/ 
 git commit -m "Daily pipeline YYYY-MM-DD"
 git push origin main
 ```
@@ -94,6 +106,8 @@ git push origin main
 스펙:           Spec.md
 Report ①:      reports/evaluations/YYYY-MM-DD.md
 Report ②:      reports/vllm-evaluations/YYYY-MM-DD.md
+누적 요약:      reports/summary/SUMMARY.md
+사이클 델타:    reports/summary/YYYY-MM-DD-delta.md
 구현-평가 루프:  N회
 vLLM 이식 루프:  M회
 vLLM 버전:      X.Y.Z
