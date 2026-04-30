@@ -1,0 +1,29 @@
+experiment:
+  date: "2026-04-29"
+  activity: "A+B+C"
+  description: "Cache-aware scheduler + chunk importance eviction + Hadamard INT4"
+
+cache:
+  type: "compressed_segment"
+  chunk_size: 128
+  max_entries: 1000
+
+compression:
+  codec: "hadamard_int4"
+  num_layers: 12
+  cutoff_ratio: 0.2
+
+scheduler:
+  type: "cache_aware"
+  fairness_max_wait: 10
+  enabled: true
+
+runner:
+  num_layers: 12
+  hidden_dim: 64
+  chunk_size: 128
+  seed: 42
+
+baseline:
+  cache_type: "contiguous"
+  scheduler: "none"

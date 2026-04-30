@@ -54,7 +54,10 @@ except ImportError:  # pragma: no cover
     _VLLM_AVAILABLE = False
     AttentionImpl = object  # type: ignore[assignment, misc]
 
-from vllm_integration.compression_codec import CompressionCodec
+from vllm_integration.compression_codec import CompressionCodec, HadamardInt4Codec
+
+# Type alias accepted by CompressedKVHook
+_AnyCodec = "CompressionCodec | HadamardInt4Codec"
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +81,7 @@ class CompressedKVHook:
 
     def __init__(
         self,
-        codec: CompressionCodec,
+        codec: "CompressionCodec | HadamardInt4Codec",
         tensor_id_k: int = 0,
         tensor_id_v: int = 1,
     ) -> None:

@@ -1,7 +1,7 @@
 import hashlib
 import struct
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple  # noqa: F401
 import torch
 
 from src.cache.base import CacheStore
@@ -21,6 +21,7 @@ class SegmentedHashCache(CacheStore):
         self._hits = 0
         self._misses = 0
         self._noncontiguous_hits = 0
+        self._importance: Dict[str, float] = {}  # chunk importance scores
 
     # ------------------------------------------------------------------ #
     # CacheStore interface                                                 #
@@ -43,10 +44,22 @@ class SegmentedHashCache(CacheStore):
         self._misses += 1
         return None
 
+    def record_attention_score(self, key: str, score: float) -> None:
+        """Accumulate attention score for a cached chunk (importance signal)."""
+        self._importance[key] = self._importance.get(key, 0.0) + score
+
     def evict(self) -> int:
+        """Evict least-important entry; falls back to LRU when scores absent."""
         if not self._store:
             return 0
-        _, evicted = self._store.popitem(last=False)
+        candidates = list(self._store.keys())
+        scored = [k for k in candidates if k in self._importance]
+        if scored:
+            evict_key = min(scored, key=lambda k: self._importance[k])
+        else:
+            evict_key = candidates[0]  # LRU fallback: first in OrderedDict
+        evicted = self._store.pop(evict_key)
+        self._importance.pop(evict_key, None)
         return evicted.nbytes
 
     def hit_rate(self) -> float:
@@ -60,6 +73,7 @@ class SegmentedHashCache(CacheStore):
         self._hits = 0
         self._misses = 0
         self._noncontiguous_hits = 0
+        self._importance.clear()
 
     # ------------------------------------------------------------------ #
     # Segment-level API                                                    #

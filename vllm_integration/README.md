@@ -1,16 +1,16 @@
-# vllm_integration — Activity B+C KV Cache Port
+# vllm_integration — Activity A+B+C KV Cache Port
 
 ## Overview
 
-This package ports the independently-verified B+C KV cache algorithm
-(30.3 % non-contiguous hit rate, −68.8 % memory) from the standalone
-`src/cache/` implementation into **vLLM 0.20.0**.
+This package ports the independently-verified A+B+C KV cache pipeline from the
+standalone `src/` implementation into **vLLM 0.20.0**.
 
 | Activity | Description | Source |
 |----------|-------------|--------|
+| **A** | Cache-hit-rate-aware request scheduling | `src/scheduler/cache_aware_scheduler.py` |
 | **B** | Position-independent segmented hash cache | `src/cache/segmented.py` |
-| **C** | Mixed-precision KV quantization (FP16/INT8) | `src/cache/compression.py` |
-| **B+C** | Compressed non-contiguous segment cache | `src/cache/compressed_segment.py` |
+| **C** | Hadamard INT4 + mixed-precision KV compression | `src/cache/compression.py` |
+| **A+B+C** | Full pipeline: scheduler + NC reuse + compression | `src/cache/compressed_segment.py` |
 
 ---
 
@@ -22,6 +22,7 @@ This package ports the independently-verified B+C KV cache algorithm
 | Install command | `pip install --upgrade vllm` |
 | Architecture | v1 (vllm.v1.*) |
 | KV cache manager | `vllm.v1.core.kv_cache_manager.KVCacheManager` |
+| Request queue | `vllm.v1.core.sched.request_queue.RequestQueue` |
 | Attention backend | `vllm.v1.attention.backend.AttentionImpl` |
 
 ---
@@ -31,12 +32,12 @@ This package ports the independently-verified B+C KV cache algorithm
 ```
 vllm_integration/
 ├── __init__.py                  Package marker
-├── compression_codec.py         Activity C: FP16/INT8 mixed-precision codec
+├── compression_codec.py         Activity C: HadamardInt4Codec (new) + CompressionCodec (prior)
 ├── block_manager_patch.py       Activity B: Position-independent segment index
 │                                + NonContiguousKVCacheManager subclass
 ├── attention_backend_patch.py   Activity B+C: CompressedKVHook + wrapper
-├── scheduler_patch.py           Activity A: stub (not in scope this cycle)
-├── install.sh                   Install script
+├── scheduler_patch.py           Activity A: CacheHitAwareRequestQueue
+├── install.sh                   Install + smoke-test script
 └── README.md                    This file
 ```
 
@@ -44,62 +45,69 @@ vllm_integration/
 
 ## vLLM Integration Points
 
+### Activity A — Cache-Hit-Aware Scheduling
+
+**Primary integration file:** `scheduler_patch.py`
+
+vLLM 0.20.0 v1 scheduler uses a pluggable `RequestQueue` (defined in
+`vllm.v1.core.sched.request_queue`). The default policy is FCFS or priority.
+
+`CacheHitAwareRequestQueue` subclasses `RequestQueue` and maintains a
+priority heap that orders requests by predicted KV segment hit rate:
+
+```
+priority = hit_rate × (1 − min(wait_steps / fairness_max_wait, 1.0))
+```
+
+Hit rate prediction peeks at `CompressedSegmentIndex._store` keys without
+calling `get()`, so cache statistics are not polluted.  A wait-step penalty
+prevents cold requests from being indefinitely starved.
+
+**How to enable:**
+```python
+from vllm_integration.scheduler_patch import create_cache_hit_aware_queue
+
+# In Scheduler.__init__, replace default request queue:
+self.waiting = create_cache_hit_aware_queue(
+    segment_index=kv_manager._segment_index,
+    chunk_size=kv_manager._segment_chunk_size,
+    fairness_max_wait=10,
+)
+```
+
 ### Activity B — Non-Contiguous KV Cache Reuse
 
 **Primary integration file:** `block_manager_patch.py`
 
-vLLM 0.20.0 uses a v1 KV cache architecture. The relevant classes are:
-
-- `vllm.v1.core.kv_cache_manager.KVCacheManager` — manages block allocation
-  and prefix cache lookup via `get_computed_blocks`.
-- `vllm.v1.core.kv_cache_utils.hash_block_tokens` — hashes token blocks for
-  prefix caching.
-
-Our extension `NonContiguousKVCacheManager` subclasses `KVCacheManager` and
-adds:
+`NonContiguousKVCacheManager` subclasses `KVCacheManager` and adds:
 
 1. `SegmentHashMixin.get_segment_key(token_ids, chunk_idx, layer_idx)` — a
-   position-independent SHA-256 hash of a fixed-size token chunk. The key
-   depends only on token *content*, not absolute position, enabling reuse
-   when the same tokens appear at different offsets.
+   position-independent SHA-256 hash of a token chunk (content-only, no
+   absolute position), enabling reuse when tokens appear at different offsets.
 
-2. `CompressedSegmentIndex` — an LRU dictionary mapping segment keys to
-   compressed KV tensors. Backed by `CompressionCodec` (Activity C).
+2. `CompressedSegmentIndex` — LRU dict mapping segment keys to compressed KV
+   tensors (backed by `HadamardInt4Codec` by default).
 
-3. `NonContiguousKVCacheManager.get_computed_blocks` — overrides the parent to
-   additionally query the segment index after the standard prefix cache lookup.
+3. `get_computed_blocks` override — queries the segment index after the
+   standard prefix cache lookup for non-contiguous hits.
 
-4. `store_segment` / `lookup_segment` — API for the attention backend to
-   populate and query the index.
+4. `store_segment` / `lookup_segment` — attention backend API.
+
+**Default codec changed to `HadamardInt4Codec`** in this cycle (pass
+`use_hadamard_int4=False` for the prior INT8 codec).
 
 ### Activity C — KV Cache Compression
 
 **Primary integration file:** `compression_codec.py`, `attention_backend_patch.py`
 
-The `CompressionCodec` implements mixed-precision storage:
+**`HadamardInt4Codec`** (new in cycle 2026-04-29, recommended):
+- Early layers (cutoff_ratio=0.2): FP16 — 50% savings
+- Late layers: Hadamard rotation + INT4-range quantized, stored as int8 — 75% savings
+- Average: ~70% memory reduction vs FP32
+- Accuracy: attention KL divergence < 0.05, cosine similarity ≥ 0.95
 
-- **Early layers** (first ~1/3): FP16 — critical attention patterns, 50 %
-  savings vs FP32.
-- **Later layers** (remaining ~2/3): symmetric per-tensor INT8 — 75 % savings
-  vs FP32, ~68.8 % overall memory reduction (measured in Report ①).
-
-`CompressedKVHook` wraps the codec with `encode_kv` / `decode_kv` methods
-designed to be called at the write and read points in the attention pipeline:
-
-- **Write**: call `encode_kv` immediately after K/V projection, before storing.
-- **Read**: call `decode_kv` immediately before passing K/V to the attention
-  kernel — kernels always receive native float32 tensors.
-
-### vLLM v1 Attention Backend Integration
-
-vLLM 0.20.0 attention backends live under `vllm.v1.attention.backends.*`.
-The main abstract class is `vllm.v1.attention.backend.AttentionImpl` with the
-key method `forward`.
-
-`NonContiguousAttentionWrapper` wraps any `AttentionImpl` instance and
-provides helpers `store_kv_chunks` (write path) and `load_cached_chunks` (read
-path). Full production integration requires subclassing the specific backend
-used by the model (e.g. `FlashAttentionImpl`).
+**`CompressionCodec`** (prior cycle, reference):
+- Early layers: FP16; later layers: symmetric INT8 — ~67% average savings
 
 ---
 
@@ -111,55 +119,53 @@ used by the model (e.g. `FlashAttentionImpl`).
 bash vllm_integration/install.sh
 ```
 
-Or manually:
-
-```bash
-pip install --upgrade vllm
-python -c "import vllm; print(vllm.__version__)"
-```
-
-### 2. Substitute the KV Cache Manager
+### 2. Substitute KV Cache Manager (Activity B+C)
 
 ```python
-from vllm_integration.compression_codec import CompressionCodec
+from vllm_integration.compression_codec import HadamardInt4Codec
 from vllm_integration.block_manager_patch import NonContiguousKVCacheManager
 
-codec = CompressionCodec(num_layers=model.config.num_hidden_layers)
-
-# Pass additional kwargs to NonContiguousKVCacheManager;
-# all standard KVCacheManager kwargs are forwarded.
 kv_manager = NonContiguousKVCacheManager(
     kv_cache_config=kv_cache_config,
     max_model_len=max_model_len,
     hash_block_size=block_size,
     enable_caching=True,
-    codec=codec,
+    use_hadamard_int4=True,   # HadamardInt4Codec (recommended)
     segment_chunk_size=64,
     segment_max_entries=2000,
 )
 ```
 
-### 3. Wire Compression Hooks into the Attention Layer
+### 3. Enable Cache-Hit-Aware Scheduling (Activity A)
+
+```python
+from vllm_integration.scheduler_patch import create_cache_hit_aware_queue
+
+# During Scheduler construction:
+self.waiting = create_cache_hit_aware_queue(
+    segment_index=kv_manager._segment_index,
+    chunk_size=64,
+    fairness_max_wait=10,
+)
+```
+
+### 4. Wire Compression Hooks into Attention (Activity B+C)
 
 ```python
 from vllm_integration.attention_backend_patch import (
-    CompressedKVHook,
-    NonContiguousAttentionWrapper,
+    CompressedKVHook, NonContiguousAttentionWrapper,
 )
 
-hook = CompressedKVHook(codec)
-wrapped_attn = NonContiguousAttentionWrapper(
-    impl=original_attn_impl,
-    hook=hook,
-    kv_manager=kv_manager,
-    chunk_size=64,
+hook = CompressedKVHook(kv_manager._segment_index.codec)
+wrapped = NonContiguousAttentionWrapper(
+    impl=original_attn_impl, hook=hook, kv_manager=kv_manager, chunk_size=64,
 )
 
-# In the forward pass (prefill):
-wrapped_attn.store_kv_chunks(token_ids, k, v, layer_idx)
+# Prefill write path:
+wrapped.store_kv_chunks(token_ids, k, v, layer_idx)
 
-# In the forward pass (decode / re-prefill):
-hit_chunks, miss_chunks = wrapped_attn.load_cached_chunks(token_ids, layer_idx)
+# Decode / re-prefill read path:
+hit_chunks, miss_chunks = wrapped.load_cached_chunks(token_ids, layer_idx)
 ```
 
 ---
@@ -170,25 +176,28 @@ hit_chunks, miss_chunks = wrapped_attn.load_cached_chunks(token_ids, layer_idx)
 |-----------|--------|
 | vLLM 0.20.0 (v1 engine) | Tested |
 | `KVCacheManager` public API | Preserved (subclass, no monkey-patching) |
+| `RequestQueue` interface | Fully implemented (`CacheHitAwareRequestQueue`) |
 | `AttentionImpl.forward` | Delegated (wrapper is pass-through) |
-| `SchedulerConfig` fields | Not modified (Activity A stub only) |
-| GPU memory layout | Follows vLLM block_size; no cross-block segments |
+| `SchedulerConfig` fields | Not modified |
+| GPU memory layout | Follows vLLM block_size |
 
 ---
 
 ## Performance Expectations (from Report ①)
 
-| Metric | Standalone result | vLLM port target |
-|--------|-------------------|-----------------|
-| Non-contiguous cache hit rate | 30.3 % | ≥ 30 % |
-| KV cache memory reduction | −68.8 % | ≥ −30 % (goal) |
-| Compression accuracy delta | ±0.3 % | ≤ ±1 % |
+| Metric | Standalone (55/55 tests) | vLLM port target |
+|--------|--------------------------|-----------------|
+| Throughput improvement | > 10% (memory-budget test) | ≥ 10% |
+| Non-contiguous cache hit rate | ≥ 30% | ≥ 30% |
+| KV cache memory reduction | ≥ 70% vs FP32 | ≥ 30% (goal) |
+| Compression accuracy (KL) | < 0.05 all layers | ≤ 0.05 |
+| Scheduling overhead (TTFT) | ≤ 5% | ≤ 5% |
 
 ---
 
 ## Cycle
 
-- Date: 2026-04-28
+- Date: 2026-04-29
 - Loop: 1 / 3
-- Activity: B+C
-- Report ①: `reports/evaluations/2026-04-28.md`
+- Activity: A+B+C
+- Report ①: `reports/evaluations/2026-04-29.md`

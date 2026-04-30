@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
     _VLLM_AVAILABLE = False
     KVCacheManager = object  # type: ignore[assignment, misc]
 
-from vllm_integration.compression_codec import CompressionCodec
+from vllm_integration.compression_codec import CompressionCodec, HadamardInt4Codec
 
 
 # --------------------------------------------------------------------------- #
@@ -226,13 +226,16 @@ class NonContiguousKVCacheManager(SegmentHashMixin, KVCacheManager):  # type: ig
         codec: Optional[CompressionCodec] = None,
         segment_chunk_size: int = 64,
         segment_max_entries: int = 2000,
+        use_hadamard_int4: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         if codec is None:
-            # Default: assume 32 layers if we cannot introspect
             num_layers = getattr(self, "_num_layers", 32)
-            codec = CompressionCodec(num_layers=num_layers)
+            if use_hadamard_int4:
+                codec = HadamardInt4Codec(num_layers=num_layers, cutoff_ratio=0.2)
+            else:
+                codec = CompressionCodec(num_layers=num_layers)
         self._segment_index = CompressedSegmentIndex(
             codec=codec,
             max_entries=segment_max_entries,

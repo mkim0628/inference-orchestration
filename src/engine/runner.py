@@ -17,6 +17,14 @@ from src.metrics.hit_rate import HitRateMetrics
 from src.metrics.latency import LatencyMetrics
 from src.metrics.memory import MemoryMetrics
 
+# Late import to avoid circular dependency; TYPE_CHECKING guard not needed
+# because we only reference the type in a string annotation / Optional check.
+_SCHEDULER_TYPE = None
+try:
+    from src.scheduler.cache_aware_scheduler import CacheAwareScheduler as _SCHEDULER_TYPE  # type: ignore[assignment]
+except ImportError:
+    pass
+
 
 @dataclass
 class InferenceRequest:
@@ -59,11 +67,13 @@ class InferenceRunner:
         hidden_dim: int = 64,
         chunk_size: int = 128,
         seed: int = 42,
+        scheduler: Optional[object] = None,
     ) -> None:
         self.cache = cache
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.chunk_size = chunk_size
+        self.scheduler = scheduler  # Optional[CacheAwareScheduler]
         random.seed(seed)
         torch.manual_seed(seed)
 
@@ -143,6 +153,8 @@ class InferenceRunner:
         )
 
     def run_batch(self, requests: List[InferenceRequest]) -> List[InferenceResult]:
+        if self.scheduler is not None:
+            requests = self.scheduler.schedule(requests)
         return [self.run(r) for r in requests]
 
     def metrics_summary(self) -> dict:

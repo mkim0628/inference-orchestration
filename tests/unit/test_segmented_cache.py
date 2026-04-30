@@ -93,3 +93,48 @@ def test_reset_stats(cache: SegmentedHashCache) -> None:
     cache.get_segments(token_ids)
     cache.reset_stats()
     assert cache.hit_rate() == 0.0
+
+
+def test_importance_based_eviction() -> None:
+    """Lower-importance chunks should be evicted before higher-importance ones."""
+    cache = SegmentedHashCache(chunk_size=4, max_entries=3)
+    kv = torch.randn(4, 8)
+
+    # Add three chunks
+    for i in range(3):
+        tokens = _token_ids(4, start=i * 4)
+        cache.put_segment(tokens, 0, kv)
+        # Record attention score: chunk 0 gets highest, chunk 2 gets lowest
+        key = cache.chunk_key(tokens, 0, 0)
+        cache.record_attention_score(key, float(3 - i))  # 3, 2, 1
+
+    # Cache is full (max_entries=3); adding a new entry should evict the
+    # least-important chunk (the one with score=1, i.e. i=2).
+    keys_before = set(cache._store.keys())
+    # Determine which key has score=1 (i=2 chunk)
+    tokens_low = _token_ids(4, start=8)
+    low_key = cache.chunk_key(tokens_low, 0, 0)
+    assert low_key in cache._store, "Low-importance chunk should be present before eviction"
+
+    # Trigger eviction directly
+    bytes_freed = cache.evict()
+    assert bytes_freed > 0, "evict() should free bytes"
+    assert low_key not in cache._store, (
+        "Least-important chunk (score=1) should have been evicted"
+    )
+    assert len(cache._store) == 2
+
+
+def test_lru_fallback_without_importance() -> None:
+    """When no importance scores exist, LRU (oldest) entry should be evicted."""
+    cache = SegmentedHashCache(chunk_size=4, max_entries=3)
+    kv = torch.randn(4, 8)
+    keys_ordered = []
+    for i in range(3):
+        tokens = _token_ids(4, start=i * 4)
+        cache.put_segment(tokens, 0, kv)
+        keys_ordered.append(cache.chunk_key(tokens, 0, 0))
+
+    oldest_key = keys_ordered[0]
+    cache.evict()
+    assert oldest_key not in cache._store, "Oldest (LRU) entry should be evicted as fallback"
