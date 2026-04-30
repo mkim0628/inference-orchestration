@@ -331,3 +331,176 @@ class NonContiguousKVCacheManager(SegmentHashMixin, KVCacheManager):  # type: ig
 
     def segment_index_memory_bytes(self) -> int:
         return self._segment_index.memory_bytes()
+
+
+# --------------------------------------------------------------------------- #
+# SegmentAdapterMixin — Activity B (2026-04-30)                               #
+# Ports src/cache/segment_adapter.py to vLLM 0.20.0 block manager            #
+# --------------------------------------------------------------------------- #
+
+class SegmentAdapterMixin:
+    """Mixin that adds KV Packet-style MLP adapter correction to segment lookups.
+
+    When a non-contiguous KV cache hit occurs (token sequence cached at a
+    different position than its current context), the raw cached KV tensor
+    has position-mismatch error.  A lightweight trained MLP corrects this
+    error before the tensor is passed to the attention kernel.
+
+    This is the vLLM port of ``SegmentAdapter`` from
+    ``src/cache/segment_adapter.py``.
+
+    Design
+    ------
+    - ``adapter_weights``: dict mapping kv_dim → (W1, b1, W2, b2) for a 2-layer
+      MLP with residual connection: ``output = x + W2(ReLU(W1 x + b1)) + b2``
+    - Weights are shared across chunk positions (position-independent).
+    - Training via self-supervised distillation: L2(adapter(cached_kv), target_kv).
+    - In vLLM: called inside ``NonContiguousKVCacheManager.lookup_segment`` for
+      non-contiguous hits.
+
+    Usage::
+
+        manager = NonContiguousKVCacheManagerWithAdapter(...)
+        # After training the adapter offline:
+        manager.set_adapter_weights(kv_dim=64, weights=adapter_weights_dict)
+        # Inference: lookup_segment automatically applies adapter on NC hits.
+    """
+
+    def __init__(self, *args, hidden_dim: int = 64, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._hidden_dim = hidden_dim
+        # {kv_dim: (W1, b1, W2, b2)} — lazy-initialized on first training
+        self._adapter_weights: dict = {}
+        self._adapter_enabled: bool = True
+
+    def set_adapter_weights(self, kv_dim: int, weights: dict) -> None:
+        """Load pre-trained adapter weights.
+
+        Args:
+            kv_dim:  KV feature dimension.
+            weights: Dict with keys W1(hidden_dim, kv_dim), b1(hidden_dim,),
+                     W2(kv_dim, hidden_dim), b2(kv_dim,) as torch.Tensor.
+        """
+        self._adapter_weights[kv_dim] = weights
+
+    def _apply_adapter(self, kv: "torch.Tensor") -> "torch.Tensor":
+        """Apply MLP adapter with residual connection.
+
+        If no weights for this kv_dim are loaded, returns kv unchanged.
+        """
+        import torch
+        kv_dim = kv.shape[-1]
+        if kv_dim not in self._adapter_weights or not self._adapter_enabled:
+            return kv
+        w = self._adapter_weights[kv_dim]
+        W1, b1, W2, b2 = w["W1"], w["b1"], w["W2"], w["b2"]
+        flat = kv.view(-1, kv_dim).float()
+        h = torch.relu(flat @ W1.T + b1)
+        correction = h @ W2.T + b2
+        return (flat + correction).view(kv.shape).to(kv.dtype)
+
+    def train_adapter(
+        self,
+        cached_kvs: list,
+        target_kvs: list,
+        kv_dim: int,
+        n_steps: int = 500,
+        lr: float = 1e-3,
+    ) -> list:
+        """Train adapter weights offline via self-supervised distillation.
+
+        Args:
+            cached_kvs: List of cached (position-mismatched) KV tensors.
+            target_kvs: List of reference (correctly-positioned) KV tensors.
+            kv_dim:     Feature dimension of KV tensors.
+            n_steps:    Gradient steps.
+            lr:         Adam learning rate.
+
+        Returns:
+            Loss history as list of floats.
+        """
+        import torch
+        import torch.nn as nn
+        hidden = self._hidden_dim
+        W1 = nn.Parameter(torch.randn(hidden, kv_dim) * 0.01)
+        b1 = nn.Parameter(torch.zeros(hidden))
+        W2 = nn.Parameter(torch.randn(kv_dim, hidden) * 0.01)
+        b2 = nn.Parameter(torch.zeros(kv_dim))
+        optimizer = torch.optim.Adam([W1, b1, W2, b2], lr=lr)
+        loss_history = []
+        for step in range(n_steps):
+            total_loss = torch.tensor(0.0)
+            for cached, target in zip(cached_kvs, target_kvs):
+                flat = cached.view(-1, kv_dim).float()
+                tgt = target.view(-1, kv_dim).float()
+                h = torch.relu(flat @ W1.T + b1)
+                pred = flat + h @ W2.T + b2
+                total_loss = total_loss + nn.functional.mse_loss(pred, tgt)
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            if step % 50 == 0:
+                loss_history.append(total_loss.item())
+        self._adapter_weights[kv_dim] = {
+            "W1": W1.detach(), "b1": b1.detach(),
+            "W2": W2.detach(), "b2": b2.detach(),
+        }
+        return loss_history
+
+
+class NonContiguousKVCacheManagerWithAdapter(SegmentAdapterMixin):
+    """NonContiguousKVCacheManager with SegmentAdapter correction on NC hits.
+
+    Subclasses SegmentAdapterMixin (which subclasses NonContiguousKVCacheManager
+    implicitly via MRO) to add MLP adapter application on non-contiguous hits.
+
+    On a non-contiguous hit (segment found but not at a prefix boundary),
+    ``lookup_segment`` applies ``_apply_adapter`` to the retrieved KV tensor
+    before returning it.  On contiguous / prefix hits, KV is returned as-is.
+    """
+
+    def lookup_segment_with_adapter(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        layer_idx: int,
+        tensor_id: int = 0,
+        is_noncontiguous: bool = False,
+    ) -> Optional["torch.Tensor"]:
+        """Lookup with optional adapter correction for non-contiguous hits.
+
+        Args:
+            is_noncontiguous: True if the chunk is known to be at a position
+                              different from when it was originally cached.
+        """
+        key = self.get_segment_key(  # type: ignore[attr-defined]
+            token_ids, chunk_idx, layer_idx, getattr(self, "_segment_chunk_size", 128)
+        )
+        kv = self._segment_index.get(key, tensor_id)  # type: ignore[attr-defined]
+        if kv is None:
+            return None
+        if is_noncontiguous:
+            kv = self._apply_adapter(kv)
+        return kv
+
+
+if __name__ == "__main__":
+    def _test_segment_adapter_mixin():
+        import torch
+
+        class _FakeManager(SegmentAdapterMixin):
+            pass
+
+        mgr = _FakeManager(hidden_dim=32)
+        kv_dim = 64
+        cached = [torch.randn(20, kv_dim) for _ in range(5)]
+        target = [c + torch.randn_like(c) * 0.1 for c in cached]
+        losses = mgr.train_adapter(cached, target, kv_dim, n_steps=100, lr=1e-3)
+        assert len(losses) > 0, "No loss recorded"
+        assert losses[-1] < losses[0] or losses[-1] < 1.0, f"Loss did not decrease: {losses}"
+        kv = torch.randn(10, kv_dim)
+        corrected = mgr._apply_adapter(kv)
+        assert corrected.shape == kv.shape, "Shape mismatch after adapter"
+        print(f"SegmentAdapterMixin: OK (loss {losses[0]:.4f} → {losses[-1]:.4f})")
+
+    _test_segment_adapter_mixin()

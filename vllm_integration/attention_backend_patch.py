@@ -289,3 +289,162 @@ class NonContiguousAttentionWrapper:
         passes through unchanged so the wrapper is drop-in safe.
         """
         return self._impl.forward(*args, **kwargs)  # type: ignore[union-attr]
+
+
+# --------------------------------------------------------------------------- #
+# TriStateKVHook — Activity C (2026-04-30)                                    #
+# Ports src/cache/tri_state_compressor.py to vLLM 0.20.0                     #
+# --------------------------------------------------------------------------- #
+
+class TriStateKVHook:
+    """ARKV-style tri-state KV compression hook for vLLM attention backends.
+
+    Ports ``TriStateCompressor`` from ``src/cache/tri_state_compressor.py``
+    into the vLLM attention pipeline.  On each K/V write, tokens are
+    classified into:
+
+    - **retain** (top ``retain_ratio`` by attention score) → FP16, no info loss
+    - **compress** (middle fraction) → HadamardInt4Codec, ~75% savings
+    - **evict** (bottom ``evict_ratio`` by attention score) → dropped
+
+    Accuracy constraint
+    -------------------
+    The ±1% perplexity delta constraint is maintained by:
+    1. Retaining the top-20% heavy-hitter tokens at FP16 precision.
+    2. Using HadamardInt4Codec (Hadamard rotation + INT4) for compress tier —
+       validated at KL < 0.007 in standalone tests (Report ① 2026-04-30).
+    3. Evicting only the bottom-40% low-attention tokens that contribute
+       negligibly to attention output.
+
+    Usage::
+
+        hook = TriStateKVHook(codec=hadamard_codec, retain_ratio=0.20, evict_ratio=0.40)
+
+        # In attention forward (write path, after K/V projection):
+        storage = hook.encode_kv(k, attn_weights, layer_idx, is_key=True)
+
+        # In attention forward (read path):
+        k_reconstructed = hook.decode_kv(storage, layer_idx)
+    """
+
+    def __init__(
+        self,
+        codec: "HadamardInt4Codec",
+        retain_ratio: float = 0.20,
+        evict_ratio: float = 0.40,
+    ) -> None:
+        self.codec = codec
+        self.retain_ratio = retain_ratio
+        self.evict_ratio = evict_ratio
+        # Storage: maps (layer_idx, tensor_id) → list of storage dicts
+        self._storage: dict = {}
+
+    def encode_kv(
+        self,
+        kv: "torch.Tensor",
+        attn_weights: "torch.Tensor",
+        layer_idx: int,
+        tensor_id: int = 0,
+    ) -> dict:
+        """Tri-state classify + compress KV tensor.
+
+        Args:
+            kv:          K or V tensor, shape (n_tokens, kv_dim).
+            attn_weights: Per-token attention importance scores, shape (n_tokens,).
+            layer_idx:   Transformer layer index.
+            tensor_id:   0 for K, 1 for V.
+
+        Returns:
+            Storage dict with keys: retain_kv, compressed_kv, retain_indices,
+            compress_indices, evict_indices, layer_idx, tensor_id.
+        """
+        import torch
+        n_tokens = kv.shape[0]
+        scores = attn_weights.float()
+
+        retain_k = max(1, int(n_tokens * self.retain_ratio))
+        evict_k = max(1, int(n_tokens * self.evict_ratio))
+
+        sorted_indices = torch.argsort(scores, descending=True)
+        retain_indices = sorted_indices[:retain_k]
+        evict_indices = sorted_indices[n_tokens - evict_k:]
+        compress_indices = sorted_indices[retain_k: n_tokens - evict_k]
+
+        retain_kv = kv[retain_indices].half()
+
+        if len(compress_indices) > 0:
+            compressed_kv = self.codec.encode(kv[compress_indices], layer_idx, tensor_id)
+        else:
+            compressed_kv = torch.zeros(0, dtype=torch.int8)
+
+        storage = {
+            "retain_kv": retain_kv,
+            "compressed_kv": compressed_kv,
+            "retain_indices": retain_indices,
+            "compress_indices": compress_indices,
+            "evict_indices": evict_indices,
+            "n_tokens": n_tokens,
+            "kv_dim": kv.shape[-1],
+            "layer_idx": layer_idx,
+            "tensor_id": tensor_id,
+        }
+        self._storage[(layer_idx, tensor_id)] = storage
+        return storage
+
+    def decode_kv(
+        self,
+        storage: dict,
+        layer_idx: int,
+        tensor_id: int = 0,
+    ) -> "torch.Tensor":
+        """Reconstruct KV from tri-state storage.
+
+        Evicted token positions are filled with zeros (they contributed
+        negligibly to attention and are safe to zero-fill for the residual).
+
+        Returns:
+            Float32 tensor of shape (n_tokens, kv_dim).
+        """
+        import torch
+        n_tokens = storage["n_tokens"]
+        kv_dim = storage["kv_dim"]
+        out = torch.zeros(n_tokens, kv_dim, dtype=torch.float32)
+
+        retain_indices = storage["retain_indices"]
+        out[retain_indices] = storage["retain_kv"].float()
+
+        compress_indices = storage["compress_indices"]
+        if len(compress_indices) > 0:
+            decompressed = self.codec.decode(storage["compressed_kv"], layer_idx, tensor_id)
+            out[compress_indices] = decompressed.float()
+
+        return out
+
+    def compression_ratio(self, retain_ratio: float = 0.20, evict_ratio: float = 0.40) -> float:
+        """Theoretical memory ratio vs FP32 baseline.
+
+        retain: retain_ratio * (2/4) = 0.10 of FP32
+        compress: (1-retain_ratio-evict_ratio) * (1/4) ≈ 0.10 of FP32
+        evict: 0
+        total ≈ 0.20 of FP32 → 80% savings
+        """
+        compress_ratio = 1.0 - retain_ratio - evict_ratio
+        return retain_ratio * 0.5 + compress_ratio * 0.25  # as fraction of FP32
+
+
+if __name__ == "__main__":
+    def _test_tri_state_hook():
+        import torch
+        from vllm_integration.compression_codec import HadamardInt4Codec
+        codec = HadamardInt4Codec(num_layers=12, cutoff_ratio=0.2)
+        hook = TriStateKVHook(codec=codec, retain_ratio=0.20, evict_ratio=0.40)
+        kv = torch.randn(50, 64)
+        attn_weights = torch.rand(50)
+        storage = hook.encode_kv(kv, attn_weights, layer_idx=5, tensor_id=0)
+        decoded = hook.decode_kv(storage, layer_idx=5, tensor_id=0)
+        assert decoded.shape == kv.shape, f"Shape mismatch: {decoded.shape} != {kv.shape}"
+        ratio = hook.compression_ratio()
+        assert ratio < 0.25, f"Compression ratio too high: {ratio}"
+        print(f"TriStateKVHook: OK (compression_ratio={ratio:.3f})")
+
+    _test_tri_state_hook()

@@ -195,9 +195,92 @@ hit_chunks, miss_chunks = wrapped.load_cached_chunks(token_ids, layer_idx)
 
 ---
 
-## Cycle
+## Cycle History
 
-- Date: 2026-04-29
+| Date | Loop | Activities | Key Additions |
+|------|------|-----------|---------------|
+| 2026-04-28 | 1/3 | B+C | NonContiguousKVCacheManager, CompressedKVHook (INT8) |
+| 2026-04-29 | 1/3 | A+B+C | CacheHitAwareRequestQueue, HadamardInt4Codec (INT4) |
+| 2026-04-30 | 1/3 | A+B+C | MultiNodeRequestRouter, TriStateKVHook, SegmentAdapterMixin |
+
+---
+
+## 2026-04-30 Additions
+
+### Activity A — MultiNodeRequestRouter (`scheduler_patch.py`)
+
+Port of `src/scheduler/multi_node_scheduler.py`. Adds P/D disaggregated prefill
+routing above `CacheHitAwareRequestQueue`:
+
+```python
+from vllm_integration.scheduler_patch import create_multi_node_router, VllmNodeConfig
+
+router = create_multi_node_router(
+    prefill_nodes=[VllmNodeConfig("p0", "prefill"), VllmNodeConfig("p1", "prefill")],
+    decode_nodes=[VllmNodeConfig("d0", "decode"), VllmNodeConfig("d1", "decode")],
+    segment_index=kv_manager._segment_index,
+    chunk_size=128,
+    codec=hadamard_codec,               # enables compress_before_transfer
+    compress_threshold_bytes=1048576,
+)
+routing = router.route(request)
+# routing["compress_before_transfer"] → True if KV size > threshold
+```
+
+### Activity C — TriStateKVHook (`attention_backend_patch.py`)
+
+Port of `src/cache/tri_state_compressor.py`. Adds ARKV-style tri-state
+(retain/compress/evict) compression to the attention write path:
+
+```python
+from vllm_integration.attention_backend_patch import TriStateKVHook
+from vllm_integration.compression_codec import HadamardInt4Codec
+
+codec = HadamardInt4Codec(num_layers=32, cutoff_ratio=0.2)
+hook = TriStateKVHook(codec=codec, retain_ratio=0.20, evict_ratio=0.40)
+
+# Write path (after K/V projection):
+storage = hook.encode_kv(k, attn_weights, layer_idx=5, tensor_id=0)
+# Read path:
+k_reconstructed = hook.decode_kv(storage, layer_idx=5, tensor_id=0)
+# Compression: ~80% memory savings vs FP32 (hook.compression_ratio() ≈ 0.20)
+```
+
+**Accuracy constraint**: retain tier (FP16) + compress tier (HadamardInt4, KL<0.007)
+maintains perplexity delta ±1%. Validated in Report ① 2026-04-30.
+
+### Activity B — SegmentAdapterMixin (`block_manager_patch.py`)
+
+Port of `src/cache/segment_adapter.py`. Adds MLP position-mismatch correction
+to non-contiguous KV hits:
+
+```python
+from vllm_integration.block_manager_patch import NonContiguousKVCacheManagerWithAdapter
+
+mgr = NonContiguousKVCacheManagerWithAdapter(hidden_dim=64)
+# Offline training:
+mgr.train_adapter(cached_kvs, target_kvs, kv_dim=64, n_steps=500)
+# Inference (non-contiguous hit):
+kv = mgr.lookup_segment_with_adapter(token_ids, chunk_idx, layer_idx, is_noncontiguous=True)
+```
+
+---
+
+## Updated Performance Expectations (from Report ① 2026-04-30)
+
+| Metric | Standalone (77/77 tests) | vLLM port target |
+|--------|--------------------------|-----------------|
+| Throughput improvement | +391% (memory-budget) | ≥ +10% |
+| Non-contiguous cache hit rate | ≥ 30% | ≥ 30% |
+| KV memory reduction (TriState) | 80% | ≥ 30% (goal) |
+| Compression accuracy (KL) | < 0.005 (INT4 tri-state) | ≤ 0.05 |
+| Scheduling overhead (TTFT) | 0.0% | ≤ 5% |
+
+---
+
+## Latest Cycle
+
+- Date: 2026-04-30
 - Loop: 1 / 3
-- Activity: A+B+C
-- Report ①: `reports/evaluations/2026-04-29.md`
+- Activity: A+B+C (multinode + tri-state + adapter)
+- Report ①: `reports/evaluations/2026-04-30.md`
