@@ -10,8 +10,18 @@
       "Write(src/**)",
       "Write(tests/**)",
       "Write(configs/experiments/**)",
+      "Write(vllm_integration/**)",
       "Bash(python *)",
-      "Bash(pytest *)"
+      "Bash(python3 *)",
+      "Bash(pytest *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git status)",
+      "Bash(git log *)",
+      "Bash(git diff *)"
     ]
   }
 }
