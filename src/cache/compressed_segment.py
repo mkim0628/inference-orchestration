@@ -1,8 +1,11 @@
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from src.cache.segmented import SegmentedHashCache
 from src.cache.compression import CompressionCodec
+
+if TYPE_CHECKING:
+    from src.cache.segment_adapter import SegmentAdapter
 
 
 class CompressedSegmentCache(SegmentedHashCache):
@@ -10,6 +13,9 @@ class CompressedSegmentCache(SegmentedHashCache):
 
     Stores KV segments in compressed form (FP16/INT8) to maximise the
     number of reusable segments within a fixed memory budget.
+
+    Optionally accepts a SegmentAdapter that is applied to decompressed KV
+    tensors on non-contiguous hits to reduce distribution shift.
     """
 
     def __init__(
@@ -17,11 +23,13 @@ class CompressedSegmentCache(SegmentedHashCache):
         codec: CompressionCodec,
         chunk_size: int = 128,
         max_entries: int = 1000,
+        adapter: Optional["SegmentAdapter"] = None,
     ) -> None:
         super().__init__(chunk_size=chunk_size, max_entries=max_entries)
         self.codec = codec
+        self.adapter = adapter
         # Tracks layer_idx per stored key so decode can use the right precision
-        self._key_layer: dict[str, int] = {}
+        self._key_layer: dict = {}
 
     def put_segment(  # type: ignore[override]
         self,
@@ -47,21 +55,29 @@ class CompressedSegmentCache(SegmentedHashCache):
         hits: List[Tuple[int, torch.Tensor]] = []
         misses: List[int] = []
 
+        miss_set_building: List[int] = []
+        hit_pairs: List[Tuple[int, torch.Tensor]] = []
+
         for i in range(n_chunks):
             key = self.chunk_key(token_ids, i, layer_idx)
             compressed = self.get(key)
             if compressed is not None:
                 tensor_id = hash(key) % (2**31)
                 kv = self.codec.decode(compressed, layer_idx, tensor_id)
-                hits.append((i, kv))
+                hit_pairs.append((i, kv))
             else:
+                miss_set_building.append(i)
                 misses.append(i)
 
-        if hits:
-            miss_set = set(misses)
-            for idx, _ in hits:
-                if any(m < idx for m in miss_set):
-                    self._noncontiguous_hits += 1
+        miss_set = set(miss_set_building)
+        for idx, kv in hit_pairs:
+            is_noncontiguous = any(m < idx for m in miss_set)
+            if is_noncontiguous:
+                self._noncontiguous_hits += 1
+                if self.adapter is not None:
+                    with torch.no_grad():
+                        kv = self.adapter(kv)
+            hits.append((idx, kv))
 
         return hits, misses
 

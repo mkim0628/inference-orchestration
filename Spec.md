@@ -1,31 +1,32 @@
-# Spec — 2026-04-29
+# Spec — 2026-04-30
 
-<!-- 변경 이유: 이전 사이클(2026-04-28) B+C 기반 구현 완료 후 Activity A(스케줄러) 추가, Activity C를 Hadamard INT4로 업그레이드. -->
+<!-- 변경 이유: 이전 사이클(2026-04-29) A+B+C 단일노드 통합 완료 후, 멀티노드 확장(A), KV Packet adapter(B), ARKV tri-state 압축(C)을 추가. -->
 
 ## 배경
 
-이전 사이클(2026-04-28): Activity B+C(위치-독립 세그먼트 해시 + FP16/INT8 혼합 정밀도)로 비연속 히트율 30.3%, 메모리 −68.8%, 정확도 ±0.72% 달성.
+이전 사이클(2026-04-29) 달성 결과:
+- Activity A: `CacheAwareScheduler` 단일노드 완료, TTFT 오버헤드 ≤5%
+- Activity B: `CompressedSegmentCache` 비연속 히트율 ≥30%, 중요도 기반 퇴거 완료
+- Activity C: `HadamardInt4Codec` INT4 양자화 −70% 메모리, KL<0.007
 
-이번 사이클의 세 가지 추가·개선:
-1. **Activity A 신규 추가**: 비연속 히트율을 인식하는 캐시-가중 스케줄러로 처리량 +20% 목표에 근접.
-2. **Activity B 개선**: ChunkKV 스타일 청크 중요도 기반 퇴거 정책 추가, 청크 크기 128 토큰 유지.
-3. **Activity C 업그레이드**: FP16/INT8 혼합 정밀도 → Hadamard 회전 기반 INT4 양자화(SAW-INT4 스타일)로 메모리 절감을 −68.8% → −75%+ 로 향상.
-
-해결 문제: Activity A 미구현(처리량 미측정), 압축률 추가 개선 여지, 퇴거 정책의 의미적 정합성 부족.
+미해결 항목 (SUMMARY.md 우선순위):
+1. 멀티노드 KV 마이그레이션 라우팅 (Activity A)
+2. KV Packet adapter 통합 (Activity B)
+3. ARKV tri-state 압축 (Activity C)
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling
-- [x] Activity B: Non-Contiguous KV Cache Reuse (개선)
-- [x] Activity C: KV Cache Compression (Hadamard INT4 업그레이드)
+- [x] Activity A: MultiNodeScheduler (P/D 분리 시뮬레이션)
+- [x] Activity B: SegmentAdapter (KV Packet 스타일 MLP adapter)
+- [x] Activity C: TriStateCompressor (ARKV tri-state: retain/compress/evict)
 
 ## 목표
 
-- [ ] 목표 1 (§1): 배치 처리량(tokens/sec) 베이스라인 대비 +10% 이상 (스케줄러 효과 측정) — evaluation_criteria.md §1
-- [ ] 목표 2 (§2): 스케줄링 오버헤드 TTFT p50 증가 +5% 이내, 캐시 히트율 +10%p 이상 — §2
-- [ ] 목표 3 (§3): 비연속 세그먼트 히트율 전체 히트의 30% 이상 유지 — §3
-- [ ] 목표 4 (§4): Hadamard INT4로 KV 메모리 −75% 이상, accuracy delta ±1% 이내 — §4
-- [ ] 목표 5 (§5): A+B+C 복합 처리량 단일 Activity 대비 추가 +5%, 복합 메모리 추가 −10% — §5
+- [ ] §1: MultiNodeScheduler 처리량 단일노드 대비 +10% 이상
+- [ ] §2: MultiNodeScheduler TTFT 오버헤드 +5% 이내 (멀티노드 포함)
+- [ ] §3: SegmentAdapter 사용 후 비연속 히트 KL divergence ≤ 0.005
+- [ ] §4: TriStateCompressor 메모리 −75% 이상, accuracy delta ±1% 이내
+- [ ] §5: A+B+C 복합 통합 테스트 통과 (기존 55개 테스트 + 신규 테스트)
 
 ## 구현 범위
 
@@ -33,297 +34,343 @@
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/scheduler/__init__.py` | A | 패키지 초기화 |
-| `src/scheduler/cache_aware_scheduler.py` | A | 비연속 히트율 인식 캐시-가중 스케줄러 |
-| `tests/unit/test_cache_aware_scheduler.py` | A | 스케줄러 단위 테스트 |
-| `tests/integration/test_abc_e2e.py` | A+B+C | 전체 통합 엔드-투-엔드 테스트 |
-| `configs/experiments/2026-04-29.yaml` | 공통 | 실험 설정 |
+| `src/cache/tri_state_compressor.py` | C | ARKV 스타일 tri-state KV 압축기 |
+| `src/cache/segment_adapter.py` | B | KV Packet 스타일 MLP adapter |
+| `src/scheduler/multi_node_scheduler.py` | A | P/D 분리 멀티노드 스케줄러 |
+| `tests/unit/test_tri_state_compressor.py` | C | TriStateCompressor 단위 테스트 |
+| `tests/unit/test_segment_adapter.py` | B | SegmentAdapter 단위 테스트 |
+| `tests/unit/test_multi_node_scheduler.py` | A | MultiNodeScheduler 단위 테스트 |
+| `configs/experiments/2026-04-30.yaml` | 공통 | 실험 설정 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/cache/compression.py` | `HadamardInt4Codec` 클래스 추가 (기존 `CompressionCodec` 유지) |
-| `src/cache/segmented.py` | `evict()` 메서드에 청크 중요도 스코어 지원 추가, `record_attention_score()` 메서드 추가 |
-| `src/cache/compressed_segment.py` | `HadamardInt4Codec` 사용 가능하도록 codec 타입 힌트 일반화 |
-| `src/engine/runner.py` | `InferenceRunner`에 optional scheduler 파라미터 추가, `run_batch()` 스케줄러 훅 |
-| `tests/unit/test_compression_accuracy.py` | `HadamardInt4Codec` 정확도 테스트 추가 |
+| `src/cache/compressed_segment.py` | `adapter` 옵션 파라미터 추가, 비연속 히트 시 adapter 적용 |
+| `tests/integration/test_abc_e2e.py` | 멀티노드 + tri-state + adapter 통합 테스트 추가 |
 
 ---
 
 ## 알고리즘 상세
 
-### CacheAwareScheduler (Activity A)
+### 1. TriStateCompressor (Activity C)
+
+**파일**: `src/cache/tri_state_compressor.py`
+
+클래스 설계:
 
 ```python
-# src/scheduler/cache_aware_scheduler.py
-
-@dataclass
-class ScheduledRequest:
-    request: InferenceRequest
-    predicted_hit_rate: float
-    wait_steps: int        # 얼마나 오래 대기했는지
-    priority_score: float  # 최종 정렬 키
-
-class CacheAwareScheduler:
+class TriStateCompressor:
     def __init__(
         self,
-        cache: CacheStore,       # CompressedSegmentCache 또는 SegmentedHashCache
-        fairness_max_wait: int = 10,  # 최대 대기 스텝 (공정성)
-        chunk_size: int = 128,
-    ) -> None: ...
+        codec: HadamardInt4Codec,
+        retain_ratio: float = 0.20,  # top 20% by attn score → FP16
+        evict_ratio: float = 0.40,   # bottom 40% → delete
+        # middle 40% → INT4 compress
+    ) -> None
 
-    def _predict_hit_rate(self, request: InferenceRequest) -> float:
-        # 1. 요청의 모든 청크에 대해 chunk_key 계산
-        # 2. cache._store에 key가 있는지 확인 (실제 get() 호출 아님 — 통계 오염 방지)
-        # 3. predicted_hit_rate = matched_chunks / total_chunks
-        ...
+    def classify(
+        self,
+        kv: torch.Tensor,           # (n_tokens, kv_dim)
+        attn_weights: torch.Tensor, # (n_tokens,)
+        layer_idx: int,
+    ) -> dict:
+        # returns: retain_kv, compress_kv, retain_indices, compress_indices, evict_indices
+
+    def encode(
+        self,
+        kv: torch.Tensor,
+        attn_weights: torch.Tensor,
+        layer_idx: int,
+        tensor_id: int = 0,
+    ) -> dict:
+        # classify + compress compress_kv with codec
+        # returns storage dict with retain_kv(FP16), compressed_kv(INT8), indices
+
+    def decode(
+        self,
+        storage: dict,
+        layer_idx: int,
+        tensor_id: int = 0,
+    ) -> torch.Tensor:
+        # reconstruct full kv; evicted positions filled with zeros
+        # shape matches original (n_tokens, kv_dim)
+
+    def compression_ratio(self, retain_ratio=0.20, evict_ratio=0.40) -> float:
+        # retain: 0.20 * (2/4) = 0.10
+        # compress: 0.40 * (1/4) = 0.10
+        # evict: 0
+        # total: 0.20 of FP32 baseline → 80% savings
+```
+
+**정확도 보존 검증 (accuracy-preservation plan)**:
+- retain tier: FP16 보존이므로 KL divergence ≈ 0 (완전 보존)
+- compress tier: HadamardInt4Codec 이미 KL<0.007 검증됨
+- evict tier: 하위 40% low-attention 토큰 — attention에 기여 미미
+- 통합 KL criterion: `KL(decode(encode(kv)), kv) < 0.01` (±1% perplexity proxy)
+- cosine similarity ≥ 0.90 for non-evicted tokens
+
+### 2. SegmentAdapter (Activity B)
+
+**파일**: `src/cache/segment_adapter.py`
+
+```python
+import torch
+import torch.nn as nn
+from typing import List, Optional
+
+class SegmentAdapter(nn.Module):
+    def __init__(
+        self,
+        kv_dim: int,
+        hidden_dim: int = 64,
+    ) -> None:
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(kv_dim, hidden_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_dim, kv_dim),
+        # )
+
+    def forward(self, cached_kv: torch.Tensor) -> torch.Tensor:
+        # residual connection: output = cached_kv + self.mlp(cached_kv)
+        # shape preserved: (..., kv_dim) → (..., kv_dim)
+
+    def train_step(
+        self,
+        cached_kv: torch.Tensor,
+        target_kv: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        # L2 loss: F.mse_loss(self.forward(cached_kv), target_kv)
+        # returns loss.item()
+
+    def fit(
+        self,
+        cached_kvs: List[torch.Tensor],
+        target_kvs: List[torch.Tensor],
+        n_steps: int = 500,
+        lr: float = 1e-3,
+    ) -> List[float]:
+        # Adam optimizer, returns loss history
+
+    def save(self, path: str) -> None: ...
+    def load(self, path: str) -> None: ...
+```
+
+**CompressedSegmentCache 수정**:
+
+`src/cache/compressed_segment.py`의 `__init__`에 파라미터 추가:
+```python
+def __init__(
+    self,
+    codec,          # HadamardInt4Codec or CompressionCodec
+    chunk_size: int = 128,
+    max_entries: int = 1000,
+    adapter: Optional["SegmentAdapter"] = None,  # NEW
+) -> None:
+    super().__init__(chunk_size=chunk_size, max_entries=max_entries)
+    self.codec = codec
+    self.adapter = adapter
+    self._key_layer: dict = {}
+```
+
+`get_segments()` 수정: 비연속 히트 발생 시 adapter 적용:
+```python
+# After decompressing kv:
+is_noncontiguous = any(m < idx for m in miss_set)
+if is_noncontiguous and self.adapter is not None:
+    with torch.no_grad():
+        kv = self.adapter(kv)
+hits.append((i, kv))
+```
+
+### 3. MultiNodeScheduler (Activity A)
+
+**파일**: `src/scheduler/multi_node_scheduler.py`
+
+```python
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+import torch
+
+from src.scheduler.cache_aware_scheduler import CacheAwareScheduler
+from src.cache.base import CacheStore
+from src.engine.runner import InferenceRequest
+
+
+@dataclass
+class NodeConfig:
+    node_id: str
+    node_type: str              # "prefill" or "decode"
+    transfer_latency_ms: float = 10.0
+    memory_capacity_gb: float = 80.0
+    current_load: float = 0.0   # 0.0–1.0
+
+
+class MultiNodeScheduler(CacheAwareScheduler):
+    def __init__(
+        self,
+        cache: CacheStore,
+        prefill_nodes: List[NodeConfig],
+        decode_nodes: List[NodeConfig],
+        codec=None,                             # HadamardInt4Codec for compress_before_transfer
+        compress_threshold_bytes: int = 1024 * 1024,
+        fairness_max_wait: int = 10,
+        chunk_size: int = 128,
+    ) -> None:
+        super().__init__(cache, fairness_max_wait, chunk_size)
+        self.prefill_nodes = prefill_nodes
+        self.decode_nodes = decode_nodes
+        self.codec = codec
+        self.compress_threshold_bytes = compress_threshold_bytes
+        self._transfer_log: List[dict] = []
 
     def schedule(self, requests: List[InferenceRequest]) -> List[InferenceRequest]:
-        # 1. 각 요청의 predicted_hit_rate 계산
-        # 2. priority = hit_rate * (1 - wait_penalty)
-        #    wait_penalty = min(wait_steps / fairness_max_wait, 1.0)
-        # 3. priority 내림차순 정렬
-        # 4. 반환: 재정렬된 요청 리스트
-        ...
+        # Call parent schedule() for hit-rate ordering
+        # Additionally annotate each request with routed (prefill_node, decode_node)
+        # routing_score = hit_rate(req) / (1 + transfer_cost(p, d))
 
-    def update_wait(self, skipped_requests: List[InferenceRequest]) -> None:
-        """이번 배치에서 처리되지 않은 요청의 wait_steps 증가."""
-        ...
+    def route(self, request: InferenceRequest) -> Tuple[NodeConfig, NodeConfig]:
+        # Select prefill node with highest hit_rate for this request's chunks
+        # Select decode node with lowest current_load
+        # Return (prefill_node, decode_node)
+
+    def simulate_transfer(
+        self,
+        kv: torch.Tensor,
+        prefill_node: NodeConfig,
+        decode_node: NodeConfig,
+    ) -> Tuple[torch.Tensor, float]:
+        # If kv.nbytes > compress_threshold_bytes and codec is not None:
+        #   compressed = codec.encode(kv, layer_idx=5); latency *= 0.25
+        #   kv_out = codec.decode(compressed, layer_idx=5)
+        # Else: kv_out = kv
+        # latency_ms = prefill_node.transfer_latency_ms * (1 + decode_node.current_load)
+        # Return (kv_out, latency_ms)
+
+    def node_load(self) -> dict:
+        # Returns {node_id: current_load} for all nodes
 ```
 
-**스케줄러 통합 (runner.py)**:
-```python
-class InferenceRunner:
-    def __init__(self, cache, scheduler=None, ...):
-        self.scheduler = scheduler  # Optional[CacheAwareScheduler]
-
-    def run_batch(self, requests):
-        if self.scheduler is not None:
-            requests = self.scheduler.schedule(requests)
-        return [self.run(r) for r in requests]
-```
-
-**_predict_hit_rate 구현 세부**:
-- `cache`가 `SegmentedHashCache`/`CompressedSegmentCache`이면 `cache._store` dict를 직접 조회(key 존재 여부만 체크, get() 미호출)
-- `cache`가 다른 타입이면 0.0 반환 (graceful fallback)
-- chunk_key 계산은 `SegmentedHashCache.chunk_key()` 와 동일 로직 사용
+**단일노드 fallback**: `prefill_nodes=[]`, `decode_nodes=[]`이면 `CacheAwareScheduler.schedule()`과 동일 동작.
 
 ---
 
-### Chunk Importance-based Eviction (Activity B 개선)
+## 테스트 명세
 
-```python
-# src/cache/segmented.py 변경
-
-class SegmentedHashCache(CacheStore):
-    def __init__(self, chunk_size=128, max_entries=1000):
-        ...
-        self._importance: dict[str, float] = {}  # key → 누적 attention score
-
-    def record_attention_score(self, key: str, score: float) -> None:
-        """어텐션 스코어 누적. 캐시 히트 시 외부에서 호출 가능."""
-        self._importance[key] = self._importance.get(key, 0.0) + score
-
-    def evict(self) -> int:
-        """중요도 최소 엔트리 퇴거. _importance 없으면 LRU fallback."""
-        if not self._store:
-            return 0
-        candidates = list(self._store.keys())
-        if self._importance:
-            evict_key = min(
-                candidates,
-                key=lambda k: self._importance.get(k, 0.0),
-            )
-        else:
-            evict_key = candidates[0]  # LRU: OrderedDict의 첫 번째 항목
-        evicted = self._store.pop(evict_key)
-        self._importance.pop(evict_key, None)
-        return evicted.nbytes
-```
-
----
-
-### HadamardInt4Codec (Activity C 업그레이드)
+### tests/unit/test_tri_state_compressor.py
 
 ```python
-# src/cache/compression.py 에 추가
+def test_classify_ratios():
+    # 100 tokens, verify len(retain)≈20, len(compress)≈40, len(evict)≈40
 
-class HadamardInt4Codec:
-    """Hadamard 회전 + INT4 양자화 코덱 (SAW-INT4 스타일).
+def test_encode_decode_roundtrip_kl():
+    # KL(decode(encode(kv)), kv) < 0.01
 
-    encode:
-      1. kv를 FP32로 변환
-      2. 초기 레이어(< cutoff): FP16으로 저장 (중요 정보 보존)
-      3. 후반 레이어:
-         a. Hadamard 회전 적용: kv_rot = H @ kv  (H = normalized Hadamard matrix)
-            - dim이 power-of-2 아닌 경우: zero-pad → Hadamard → unpad 후 저장
-         b. scale = kv_rot.abs().max() / 7.0  (INT4 범위 [-8, 7])
-         c. quantize: round(kv_rot / scale).clamp(-8, 7).to(torch.int8)
+def test_encode_decode_cosine():
+    # cosine_similarity(decoded, original) >= 0.90 for non-evicted
 
-    decode:
-      1. 초기 레이어: FP16 → FP32
-      2. 후반 레이어: int8 * scale → inverse Hadamard → FP32
-         (정규화 Hadamard는 직교 행렬: H^{-1} = H^T = H)
+def test_compression_ratio_above_75pct():
+    # compressor.compression_ratio() <= 0.25 (i.e., ≥75% savings)
 
-    메모리 절감 (num_layers=12, cutoff_ratio=0.2):
-      - 초기 2 레이어: FP16 → −50% vs FP32
-      - 후반 10 레이어: INT8 저장 (INT4 범위) → −75% vs FP32
-      - 평균: (2*0.5 + 10*0.75) / 12 = 0.708 → −70.8%
-      (true INT4 bit-packing 구현 시: 후반 −87.5%, 평균 −81%)
-    """
+def test_accuracy_preservation_proxy():
+    # ±1% perplexity proxy: KL < 0.01 for mixed retain+compress tiers
+```
 
-    def __init__(self, num_layers: int, cutoff_ratio: float = 0.2) -> None:
-        self.num_layers = num_layers
-        self.cutoff = max(1, int(num_layers * cutoff_ratio))
-        self._scales: dict[tuple[int, int], float] = {}
-        self._hadamard_cache: dict[int, torch.Tensor] = {}  # dim → H matrix
+### tests/unit/test_segment_adapter.py
 
-    def _next_power_of_two(self, n: int) -> int:
-        p = 1
-        while p < n:
-            p <<= 1
-        return p
+```python
+def test_forward_shape_preserved():
+    # adapter.forward(x).shape == x.shape
 
-    def _hadamard_matrix(self, dim: int) -> torch.Tensor:
-        """Normalized Hadamard matrix for dim (builds recursively, cached)."""
-        if dim in self._hadamard_cache:
-            return self._hadamard_cache[dim]
-        if dim == 1:
-            h = torch.ones(1, 1)
-        else:
-            half = self._hadamard_matrix(dim // 2)
-            top = torch.cat([half, half], dim=1)
-            bot = torch.cat([half, -half], dim=1)
-            h = torch.cat([top, bot], dim=0) / (2 ** 0.5)
-        self._hadamard_cache[dim] = h
-        return h
+def test_residual_connection():
+    # With zero-init mlp weights, forward(x) ≈ x
 
-    def _apply_hadamard(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply Hadamard rotation to last dimension of x."""
-        orig_dim = x.shape[-1]
-        pad_dim = self._next_power_of_two(orig_dim)
-        if pad_dim != orig_dim:
-            pad = torch.zeros(*x.shape[:-1], pad_dim - orig_dim, dtype=x.dtype)
-            x = torch.cat([x, pad], dim=-1)
-        H = self._hadamard_matrix(pad_dim).to(x.device)
-        rotated = x @ H.T  # (..., pad_dim)
-        return rotated[..., :orig_dim]
+def test_training_reduces_loss():
+    # fit() loss[-1] < loss[0] after 100 steps
 
-    def _inverse_hadamard(self, x: torch.Tensor) -> torch.Tensor:
-        """Inverse Hadamard (H is orthogonal: H^{-1} = H^T = H for normalized)."""
-        orig_dim = x.shape[-1]
-        pad_dim = self._next_power_of_two(orig_dim)
-        if pad_dim != orig_dim:
-            pad = torch.zeros(*x.shape[:-1], pad_dim - orig_dim, dtype=x.dtype)
-            x = torch.cat([x, pad], dim=-1)
-        H = self._hadamard_matrix(pad_dim).to(x.device)
-        restored = x @ H  # H^T = H for normalized Hadamard
-        return restored[..., :orig_dim]
+def test_noncontiguous_correction():
+    # perturbed_kv = kv + noise; fit(perturbed, kv)
+    # KL(adapter(perturbed), kv) < KL(perturbed, kv)
+```
 
-    def encode(self, kv: torch.Tensor, layer_idx: int, tensor_id: int = 0) -> torch.Tensor:
-        kv_f = kv.float()
-        if layer_idx < self.cutoff:
-            return kv_f.half()
-        rotated = self._apply_hadamard(kv_f)
-        abs_max = rotated.abs().max().item()
-        scale = abs_max / 7.0 if abs_max > 0 else 1.0
-        self._scales[(layer_idx, tensor_id)] = scale
-        quantized = rotated.div(scale).round().clamp(-8, 7).to(torch.int8)
-        return quantized
+### tests/unit/test_multi_node_scheduler.py
 
-    def decode(self, compressed: torch.Tensor, layer_idx: int, tensor_id: int = 0) -> torch.Tensor:
-        if layer_idx < self.cutoff:
-            return compressed.float()
-        scale = self._scales.get((layer_idx, tensor_id), 1.0)
-        dequantized = compressed.float() * scale
-        return self._inverse_hadamard(dequantized)
+```python
+def test_schedule_returns_all_requests():
+    # len(scheduled) == len(input)
 
-    def compression_ratio(self, layer_idx: int) -> float:
-        return 0.5 if layer_idx < self.cutoff else 0.75
+def test_high_hit_rate_scheduled_first():
+    # warm request (matching chunks) before cold request
 
-    def average_compression_ratio(self) -> float:
-        early = self.cutoff * 0.5
-        late = (self.num_layers - self.cutoff) * 0.75
-        return (early + late) / self.num_layers
+def test_fairness():
+    # cold request scheduled within fairness_max_wait steps
+
+def test_route_returns_valid_nodes():
+    # route() returns (NodeConfig, NodeConfig) with correct node_types
+
+def test_compress_before_transfer():
+    # large kv tensor → simulate_transfer uses codec → shape preserved
+
+def test_single_node_fallback():
+    # prefill_nodes=[], decode_nodes=[] → same ordering as parent
+
+def test_node_load_dict():
+    # node_load() returns dict with all node IDs as keys
 ```
 
 ---
 
-## Activity C — Accuracy Preservation 검증 계획
+## 설정 파일
 
-- **perplexity 측정**: 합성 KV 텐서(shape: [128, 64], FP32) 기반 encode→decode 왕복 테스트.
-  - L2 relative error = `||decoded - original||_F / ||original||_F` ≤ 1%
-  - 코사인 유사도 = `cos_sim(decoded.flatten(), original.flatten())` ≥ 0.99
-- **태스크 정확도 측정**: 어텐션 스코어 KL divergence.
-  - Q matrix 고정(randn seed=42, shape [8, 64])
-  - `attn_orig = softmax(Q @ K_orig.T / sqrt(64))`
-  - `attn_decoded = softmax(Q @ K_decoded.T / sqrt(64))`
-  - KL(attn_orig || attn_decoded) ≤ 0.01
-- **검증 테스트 파일**: `tests/unit/test_compression_accuracy.py` — `TestHadamardInt4Accuracy` 클래스
-  - `test_roundtrip_l2_error`: L2 relative error ≤1% (모든 레이어, num_layers=12)
-  - `test_cosine_similarity`: cosine sim ≥0.99 (모든 레이어)
-  - `test_attention_kl_divergence`: KL ≤0.01 (후반 레이어, INT4 적용 레이어)
-  - `test_vs_baseline_codec`: HadamardInt4Codec vs CompressionCodec 정확도 비교
-- **허용 오차**: ±1% — evaluation_criteria.md §4 필수 항목
-
----
-
-## 설정 파라미터
-
+**`configs/experiments/2026-04-30.yaml`**:
 ```yaml
-# configs/experiments/2026-04-29.yaml
-experiment:
-  date: "2026-04-29"
-  activity: "A+B+C"
-  description: "Cache-aware scheduler + chunk importance eviction + Hadamard INT4"
+experiment: "2026-04-30-abc-multinode-tristate-adapter"
+date: "2026-04-30"
+activities: [A, B, C]
 
 cache:
-  type: "compressed_segment"
+  type: CompressedSegmentCache
+  codec: HadamardInt4Codec
   chunk_size: 128
   max_entries: 1000
+  adapter:
+    enabled: true
+    kv_dim: 64
+    hidden_dim: 64
+    n_train_steps: 500
+    lr: 0.001
 
-compression:
-  codec: "hadamard_int4"
-  num_layers: 12
-  cutoff_ratio: 0.2
+compressor:
+  type: TriStateCompressor
+  retain_ratio: 0.20
+  evict_ratio: 0.40
 
 scheduler:
-  type: "cache_aware"
+  type: MultiNodeScheduler
+  prefill_nodes: 2
+  decode_nodes: 2
+  transfer_latency_ms: 10.0
+  compress_threshold_bytes: 1048576
   fairness_max_wait: 10
-  enabled: true
 
-runner:
-  num_layers: 12
-  hidden_dim: 64
-  chunk_size: 128
-  seed: 42
-
-baseline:
-  cache_type: "contiguous"
-  scheduler: "none"
+metrics:
+  target_throughput_gain: 0.20
+  target_memory_reduction: 0.75
+  target_noncontiguous_hit_rate: 0.30
+  max_kl_divergence: 0.01
+  max_scheduling_overhead_pct: 5.0
 ```
 
 ---
 
-## 테스트 요구사항
+## 구현 시 주의사항
 
-- [ ] `tests/unit/test_cache_aware_scheduler.py`
-  - `test_schedule_reorders_by_hit_rate`
-  - `test_fairness_max_wait`
-  - `test_scheduling_overhead_ms`
-- [ ] `tests/unit/test_compression_accuracy.py` (기존 + `TestHadamardInt4Accuracy` 추가)
-- [ ] `tests/unit/test_segmented_cache.py` (기존 + `test_importance_based_eviction` 추가)
-- [ ] `tests/integration/test_abc_e2e.py` (신규)
-  - A+B+C 전체 파이프라인: 스케줄러 → CompressedSegmentCache(HadamardInt4Codec) → 처리량 측정
-  - 베이스라인 vs A+B+C 비교 (처리량 +10% 이상, 메모리 −70% 이상, accuracy ≤1%)
+1. `TriStateCompressor`는 `CacheStore` 상속 불필요 — 변환기 역할로 `CompressedSegmentCache` 내부에서 선택적으로 사용.
+2. `SegmentAdapter`는 `torch.nn.Module` 상속. 추론 시 반드시 `eval()` 모드. no_grad() 사용.
+3. `MultiNodeScheduler`는 `CacheAwareScheduler` 상속으로 기존 단위 테스트(`test_cache_aware_scheduler.py`) 그대로 통과해야 함.
+4. 모든 테스트는 CPU 텐서로 통과해야 함 (GPU 불필요).
+5. 기존 55개 테스트가 그대로 통과해야 하며, 신규 파일 추가 시 `__init__.py`에 import 추가.
+6. SegmentAdapter의 `fit()` 수렴 확인: loss[0] > loss[-1] (최소 감소)로 테스트.
 
-## 완료 기준 (Definition of Done)
-
-- 단위 테스트 100% 통과
-- 통합 테스트 100% 통과
-- `HadamardInt4Codec` accuracy: L2 error ≤1%, cosine sim ≥0.99 (모든 레이어)
-- 스케줄러 오버헤드: 100 요청 재정렬 ≤5ms
-- 베이스라인 대비 메모리 −70% 이상
-- 비연속 세그먼트 히트율 ≥30% 유지
-- `evaluation_criteria.md` §0·§1·§2·§3·§4·§5 전 섹션 기준 적용
+SPEC_SAVED
