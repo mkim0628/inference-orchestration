@@ -1,0 +1,35 @@
+experiment: "2026-04-30-abc-multinode-tristate-adapter"
+date: "2026-04-30"
+activities: [A, B, C]
+
+cache:
+  type: CompressedSegmentCache
+  codec: HadamardInt4Codec
+  chunk_size: 128
+  max_entries: 1000
+  adapter:
+    enabled: true
+    kv_dim: 64
+    hidden_dim: 64
+    n_train_steps: 500
+    lr: 0.001
+
+compressor:
+  type: TriStateCompressor
+  retain_ratio: 0.20
+  evict_ratio: 0.40
+
+scheduler:
+  type: MultiNodeScheduler
+  prefill_nodes: 2
+  decode_nodes: 2
+  transfer_latency_ms: 10.0
+  compress_threshold_bytes: 1048576
+  fairness_max_wait: 10
+
+metrics:
+  target_throughput_gain: 0.20
+  target_memory_reduction: 0.75
+  target_noncontiguous_hit_rate: 0.30
+  max_kl_divergence: 0.01
+  max_scheduling_overhead_pct: 5.0
