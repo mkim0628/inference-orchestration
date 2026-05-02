@@ -10,7 +10,7 @@ Reference: CapKV (arXiv 2604.25975) — Information Bottleneck + leverage scores
 """
 
 import math
-from typing import Dict
+from typing import Dict, Union
 
 import numpy as np
 import torch
@@ -218,7 +218,7 @@ class LeverageScoreCompressor:
         self,
         n_tokens: int,
         d_head: int,
-    ) -> Dict[str, object]:
+    ) -> Dict[str, Union[int, float]]:
         """Estimate memory usage for n_tokens tokens with given d_head.
 
         Returns a dict with per-tier bytes and the overall reduction ratio

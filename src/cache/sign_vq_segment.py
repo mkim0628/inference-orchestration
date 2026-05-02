@@ -13,7 +13,7 @@ Reference: Self-Indexing KVCache (AAAI 2026, arXiv 2603.14224).
 """
 
 from collections import OrderedDict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -222,7 +222,7 @@ class SignVQSegmentCache(SegmentedHashCache):
     # Metrics                                                              #
     # ------------------------------------------------------------------ #
 
-    def tier_hit_rates(self) -> dict:
+    def tier_hit_rates(self) -> Dict[str, float]:
         """Return per-tier and overall hit rate metrics.
 
         Returns:
