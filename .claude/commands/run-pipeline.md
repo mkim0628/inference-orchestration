@@ -89,11 +89,18 @@
 
 ### 완료 — 결과물 커밋 & Push
 
-모든 단계 완료 후 변경 파일을 커밋한다:
+모든 단계 완료 후 변경 파일을 커밋한다.
+**현재 브랜치가 main이 아닌 경우(세션 자동 생성 브랜치 포함) 반드시 main으로 merge 후 push한다.**
 
 ```bash
-git add reports/ Spec.md vllm_integration/ src/ tests/ configs/ 
-git commit -m "Daily pipeline YYYY-MM-DD"
+git add reports/ Spec.md vllm_integration/ src/ tests/ configs/
+git commit -m "Daily pipeline YYYY-MM-DD" || echo "Nothing to commit"
+CURRENT_BRANCH=$(git branch --show-current)
+if [ "$CURRENT_BRANCH" != "main" ]; then
+  git checkout main
+  git pull origin main
+  git merge "$CURRENT_BRANCH" --no-ff -m "Merge daily pipeline YYYY-MM-DD"
+fi
 git push origin main
 ```
 

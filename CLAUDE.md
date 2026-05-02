@@ -240,6 +240,7 @@ low-rank approximation, CacheBlend, positional-independent caching.
 - Report ①(evaluator)과 Report ②(vllm-evaluator)는 독립적으로 저장한다. 하나가 실패해도 다른 하나는 저장한다.
 - `reports/summary/SUMMARY.md` 는 summarizer만 수정한다. 사람이 직접 편집하지 않는다.
 - summarizer는 SIGNIFICANT_CHANGE: false로 파이프라인이 중단된 날에도 반드시 실행한다.
+- **파이프라인 최종 push는 항상 `main` 브랜치에 한다.** 세션이 자동 생성한 feature 브랜치(예: `claude/...`)에서 작업 중이더라도 반드시 `main`으로 merge 후 `git push origin main`을 실행한다. feature 브랜치에만 push하고 끝내서는 안 된다.
 
 ---
 
