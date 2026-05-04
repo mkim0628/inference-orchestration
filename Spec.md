@@ -1,117 +1,113 @@
-# Spec — 2026-05-03
+# Spec — 2026-05-04
 
-<!-- 변경 이유 (이전 Spec.md: 2026-05-02 대비):
-이전 사이클(2026-05-02)은 B+C (SignVQSegmentCache + LeverageScoreCompressor) 조합이었다.
-이번 사이클은 A+B+C 전체 통합으로 전환한다. 주요 변경 내용:
+<!-- 변경 이유 (이전 Spec.md: 2026-05-03 대비):
+이전 사이클(2026-05-03)은 A+B+C (DualMapScheduler + SemanticSegmentCache/DHD + TurboQuantCodec/PolarQuant+QJL) 조합이었다.
+이번 사이클은 A+B (DAGTopologyScheduler + WorkloadAwareTTLCache + DAGAwareTTLAdjuster) 조합으로 전환한다.
+주요 변경 내용:
 
-1. [Activity B 교체] 해시 기반 정확 매칭(Sign VQ XOR 유사도) → DHD(Dual-Stage High Deviation)
-   의미 유사도 기반 비연속 KV 공유. 세그먼트 임베딩(평균 Key 벡터)을 코사인 유사도로 검색하며
-   편차가 큰 head/token만 선택적으로 재계산하는 방식으로 알고리즘이 본질적으로 다르다.
+1. [Activity A 교체] DualMapScheduler(이중 해시 + 의미 히트율 가중 라우팅) →
+   DAGTopologyScheduler(SAGA/Pythia 영감 워크플로우 DAG 위상 기반 KV 선제 보존 스케줄러).
+   알고리즘 자료구조가 해시 맵 → BFS/DFS DAG 위상 분석으로 본질적으로 다르다.
+   최적화 단위도 요청(request) 수준 → 에이전트 파이프라인(workflow) 수준으로 격상된다.
 
-2. [Activity C 교체] 레버리지 스코어 3-티어(CapKV 스타일) → TurboQuant 2단계 VQ
-   (PolarQuant 랜덤 회전 + 3비트 스칼라 양자화 + QJL 잔차 1비트 보정). 훈련 없이 6× 메모리
-   절감과 정확도 보존을 동시에 달성하는 알고리즘이다.
+2. [Activity B 교체] SemanticSegmentCache/DHD(의미 유사도 기반 비연속 KV 공유) →
+   WorkloadAwareTTLCache(워크로드 카테고리별 TTL 세그먼트 보존 정책).
+   세그먼트 선택 기준이 내용 유사도 → 사용 시간 패턴으로 전환된다.
 
-3. [Activity A 신규] DualMapScheduler 이중 해시 + 의미 히트율 가중 라우팅 추가.
-   이전 사이클에는 Activity A가 없었다.
+3. [Activity C 제외] TurboQuantCodec(PolarQuant+QJL 3비트) 이번 사이클에서 제외.
+   Activity C에 해당하는 RedundancyAwareEvictionPolicy(C-1)는 이번 사이클 구현 타겟에
+   명시적으로 포함되어 있으나, 아이디어 리포트 최우선 타겟(Cross-1 A+B)에 따라 메인
+   스코프는 A+B로 제한한다. 단, B-2의 WorkloadAwareTTLCache 퇴거 품질 향상을 위해
+   RedundancyAwareEvictionPolicy(C-1)를 보조 구성요소로 포함한다.
+   → Activity C 포함으로 판단: accuracy-preserving 검증 계획 필수 작성.
 
-4. [Cross-2 신규] SemanticSegmentCache와 TurboQuantCodec의 직접 파이프라인 통합.
-   put 시 TurboQuant 압축 저장, get 시 DHD 편차 체크 후 선택적 재계산.
+4. [Cross-1 신규] DAGAwareTTLAdjuster: DAGTopologyScheduler의 후속 노드 KV 재사용
+   확률 예측을 WorkloadAwareTTLCache의 TTL 조정에 실시간 연결.
+   이전 사이클에 없던 DAG 이벤트 → 캐시 TTL 피드백 루프.
 
-5. [Activity B 보조] SpeculativeSegmentFetcher: 비연속 세그먼트 검색을 크리티컬 패스
-   밖으로 이동시키는 비동기 프리패칭 레이어 추가.
-
-기존 파일(sign_vq_segment.py, leverage_compressor.py, compression.py, segmented.py,
-contiguous.py, tri_state_compressor.py, compressed_segment.py, segment_adapter.py,
-cache_aware_scheduler.py, multi_node_scheduler.py)은 수정하지 않는다.
+기존 파일(turbo_quant.py, dhd_segment_cache.py, speculative_fetcher.py, sign_vq_segment.py,
+leverage_compressor.py, compression.py, segmented.py, contiguous.py, tri_state_compressor.py,
+compressed_segment.py, segment_adapter.py, cache_aware_scheduler.py, dual_map_scheduler.py,
+multi_node_scheduler.py)은 수정하지 않는다.
 기존 모든 단위·통합 테스트가 회귀 없이 통과해야 한다.
 -->
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-03.md`
-**최우선 구현 타겟**: Cross-2 (B+C) — SemanticSegmentCache(DHD) + TurboQuantCodec(PolarQuant+QJL)
-**A 구성요소**: DualMapScheduler 의미 히트율 가중 이중 해시 라우팅
-**보조 구성요소**: SpeculativeSegmentFetcher (비동기 KV 세그먼트 프리패칭)
+**기반 아이디어 리포트**: `reports/ideas/2026-05-04.md`
+**최우선 구현 타겟**: Cross-1 (A+B) — DAGTopologyScheduler(A-1) + WorkloadAwareTTLCache(B-2) + DAGAwareTTLAdjuster
+**보조 구성요소**: RedundancyAwareEvictionPolicy(C-1) — WorkloadAwareTTLCache 퇴거 품질 향상 레이어
 
 **해결하려는 문제**:
-- 기존 `SegmentedHashCache`와 `SignVQSegmentCache`는 정확 토큰 해시 매칭에만 의존한다.
-  프롬프트 토큰이 하나라도 다르면 비연속 히트가 발생하지 않아 히트율 목표(전체 히트의 30% 비연속)
-  달성이 어렵다.
-- 기존 압축 기법(INT8, Hadamard INT4, CapKV 3-티어)은 −30~75% 메모리 절감을 달성하지만
-  알고리즘 구조상 3비트 이하로 내려가면 정확도 저하가 빠르게 나타난다.
-- 캐시 히트율 기반 스케줄러(`CacheAwareScheduler`)는 의미 유사도가 높은 요청을 같은 캐시
-  인스턴스로 모을 수 없어 Cross-2의 의미 히트 이점을 살리지 못한다.
+- 기존 스케줄러(`CacheAwareScheduler`, `DualMapScheduler`)는 요청 단위 최적화에 머물러 에이전트
+  워크플로우의 DAG 구조(도구 호출 순서, 에이전트 의존 관계)를 활용하지 못한다. 후속 에이전트
+  노드가 현재 노드의 KV를 재사용할 가능성이 높아도 퇴거 결정에 반영되지 않는다.
+- 기존 캐시(`SegmentedHashCache`, `SemanticSegmentCache`)는 세그먼트 내용(해시, 의미 유사도)만
+  보고 사용 시간 패턴(카테고리별 재사용 간격)은 무시한다. KVCache-in-the-Wild 실측에 따르면
+  카테고리별(코드/대화/RAG/에이전틱) TTL을 다르게 설정하면 히트율 23.9% 향상 가능하다.
+- 단순 LRU 퇴거는 세그먼트 중요도와 중복성을 동시에 평가하지 못해 중복 세그먼트가 오랫동안
+  캐시를 점유하고 고유한 중요 세그먼트가 조기 퇴거된다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling — DualMapScheduler (의미 히트율 가중 이중 해시 라우팅)
-- [x] Activity B: Non-Contiguous KV Cache Reuse — SemanticSegmentCache (DHD 의미 유사도 기반)
-- [x] Activity C: KV Cache Compression — TurboQuantCodec (PolarQuant + QJL 3비트)
+- [x] Activity A: KV Cache-aware Scheduling — DAGTopologyScheduler (DAG 위상 기반 KV 선제 보존)
+- [x] Activity B: Non-Contiguous KV Cache Reuse — WorkloadAwareTTLCache (카테고리별 TTL 세그먼트)
+- [x] Activity C: KV Cache Compression (보조) — RedundancyAwareEvictionPolicy (중요도×중복성 이중 스코어 퇴거)
 
 ---
 
 ## 목표
 
-- [ ] 목표 1 (§4 Accuracy 필수): 압축 전후 perplexity 변화 ±1% 이내 — WikiText-2 proxy 검증
-- [ ] 목표 2 (§4 Accuracy 필수): downstream 태스크 정확도 변화 ±1% 이내 — LongBench 3개 서브태스크 proxy 검증
-- [ ] 목표 3 (§4 Memory): KV 캐시 메모리 베이스라인 대비 −60% 이상 (목표 −75%, 평가 기준 최소 −30%)
-- [ ] 목표 4 (§3 Non-Contiguous Hit Rate): 전체 히트 중 의미 기반 비연속 히트 비율 ≥ 30%
-- [ ] 목표 5 (§1 Throughput): tokens/sec 베이스라인 대비 +10% 이상 (목표 +20%)
-- [ ] 목표 6 (§1 TTFT): TTFT p50 베이스라인 대비 +5% 이내 (의미 검색 오버헤드 포함)
-- [ ] 목표 7 (§2 Scheduling): 스케줄링 캐시 히트율 향상 ≥ +10%p (미적용 대비)
-- [ ] 목표 8 (§5 Cross): 복합 메모리 감소 단일 Activity 대비 추가 −10% 이상
+- [ ] 목표 1 (§3 Non-Contiguous Hit Rate): 전체 히트 중 비연속 히트 비율 ≥ 30% (TTL 기반 보존으로 달성)
+- [ ] 목표 2 (§2 Scheduling): 스케줄링 TTFT p50 오버헤드 ≤ +5% (DAG 분석 비용 포함)
+- [ ] 목표 3 (§2 Scheduling): 스케줄링 적용 캐시 히트율 향상 ≥ +10%p (DAG 인식 보존 적용 전 대비)
+- [ ] 목표 4 (§1 Throughput): tokens/sec 베이스라인 대비 +20% 이상 (Cross-1 복합 효과)
+- [ ] 목표 5 (§3 KV Memory Footprint): 베이스라인 대비 +20% 이내 (TTL 퇴거로 메모리 압력 완화)
+- [ ] 목표 6 (§4 Accuracy 필수): 중복성 퇴거 전후 perplexity 변화 ±1% 이내 (proxy 수치 검증)
+- [ ] 목표 7 (§4 Accuracy 필수): downstream 태스크 정확도 변화 ±1% 이내 (proxy 수치 검증)
+- [ ] 목표 8 (§5 Cross): 복합 처리량 향상 단일 Activity 대비 추가 +5% 이상
+- [ ] 목표 9 (§5 Cross): 복합 메모리 감소 단일 Activity 대비 추가 −10% 이상
+- [ ] 목표 10: DAG 재사용 확률 예측 정확도 측정 (예측 KV 보존률 vs 실제 히트 비율, 결과 파일 저장)
 
 ---
 
 ## 아키텍처 개요
 
 ```
-요청 입력
-    │
+워크플로우 DAG 등록
+    │ register_workflow(dag_id, node_graph)
     ▼
-┌────────────────────────────────────────────┐
-│  DualMapScheduler (Activity A)             │
-│  h1(req), h2(req) → 후보 노드 (n1, n2)    │
-│  semantic_hit_score = cosine(req_emb,      │
-│                       node_segment_embs)   │
-│  routing_score = sem_hit × (1 - load)      │
-│  → 최고 점수 노드 선택 + 공정성 보장        │
-└──────────────────────┬─────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────┐
-│  SpeculativeSegmentFetcher (Activity B)    │
-│  이전 배치 처리 중 다음 배치 세그먼트 비동기  │
-│  프리패칭 → 크리티컬 패스에서 KV 검색 제거   │
-└──────────────────────┬─────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────┐
-│  SemanticSegmentCache (Activity B)         │
-│  get(query_emb):                           │
-│    1. 정확 해시 조회 (fast path)            │
-│    2. 코사인 유사도 상위-k 세그먼트 검색     │
-│    3. DHD 편차 체크 → 재계산 결정           │
-│  put(kv, emb):                             │
-│    TurboQuantCodec.encode(kv) → 3비트 저장  │
-│    임베딩 인덱스 갱신                        │
-└──────────────────────┬─────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────┐
-│  TurboQuantCodec (Activity C)              │
-│  PolarQuant: R @ kv → 3비트 스칼라 양자화   │
-│  QJL: 잔차 → 1비트 JL 변환 저장            │
-│  decode: 역양자화 + 잔차 복원 + R^T 역회전  │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  DAGTopologyScheduler (Activity A)                           │
+│  BFS 위상 분석 → 후속 노드 KV 재사용 확률 계산               │
+│  kv_reuse_probability > retain_threshold:                    │
+│    → 세그먼트 핀 고정 (LRU 퇴거 제외)                        │
+│  DAG 미지 요청 → CacheAwareScheduler 위임 (폴백)             │
+└───────────────────────────┬──────────────────────────────────┘
+                            │ {segment_id, dag_reuse_probability} 이벤트
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│  DAGAwareTTLAdjuster (Cross-1 통합 모듈)                     │
+│  adjusted_ttl = base_ttl × (1 + prob × alpha)               │
+│  후속 노드 완료 → TTL 즉시 0 (조기 퇴거 허용)                │
+└───────────────────────────┬──────────────────────────────────┘
+                            │ TTL 조정 명령
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│  WorkloadAwareTTLCache (Activity B)                          │
+│  카테고리 분류 (키워드 룰 / k-NN 첫 32 토큰)                 │
+│  카테고리별 TTL 세그먼트 저장                                 │
+│  evict_candidates() → TTL 만료 후보 목록                     │
+│    └→ RedundancyAwareEvictionPolicy 이중 스코어 적용 (보조)  │
+│  최종 퇴거 실행                                              │
+└──────────────────────────────────────────────────────────────┘
          │
          ▼
-  (hits, misses, hit_types, memory_bytes)
-  hit_type: "exact" | "semantic" | "miss"
-  semantic_recompute_ratio: 재계산 세그먼트 비율
+  (hits, misses, ttl_hits, exact_hits, memory_bytes)
+  hit_type: "exact" | "ttl_preserved" | "miss"
+  eviction_type: "ttl_expired" | "memory_pressure" | "dag_completed"
 ```
 
 ---
@@ -122,222 +118,108 @@ cache_aware_scheduler.py, multi_node_scheduler.py)은 수정하지 않는다.
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/cache/turbo_quant.py` | C | `TurboQuantCodec` — PolarQuant 랜덤 회전 + 3비트 스칼라 양자화 + QJL 잔차 1비트 보정 |
-| `src/cache/dhd_segment_cache.py` | B+C | `SemanticSegmentCache` — 세그먼트 임베딩 + 코사인 유사도 검색 + DHD 편차 기반 선택적 재계산 |
-| `src/scheduler/dual_map_scheduler.py` | A | `DualMapScheduler` — 이중 해시 + 의미 히트율 가중 라우팅 |
-| `src/cache/speculative_fetcher.py` | B | `SpeculativeSegmentFetcher` — 비동기 세그먼트 프리패칭 |
-| `configs/experiments/2026-05-03.yaml` | 공통 | 실험 설정 |
-| `tests/unit/test_turbo_quant.py` | C | TurboQuantCodec 단위 테스트 |
-| `tests/unit/test_turbo_quant_accuracy.py` | C | Accuracy-preserving 검증 테스트 (필수) |
-| `tests/unit/test_dhd_segment_cache.py` | B+C | SemanticSegmentCache 단위 테스트 |
-| `tests/unit/test_dual_map_scheduler.py` | A | DualMapScheduler 단위 테스트 |
-| `tests/integration/test_abc_integration.py` | A+B+C | A+B+C 전체 통합 테스트 |
+| `src/cache/workload_ttl_cache.py` | B | `WorkloadAwareTTLCache` — 카테고리 분류기 + 카테고리별 TTL + LRU-TTL 복합 퇴거. `CacheStore` 인터페이스 구현 |
+| `src/cache/redundancy_eviction.py` | C (보조) | `RedundancyAwareEvictionPolicy` — 중요도×중복성 이중 스코어 퇴거 정책. WorkloadAwareTTLCache의 evict_candidates() 훅에 연결 |
+| `src/scheduler/dag_topology_scheduler.py` | A | `DAGTopologyScheduler` — DAG 메타데이터 수집 + BFS 위상 분석 + KV 선제 보존 결정. CacheAwareScheduler 위임 폴백 |
+| `src/scheduler/dag_ttl_adjuster.py` | A+B (Cross-1) | `DAGAwareTTLAdjuster` — DAGTopologyScheduler 이벤트 구독 + WorkloadAwareTTLCache TTL 동적 조정 |
+| `configs/experiments/2026-05-04.yaml` | 공통 | 실험 설정 YAML |
+| `tests/unit/test_workload_ttl_cache.py` | B | WorkloadAwareTTLCache 단위 테스트 |
+| `tests/unit/test_redundancy_eviction_accuracy.py` | C | RedundancyAwareEvictionPolicy accuracy-preserving 검증 (필수) |
+| `tests/unit/test_dag_topology_scheduler.py` | A | DAGTopologyScheduler 단위 테스트 |
+| `tests/unit/test_dag_ttl_adjuster.py` | A+B | DAGAwareTTLAdjuster 단위 테스트 |
+| `tests/integration/test_cross_ab_dag_ttl.py` | A+B+C | Cross-1 전체 통합 테스트 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/cache/base.py` | 변경 없음 — 기존 CacheStore 인터페이스를 그대로 준수 |
-| `tests/integration/test_abc_e2e.py` | 기존 테스트 유지; 새 통합 테스트는 `test_abc_integration.py`에 별도 작성 |
+| `src/cache/base.py` | 변경 없음 — 기존 CacheStore 인터페이스 그대로 준수 |
 
-**주의**: 기존 파일(`sign_vq_segment.py`, `leverage_compressor.py`, `compression.py`,
-`segmented.py`, `contiguous.py`, `tri_state_compressor.py`, `compressed_segment.py`,
-`segment_adapter.py`, `cache_aware_scheduler.py`, `multi_node_scheduler.py`)은
+**주의**: 기존 파일(`turbo_quant.py`, `dhd_segment_cache.py`, `speculative_fetcher.py`,
+`sign_vq_segment.py`, `leverage_compressor.py`, `compression.py`, `segmented.py`,
+`contiguous.py`, `tri_state_compressor.py`, `compressed_segment.py`, `segment_adapter.py`,
+`cache_aware_scheduler.py`, `dual_map_scheduler.py`, `multi_node_scheduler.py`)은
 이번 사이클에서 수정하지 않는다. 기존 단위·통합 테스트 전부가 회귀 없이 통과해야 한다.
 
 ---
 
 ## 알고리즘 상세
 
-### 1. TurboQuantCodec (Activity C)
+### 1. WorkloadAwareTTLCache (Activity B)
 
-**파일**: `src/cache/turbo_quant.py`
+**파일**: `src/cache/workload_ttl_cache.py`
 
 **핵심 아이디어**:
-- PolarQuant: 레이어별 고정 시드로 생성한 랜덤 직교 회전 행렬 R을 KV에 적용해 outlier 분산을
-  균일하게 재분배한 후 3비트 스칼라 양자화 수행.
-- QJL 잔차 보정: 양자화 잔차를 1비트 JL(Johnson-Lindenstrauss) 변환 (랜덤 ±1 행렬)으로
-  부호 벡터를 저장해 체계적 오류를 교정.
-- 실효 저장 비트: 3비트 본체 + 1비트 QJL = 4비트 이하 (INT4와 동등 저장 공간에서 정확도 우위).
+- 요청을 카테고리(code / chat / rag / agentic)로 분류하고 카테고리별 TTL을 세그먼트에 할당.
+- TTL 만료 세그먼트를 퇴거 1순위 후보로 표시, 메모리 부족 시 TTL 만료 세그먼트 우선 퇴거.
+- 실제 히트·미스 패턴을 카테고리별로 집계해 EMA 방식으로 TTL 프로파일 온라인 갱신.
+- DAGAwareTTLAdjuster로부터 TTL 조정 명령을 수신해 세그먼트 TTL을 동적으로 오버라이드.
 
-**회전 행렬 생성 (레이어별 고정 시드)**:
+**카테고리 분류 로직**:
+```
+키워드 룰 기반 (우선):
+  - "def ", "class ", "import ", "```python" 포함 → "code"
+  - "document", "context:", "passage", "retrieved" 포함 → "rag"
+  - "tool_call", "function_call", "agent", "workflow" 포함 → "agentic"
+  - 그 외 → "chat"
 
-```python
-def _get_rotation_matrix(layer_idx: int, d_head: int) -> torch.Tensor:
-    # 시드 = base_seed XOR (layer_idx * 2654435761)  (Knuth 곱셈 해시)
-    # torch.manual_seed(seed) 후 표준 정규 분포 행렬 생성 → QR 분해로 직교화
-    rng = torch.Generator()
-    rng.manual_seed(base_seed ^ (layer_idx * 2654435761 & 0xFFFFFFFF))
-    raw = torch.randn(d_head, d_head, generator=rng)
-    Q, _ = torch.linalg.qr(raw)  # Q: (d_head, d_head) 직교 행렬
-    return Q  # R = Q
+k-NN 폴백 (키워드 룰 미분류 시, 선택 옵션):
+  - 첫 32 토큰 ID 평균 임베딩 벡터 → K=5 최근접 이웃으로 카테고리 결정
+  - 초기 레이블 없을 경우 "chat" 기본값 사용
+```
+
+**TTL 프로파일 초기값** (KVCache-in-the-Wild 논문 Table 3 기반):
+```
+code:     ttl_base_sec = 600, reuse_probability = 0.75
+chat:     ttl_base_sec = 300, reuse_probability = 0.60
+rag:      ttl_base_sec = 120, reuse_probability = 0.45
+agentic:  ttl_base_sec = 480, reuse_probability = 0.80
 ```
 
 **의사코드**:
 
 ```python
-class TurboQuantCodec:
-    def __init__(
-        self,
-        num_layers: int,
-        bits: int = 3,                    # 스칼라 양자화 비트 수
-        qjl_bits: int = 1,               # QJL 잔차 보정 비트 수
-        base_seed: int = 42,             # 회전 행렬 시드 베이스
-        sensitive_layers_ratio: float = 0.25,  # DepthKV 스타일: 상위 N*ratio 레이어는 4비트
-    ) -> None:
-        # _rotation_cache: Dict[int, torch.Tensor] — 레이어별 회전 행렬 캐시
-        # _qjl_cache: Dict[int, torch.Tensor] — 레이어별 QJL 행렬 캐시
-        # _sensitive_cutoff = int(num_layers * sensitive_layers_ratio)
-        ...
+import time
+from collections import OrderedDict
+from typing import Dict, List, Optional, Set, Tuple
+import torch
 
-    def _get_rotation_matrix(self, layer_idx: int, d_head: int) -> torch.Tensor:
-        # 캐시 조회 후 없으면 생성 (위 의사코드 참조)
-        ...
+from src.cache.base import CacheStore
 
-    def _get_qjl_matrix(self, layer_idx: int, d_head: int, proj_dim: int) -> torch.Tensor:
-        # QJL 행렬: (proj_dim, d_head) float, 각 원소는 ±1/sqrt(proj_dim)
-        # 시드 = base_seed XOR (layer_idx * 1234567891 & 0xFFFFFFFF)
-        rng = torch.Generator()
-        rng.manual_seed(base_seed ^ (layer_idx * 1234567891 & 0xFFFFFFFF))
-        raw = torch.randint(0, 2, (proj_dim, d_head), generator=rng).float()
-        return (2 * raw - 1) / (proj_dim ** 0.5)  # ±1/sqrt(proj_dim)
 
-    def _effective_bits(self, layer_idx: int) -> int:
-        # 민감 레이어(초기 _sensitive_cutoff 레이어)는 4비트, 나머지는 self.bits
-        return 4 if layer_idx < self._sensitive_cutoff else self.bits
+@dataclass
+class TTLEntry:
+    value: torch.Tensor
+    category: str
+    ttl_sec: float
+    created_at: float          # time.monotonic()
+    pinned: bool = False       # DAG 보존 핀 고정
+    importance_score: float = 0.0  # 누적 어텐션 스코어 (RedundancyAwareEvictionPolicy용)
+    embedding: Optional[torch.Tensor] = None  # 중복성 계산용 Key 평균 벡터
 
-    def encode(
-        self,
-        kv: torch.Tensor,   # (n_tokens, d_head) float32 — K 또는 V
-        layer_idx: int,
-        tensor_id: int = 0,
-    ) -> dict:
-        # kv_f = kv.float()
-        # d_head = kv_f.shape[-1]
-        # eff_bits = _effective_bits(layer_idx)
-        # levels = 2 ** eff_bits        예: 3비트 → 8 레벨
 
-        # 1. PolarQuant 회전
-        # R = _get_rotation_matrix(layer_idx, d_head)  # (d_head, d_head)
-        # kv_rotated = kv_f @ R.T                      # (n_tokens, d_head)
-
-        # 2. 3비트 스칼라 양자화 (per-row symmetric)
-        # scale = kv_rotated.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / ((levels-1)/2)
-        # quantized = (kv_rotated / scale).round().clamp(-(levels//2), (levels//2)-1)
-        #             .to(torch.int8)                  # (n_tokens, d_head) int8
-
-        # 3. QJL 잔차 보정
-        # kv_dequant = quantized.float() * scale       # 역양자화 (회전 공간)
-        # residual = kv_rotated - kv_dequant           # 잔차 (n_tokens, d_head)
-        # proj_dim = d_head  (JL 차원 = d_head 사용)
-        # P = _get_qjl_matrix(layer_idx, d_head, proj_dim)  # (proj_dim, d_head)
-        # proj = residual @ P.T                        # (n_tokens, proj_dim)
-        # qjl_bits_tensor = (proj >= 0).to(torch.uint8)    # (n_tokens, proj_dim) 0/1
-        # qjl_packed = torch.packbits(qjl_bits_tensor, dim=-1)  # (n_tokens, ceil(proj_dim/8))
-
-        # return {
-        #     "quantized": quantized,       # (n_tokens, d_head) int8
-        #     "scale": scale,              # (n_tokens, 1) float32
-        #     "qjl_packed": qjl_packed,    # (n_tokens, ceil(proj_dim/8)) uint8
-        #     "layer_idx": layer_idx,
-        #     "tensor_id": tensor_id,
-        #     "d_head": d_head,
-        #     "proj_dim": proj_dim,
-        #     "eff_bits": eff_bits,
-        #     "n_tokens": kv_f.shape[0],
-        # }
-        ...
-
-    def decode(
-        self,
-        compressed: dict,
-        layer_idx: int,
-        tensor_id: int = 0,
-    ) -> torch.Tensor:
-        # d_head = compressed["d_head"]
-        # R = _get_rotation_matrix(layer_idx, d_head)
-        # P = _get_qjl_matrix(layer_idx, d_head, compressed["proj_dim"])
-
-        # 1. 역양자화
-        # kv_dequant = compressed["quantized"].float() * compressed["scale"]  # (n, d_head)
-
-        # 2. QJL 잔차 복원
-        # qjl_unpacked = torch.unpackbits(compressed["qjl_packed"], dim=-1)[:, :compressed["proj_dim"]]
-        # qjl_signs = 2.0 * qjl_unpacked.float() - 1.0    # ±1.0, (n, proj_dim)
-        # residual_approx = qjl_signs @ P                   # (n, d_head) — JL 역변환 근사
-        # kv_corrected = kv_dequant + residual_approx       # (n, d_head) 회전 공간
-
-        # 3. 역회전
-        # return kv_corrected @ R                            # (n, d_head) 원래 공간
-        ...
-
-    def memory_bytes_estimate(
-        self,
-        n_tokens: int,
-        d_head: int,
-        layer_idx: int = 0,
-    ) -> dict:
-        # eff_bits = _effective_bits(layer_idx)
-        # quantized_bytes = n_tokens * d_head * 1          # int8 (1 byte/element, 3비트 → int8 저장)
-        # scale_bytes = n_tokens * 4                       # float32 per-row scale
-        # qjl_bytes = n_tokens * math.ceil(d_head / 8)    # 1비트 packed
-        # total = quantized_bytes + scale_bytes + qjl_bytes
-        # baseline = n_tokens * d_head * 4                 # FP32 기준
-        # return {"total_bytes": total, "baseline_bytes": baseline,
-        #         "reduction_ratio": 1.0 - total / baseline}
-        ...
-
-    def compression_ratio(self, layer_idx: int) -> float:
-        # 3비트 레이어: 1 - (d * 1 + 4 + ceil(d/8)) / (d * 4)
-        # d_head=128 기준: ≈ 75% 절감 (6×)
-        ...
-```
-
-**메모리 계산 (d_head=128, n_tokens=1000 기준)**:
-- FP32 베이스라인: 1000 × 128 × 4 = 512,000 bytes
-- quantized (int8): 1000 × 128 × 1 = 128,000 bytes (3비트 → int8 패킹)
-- scale (float32 per-row): 1000 × 1 × 4 = 4,000 bytes
-- QJL (1비트 packed, proj_dim=128): 1000 × ceil(128/8) = 16,000 bytes
-- **총계**: 148,000 bytes
-- **감소율**: 1 - 148,000/512,000 ≈ **71.1% 감소** (목표 −60% 달성)
-
----
-
-### 2. SemanticSegmentCache (Activity B+C)
-
-**파일**: `src/cache/dhd_segment_cache.py`
-
-**핵심 아이디어**:
-- 세그먼트 임베딩: 청크 내 Key 벡터의 평균 → (d_head,) float32 — 추가 모델 불필요.
-- 유사도 검색: brute-force 코사인 유사도 (N_segments ≤ 10K 가정). FAISS 선택 가능.
-- DHD 판단: 후보 KV와 쿼리 세그먼트 간 head-wise L2 편차 계산.
-  편차 > deviation_threshold인 head/token만 재계산 대상으로 표시.
-- TurboQuantCodec 통합: 저장 시 압축, 조회 시 복원 후 DHD 편차 체크.
-
-```python
-class SemanticSegmentCache(CacheStore):
-    """DHD 의미 유사도 기반 비연속 KV 공유 캐시 (Activity B+C).
+class WorkloadAwareTTLCache(CacheStore):
+    """카테고리별 TTL 세그먼트 보존 KV 캐시 (Activity B).
 
     저장소 구조:
-      _exact_store: OrderedDict[str, torch.Tensor]  — 정확 해시 히트 경로 (압축 KV dict)
-      _semantic_index: List[Tuple[str, torch.Tensor]]  — (key, embedding) 리스트 (유사도 검색용)
-      _compressed_store: Dict[str, dict]  — key → TurboQuantCodec 압축 결과
+      _store: OrderedDict[str, TTLEntry]  — LRU 순서 유지
+      _ttl_profiles: Dict[str, dict]      — 카테고리별 TTL 프로파일 (EMA 갱신)
+      _pinned: Set[str]                   — DAG 핀 고정 세그먼트 키 집합
+      _eviction_policy: Optional[RedundancyAwareEvictionPolicy]  — 보조 퇴거 정책
 
     히트 분류:
-      exact_hits: 정확 토큰 해시 매칭
-      semantic_hits: 코사인 유사도 + DHD 편차 통과 (비연속 히트)
-      recompute_count: DHD 편차 초과로 재계산한 세그먼트 수
+      exact_hits: 정확 키 매칭
+      ttl_preserved_hits: TTL 만료 전 재사용 (비연속 히트로 분류)
+      misses: 미스
     """
 
     def __init__(
         self,
-        codec: "TurboQuantCodec",
-        chunk_size: int = 128,
         max_entries: int = 1000,
-        top_k: int = 5,                     # 유사도 검색 상위-k 후보 수
-        similarity_threshold: float = 0.80,  # 코사인 유사도 최소 임계값
-        deviation_threshold: float = 0.20,   # DHD L2 편차 임계값 (token당 정규화)
-        recompute_budget: float = 0.20,      # 전체 세그먼트 중 최대 재계산 비율
+        chunk_size: int = 128,
+        ttl_ema_alpha: float = 0.1,       # EMA 갱신 계수
+        eviction_policy: Optional["RedundancyAwareEvictionPolicy"] = None,
+        ttl_profiles: Optional[Dict[str, dict]] = None,
     ) -> None: ...
 
     # ------------------------------------------------------------------ #
@@ -345,128 +227,96 @@ class SemanticSegmentCache(CacheStore):
     # ------------------------------------------------------------------ #
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        # CacheStore 인터페이스 준수용 raw put (압축 없이)
-        # 내부적으로 _exact_store[key] = value
+        # 카테고리 미지정 시 "chat" 기본값으로 TTLEntry 생성
+        # put_segment() 권장; 이 메서드는 하위 호환성 유지용
         ...
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        # 정확 해시 조회만 (의미 검색은 get_semantic() 사용)
+        # TTL 만료 체크: (time.monotonic() - entry.created_at) > entry.ttl_sec → miss
+        # 미만이면 hit; exact_hits 또는 ttl_preserved_hits 카운터 증가
+        # LRU 갱신: _store.move_to_end(key)
         ...
 
     def evict(self) -> int:
-        # LRU 퇴거: _exact_store, _compressed_store, _semantic_index 동기화
+        # 1단계: TTL 만료 세그먼트 목록 생성 (핀 고정 제외)
+        # 2단계: eviction_policy가 있으면 이중 스코어로 정렬
+        # 3단계: 최고 eviction_score 세그먼트 퇴거
+        # 4단계: TTL 만료 세그먼트 없으면 LRU 폴백 (비핀 고정 중 가장 오래된 것)
         ...
 
     def hit_rate(self) -> float:
-        # (exact_hits + semantic_hits) / (exact_hits + semantic_hits + misses)
+        # (exact_hits + ttl_preserved_hits) / total
         ...
 
     def memory_bytes(self) -> int:
-        # _compressed_store의 모든 압축 dict 크기 합산
+        # _store의 모든 value.nbytes 합산
         ...
 
     def reset_stats(self) -> None:
-        # exact_hits, semantic_hits, misses, recompute_count 초기화
+        # exact_hits, ttl_preserved_hits, misses, eviction_counts 초기화
         ...
 
     # ------------------------------------------------------------------ #
-    # 확장 API (B+C 통합)                                                  #
+    # 확장 API                                                             #
     # ------------------------------------------------------------------ #
 
     def put_segment(
         self,
-        token_ids: List[int],
-        chunk_idx: int,
-        keys: torch.Tensor,    # (n_tokens_in_chunk, d_head)
-        values: torch.Tensor,  # (n_tokens_in_chunk, d_head)
-        layer_idx: int = 0,
+        key: str,
+        value: torch.Tensor,
+        category: str,
+        embedding: Optional[torch.Tensor] = None,
+        override_ttl_sec: Optional[float] = None,
     ) -> None:
-        # 1. 청크 키 생성 (SHA-256, segmented.py 방식 동일)
-        # 2. 세그먼트 임베딩 계산: embedding = keys.mean(dim=0)  # (d_head,)
-        # 3. TurboQuantCodec.encode(keys) → k_compressed
-        #    TurboQuantCodec.encode(values) → v_compressed
-        # 4. _compressed_store[key] = {"k": k_compressed, "v": v_compressed, "layer_idx": ...}
-        # 5. _semantic_index 갱신: append((key, embedding))
-        # 6. max_entries 초과 시 evict()
+        # TTLEntry 생성: ttl_sec = override_ttl_sec or _ttl_profiles[category]["ttl_base_sec"]
+        # embedding 저장 (중복성 계산용)
+        # max_entries 초과 시 evict()
         ...
 
-    def get_segment(
-        self,
-        token_ids: List[int],
-        chunk_idx: int,
-        query_keys: torch.Tensor,  # (n_tokens_in_chunk, d_head) — DHD 편차 체크용
-        layer_idx: int = 0,
-    ) -> Tuple[Optional[torch.Tensor], str]:
-        # Returns: (kv_tensor or None, hit_type)
-        # hit_type: "exact" | "semantic" | "miss"
-
-        # 1. 정확 해시 조회
-        # key = chunk_key(token_ids, chunk_idx, layer_idx)
-        # if key in _compressed_store:
-        #     k = codec.decode(_compressed_store[key]["k"], layer_idx)
-        #     v = codec.decode(_compressed_store[key]["v"], layer_idx)
-        #     exact_hits += 1
-        #     return torch.cat([k, v], dim=-1), "exact"
-
-        # 2. 의미 유사도 검색
-        # query_emb = query_keys.mean(dim=0)  # (d_head,)
-        # top_k_candidates = _cosine_search(query_emb, top_k)
-        # for (cand_key, cand_emb, cos_sim) in top_k_candidates:
-        #     if cos_sim < similarity_threshold:
-        #         continue
-        #     k_cand = codec.decode(_compressed_store[cand_key]["k"], layer_idx)
-        #     v_cand = codec.decode(_compressed_store[cand_key]["v"], layer_idx)
-        #     # DHD 편차 체크
-        #     deviation = _compute_dhd_deviation(query_keys, k_cand)
-        #     if deviation <= deviation_threshold:
-        #         semantic_hits += 1
-        #         return torch.cat([k_cand, v_cand], dim=-1), "semantic"
-        #     else:
-        #         # 편차 > threshold: 편차 큰 token만 재계산 표시
-        #         recompute_count += 1
-        #         return None, "miss"  # 호출자가 재계산 수행
-
-        # 3. 미스
-        # misses += 1
-        # return None, "miss"
+    def adjust_ttl(self, key: str, new_ttl_sec: float) -> None:
+        # DAGAwareTTLAdjuster 호출용: 특정 세그먼트 TTL 즉시 변경
+        # new_ttl_sec == 0.0이면 즉시 퇴거 후보로 표시 (expires_at = created_at)
         ...
 
-    def _cosine_search(
-        self,
-        query_emb: torch.Tensor,  # (d_head,)
-        top_k: int,
-    ) -> List[Tuple[str, torch.Tensor, float]]:
-        # _semantic_index의 모든 (key, emb) 대상 코사인 유사도 계산
-        # emb_matrix = torch.stack([emb for _, emb in _semantic_index])  # (N, d_head)
-        # q_norm = F.normalize(query_emb.unsqueeze(0), dim=-1)         # (1, d_head)
-        # e_norm = F.normalize(emb_matrix, dim=-1)                     # (N, d_head)
-        # sims = (q_norm @ e_norm.T).squeeze(0)                        # (N,)
-        # top_k_idx = sims.argsort(descending=True)[:top_k]
-        # return [(key, emb, sims[i].item()) for i, (key, emb) in ...]
+    def pin(self, key: str) -> None:
+        # _pinned에 key 추가 → evict()에서 제외
         ...
 
-    def _compute_dhd_deviation(
-        self,
-        query_keys: torch.Tensor,   # (n_tokens, d_head)
-        cached_keys: torch.Tensor,  # (n_tokens, d_head) — 후보 세그먼트 Key
-    ) -> float:
-        # 두 텐서의 행 수가 다를 수 있음 → min 길이로 잘라서 비교
-        # min_len = min(query_keys.shape[0], cached_keys.shape[0])
-        # q = query_keys[:min_len]
-        # c = cached_keys[:min_len]
-        # deviation = (q - c).norm(dim=-1).mean().item() / (c.norm(dim=-1).mean().item() + 1e-8)
-        # return deviation  # 정규화된 편차 (0~∞, deviation_threshold와 비교)
+    def unpin(self, key: str) -> None:
+        # _pinned에서 key 제거
         ...
 
-    def semantic_hit_rates(self) -> dict:
-        # total = exact_hits + semantic_hits + misses
-        # return {
-        #     "exact_hit_rate": exact_hits / total,
-        #     "semantic_hit_rate": semantic_hits / total,
-        #     "overall_hit_rate": (exact_hits + semantic_hits) / total,
-        #     "noncontiguous_ratio": semantic_hits / (exact_hits + semantic_hits) if hits > 0 else 0,
-        #     "recompute_ratio": recompute_count / max(1, exact_hits + semantic_hits),
+    def evict_candidates(self) -> List[str]:
+        # TTL 만료 세그먼트 키 목록 반환 (핀 고정 제외)
+        # RedundancyAwareEvictionPolicy가 이 목록을 스코어링함
+        ...
+
+    def record_hit(self, key: str, is_ttl_preserved: bool = False) -> None:
+        # 히트 기록 + EMA 온라인 TTL 갱신
+        # category = _store[key].category
+        # reuse_gap = time.monotonic() - _store[key].created_at
+        # _ttl_profiles[category]["ttl_base_sec"] =
+        #     (1 - ema_alpha) × old_ttl + ema_alpha × reuse_gap × ttl_multiplier
+        ...
+
+    def record_importance(self, key: str, score: float) -> None:
+        # 어텐션 스코어 누적 (RedundancyAwareEvictionPolicy 중요도 계산용)
+        ...
+
+    def ttl_hit_stats(self) -> dict:
+        # {
+        #   "exact_hit_rate": exact_hits / total,
+        #   "ttl_preserved_hit_rate": ttl_preserved_hits / total,
+        #   "overall_hit_rate": (exact_hits + ttl_preserved_hits) / total,
+        #   "noncontiguous_ratio": ttl_preserved_hits / (exact_hits + ttl_preserved_hits),
+        #   "eviction_ttl_count": int,   # TTL 만료 퇴거 수
+        #   "eviction_pressure_count": int,  # 메모리 압력 퇴거 수
         # }
+        ...
+
+    def _classify_category(self, key: str, token_ids: Optional[List[int]] = None) -> str:
+        # 키워드 룰 기반 분류 (key 문자열에서 메타데이터 추출 불가 시 token_ids 사용)
+        # 폴백: "chat"
         ...
 
     def chunk_key(
@@ -475,7 +325,7 @@ class SemanticSegmentCache(CacheStore):
         chunk_idx: int,
         layer_idx: int = 0,
     ) -> str:
-        # segmented.py와 동일한 SHA-256 방식
+        # segmented.py와 동일한 SHA-256 방식 (SegmentedHashCache.chunk_key 호환)
         import hashlib, struct
         start = chunk_idx * self.chunk_size
         chunk = token_ids[start : start + self.chunk_size]
@@ -486,142 +336,320 @@ class SemanticSegmentCache(CacheStore):
 
 ---
 
-### 3. DualMapScheduler (Activity A)
+### 2. RedundancyAwareEvictionPolicy (Activity C 보조)
 
-**파일**: `src/scheduler/dual_map_scheduler.py`
+**파일**: `src/cache/redundancy_eviction.py`
 
 **핵심 아이디어**:
-- 각 요청에 두 독립 해시 함수 h1, h2를 적용해 두 후보 노드 (n1, n2)를 선택.
-- 각 후보 노드에서 "의미 히트율": 요청 임베딩과 노드 캐시 세그먼트 임베딩 간 코사인 유사도 상위-k 평균.
-- 라우팅 스코어 = semantic_hit_rate × (1 - load_ratio).
-- SLO 위반 시 부하 기준만으로 선택 (안전 전환).
-- 단일 노드 시뮬레이션: num_nodes=1 설정 가능.
+- 중요도 스코어(누적 어텐션 스코어)와 중복성 스코어(Key 벡터 코사인 유사도 평균)를 결합.
+- `eviction_score = (1 - importance_score) × redundancy_score` — 중요도 낮고 중복성 높은 세그먼트 우선 퇴거.
+- WorkloadAwareTTLCache의 `evict_candidates()` 훅에 연결해 TTL 만료 후보 중에서만 스코어링.
+- 훈련 불필요, N ≤ 100 세그먼트에서 brute-force O(N × chunk_size × d_head) 허용.
 
-**스케줄링 단위**: 요청(request) 단위 라우팅. 배치 구성 후 각 요청에 `target_node_id` 속성을 주석(annotation)으로 추가.
+**accuracy-preserving 근거**:
+- 이중 스코어의 곱 형태(`(1-importance) × redundancy`)가 중요 토큰(importance 높음)을 구조적으로
+  보호한다. 중요성이 낮은 후보 중에서만 중복성으로 우선순위를 조정하므로 false negative(중요 토큰
+  퇴거) 위험이 없다.
+- RAG 중복 문서 등 의미적으로 동일한 세그먼트를 우선 퇴거해 정확도 마진을 확보하면서 메모리 압력
+  완화가 가능하다.
 
-**캐시 상태 접근**: 각 노드는 `SemanticSegmentCache` 인스턴스를 보유하며, 스케줄러는 `cache._semantic_index`를 읽어 임베딩 인덱스를 접근한다 (조회 통계를 오염시키지 않기 위해 직접 접근).
+**의사코드**:
 
 ```python
-@dataclass
-class NodeState:
-    node_id: str
-    cache: "SemanticSegmentCache"
-    current_load: float = 0.0      # 0.0~1.0
-    slo_violation: bool = False    # True이면 부하 기준으로만 라우팅
+from typing import Dict, List, Optional, Tuple
+import torch
+import torch.nn.functional as F
 
-class DualMapScheduler:
+
+class RedundancyAwareEvictionPolicy:
+    """중요도×중복성 이중 스코어 퇴거 정책 (Activity C 보조).
+
+    WorkloadAwareTTLCache.evict_candidates() 결과에 적용하는 drop-in 퇴거 정책.
+    CacheStore를 상속하지 않음 — 순수 스코어링 레이어.
+    """
+
     def __init__(
         self,
-        nodes: List[NodeState],
-        slo_ttft_ms: float = 200.0,       # SLO 위반 임계값 (ms)
-        top_k_semantic: int = 5,          # 의미 히트율 계산 시 상위-k
-        fairness_max_wait: int = 10,      # 공정성 최대 대기 스텝
-        hash_seed_1: int = 2654435761,    # h1 해시 시드
-        hash_seed_2: int = 1234567891,    # h2 해시 시드
+        redundancy_top_n: int = 100,     # 중복성 계산 대상 상위 N 세그먼트
+        importance_weight: float = 1.0,  # 중요도 가중치
+        redundancy_weight: float = 1.0,  # 중복성 가중치
+        doc_id_shortcut: bool = True,    # 문서 ID 기반 중복 감지 단축 경로
     ) -> None: ...
 
-    def _node_index_h1(self, request_id: str) -> int:
-        # hash(hash_seed_1 XOR hash(request_id)) % len(nodes)
-        ...
-
-    def _node_index_h2(self, request_id: str) -> int:
-        # hash(hash_seed_2 XOR hash(request_id)) % len(nodes)
-        # 보장: h1 != h2 (같으면 (h2 + 1) % len(nodes))
-        ...
-
-    def _semantic_hit_score(
+    def score_candidates(
         self,
-        request_embedding: torch.Tensor,  # (d_head,) 요청 임베딩
-        node: NodeState,
-    ) -> float:
-        # node.cache._semantic_index에서 임베딩 목록 조회 (통계 비오염)
-        # 상위 top_k_semantic 코사인 유사도 평균 반환
-        # _semantic_index가 비어있으면 0.0 반환
+        candidates: List[str],           # evict_candidates()에서 받은 키 목록
+        store_entries: Dict[str, "TTLEntry"],  # _store 직접 참조
+    ) -> List[Tuple[str, float]]:
+        """Returns (key, eviction_score) pairs sorted by score descending.
+
+        eviction_score = (1 - normalized_importance) × redundancy_score
+        높을수록 먼저 퇴거.
+        """
+        # 1. 중요도 정규화:
+        #    max_imp = max(e.importance_score for e in candidates_entries) or 1.0
+        #    normalized_importance[key] = entry.importance_score / max_imp
+
+        # 2. 중복성 스코어 계산 (N ≤ redundancy_top_n인 경우 brute-force):
+        #    embeddings = [store[k].embedding for k in candidates if store[k].embedding is not None]
+        #    emb_matrix = torch.stack(embeddings)  # (N, d_head)
+        #    e_norm = F.normalize(emb_matrix, dim=-1)
+        #    sim_matrix = e_norm @ e_norm.T        # (N, N)
+        #    # 자기 자신 제외
+        #    sim_matrix.fill_diagonal_(0.0)
+        #    redundancy[key] = sim_matrix[i].mean().item()
+
+        # 3. doc_id_shortcut: key에 doc_id 접두사가 동일한 세그먼트 → 즉시 redundancy=1.0
+
+        # 4. eviction_score = (1 - normalized_importance) × redundancy_score
         ...
 
-    def _request_embedding(self, request: InferenceRequest) -> torch.Tensor:
-        # 요청 토큰 임베딩 근사: token_ids를 float 벡터로 변환 후 정규화
-        # 실제 임베딩 모델 없이: token_ids의 평균을 d_head 차원으로 확장
-        # (d_head는 nodes[0].cache._semantic_index[0][1].shape[-1] 참조)
-        # token_mean = mean(token_ids) → scalar
-        # 시드 기반 pseudo-random 벡터: torch.manual_seed(int(token_mean)) → randn(d_head)
-        ...
-
-    def route(self, request: InferenceRequest) -> str:
-        # Returns: target node_id
-
-        # 1. SLO 위반 노드 확인
-        # 2. 두 후보 노드 선택: idx1 = h1(req.request_id), idx2 = h2(req.request_id)
-        # 3. 의미 히트율 계산: score_i = semantic_hit_score(req_emb, node_i) × (1 - node_i.load)
-        # 4. SLO 위반 시: score = (1 - load) 만으로 결정
-        # 5. 공정성 보정: wait_steps >= fairness_max_wait이면 부하 기준으로만 선택
-        # 6. 최고 점수 노드 반환
-        ...
-
-    def schedule(self, requests: List[InferenceRequest]) -> List[InferenceRequest]:
-        # 각 요청에 target_node_id 주석 추가 후 의미 히트율 내림차순 정렬
-        # 동일 노드 대상 요청끼리 묶어서 배치 형성 (캐시 지역성 향상)
-        ...
-
-    def update_load(self, node_id: str, load: float) -> None:
-        # 노드 부하 업데이트
-        ...
-
-    def update_slo_status(self, node_id: str, violated: bool) -> None:
-        # SLO 위반 상태 업데이트
+    def select_evict_keys(
+        self,
+        candidates: List[str],
+        store_entries: Dict[str, "TTLEntry"],
+        n_evict: int = 1,
+    ) -> List[str]:
+        # score_candidates() 후 상위 n_evict 키 반환
         ...
 ```
 
 ---
 
-### 4. SpeculativeSegmentFetcher (Activity B)
+### 3. DAGTopologyScheduler (Activity A)
 
-**파일**: `src/cache/speculative_fetcher.py`
+**파일**: `src/scheduler/dag_topology_scheduler.py`
 
 **핵심 아이디어**:
-- 이전 배치 처리 중에 다음 배치 요청의 세그먼트 검색을 비동기로 미리 실행.
-- `threading.Thread`로 비동기 프리패치 실행 (GPU 없이 CPU에서 유사도 검색 수행).
-- 최대 대기 시간 초과 시 miss로 처리 (TTFT 보호).
+- 에이전트 워크플로우 DAG(노드 = 에이전트/도구 호출, 엣지 = 의존 관계)를 등록.
+- BFS/DFS로 DAG를 위상 순회해 각 노드의 후속 노드 수(out_degree)와 KV 공유 확률 계산.
+- KV 재사용 확률 > retain_threshold인 세그먼트를 WorkloadAwareTTLCache.pin()으로 핀 고정.
+- 워크플로우 실행 완료된 노드의 세그먼트는 unpin() + TTL 즉시 단축.
+- DAG 미지 요청은 기존 `CacheAwareScheduler`에 위임(폴백).
+- Bélády 상한 계산(시뮬레이션 기반)을 벤치마크 비교 도구로 포함.
+
+**스케줄링 결정 단위**: 배치(batch) 단위. 배치 내 각 요청에 `dag_node_id`와 `kv_reuse_probability` 주석 추가.
+
+**캐시 상태 접근**: `WorkloadAwareTTLCache.pin()` / `unpin()` / `adjust_ttl()`을 통해서만 캐시 상태를 수정. 통계 오염 없음.
+
+**DAG 노드 JSON 포맷**:
+```json
+{
+  "dag_id": "workflow_001",
+  "nodes": [
+    {
+      "agent_id": "agent_A",
+      "tool_calls": ["tool_1", "tool_2"],
+      "expected_kv_tokens": 512,
+      "parent_ids": []
+    },
+    {
+      "agent_id": "agent_B",
+      "tool_calls": ["tool_3"],
+      "expected_kv_tokens": 256,
+      "parent_ids": ["agent_A"]
+    }
+  ]
+}
+```
+
+**의사코드**:
 
 ```python
-class SpeculativeSegmentFetcher:
+import json
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+import torch
+
+from src.scheduler.cache_aware_scheduler import CacheAwareScheduler
+from src.engine.runner import InferenceRequest
+
+
+@dataclass
+class DAGNode:
+    agent_id: str
+    tool_calls: List[str]
+    expected_kv_tokens: int
+    parent_ids: List[str]
+    out_degree: int = 0              # BFS 분석 후 채워짐
+    kv_reuse_probability: float = 0.0
+
+
+@dataclass
+class WorkflowDAG:
+    dag_id: str
+    nodes: Dict[str, DAGNode]        # agent_id → DAGNode
+    topological_order: List[str]     # BFS 위상 순서
+    completed_nodes: Set[str] = field(default_factory=set)
+    belady_upper_bound: float = 0.0  # Bélády 상한 (시뮬레이션 계산)
+
+
+class DAGTopologyScheduler:
+    """워크플로우 DAG 위상 기반 KV 선제 보존 스케줄러 (Activity A).
+
+    스케줄링 결정 단위: 배치(batch).
+    캐시 접근 방법: WorkloadAwareTTLCache.pin() / unpin() / adjust_ttl() 전용 API.
+    """
+
     def __init__(
         self,
-        cache: "SemanticSegmentCache",
-        max_wait_ms: float = 5.0,     # 프리패치 결과 대기 최대 시간
-        prefetch_depth: int = 1,       # 미래 배치 깊이 (1 = 다음 배치만)
+        cache: "WorkloadAwareTTLCache",
+        fallback_scheduler: Optional[CacheAwareScheduler] = None,
+        retain_threshold: float = 0.5,  # KV 보존 결정 최소 확률
+        alpha_ttl_extend: float = 2.0,  # TTL 연장 계수 (DAGAwareTTLAdjuster 전달용)
+        kv_reuse_histogram: Optional[Dict] = None,  # 워크플로우별 히스토그램 (결과 저장용)
     ) -> None: ...
 
-    def prefetch_async(
+    def register_workflow(self, dag_spec: dict) -> str:
+        """DAG JSON 스펙을 파싱하고 위상 분석 후 dag_id 반환.
+
+        Args:
+            dag_spec: DAG JSON 딕셔너리
+        Returns:
+            dag_id: 등록된 워크플로우 식별자
+        """
+        # 1. DAGNode 목록 파싱
+        # 2. BFS 위상 순회: deque를 사용한 Kahn 알고리즘
+        #    in_degree = {node_id: len(parents) for ...}
+        #    queue = deque(node_id for node_id in nodes if in_degree[node_id] == 0)
+        #    topological_order = []
+        #    while queue:
+        #        node_id = queue.popleft()
+        #        topological_order.append(node_id)
+        #        for child in children[node_id]:
+        #            in_degree[child] -= 1
+        #            if in_degree[child] == 0:
+        #                queue.append(child)
+        # 3. out_degree 계산: 각 노드의 자식 수
+        # 4. kv_reuse_probability 계산:
+        #    prob[node] = out_degree[node] / max(1, max_out_degree) × base_weight
+        #    base_weight: 10회 이상 실행된 워크플로우는 히스토그램 기반, 미만은 out_degree 기반
+        # 5. Bélády 상한 시뮬레이션: 모든 노드 KV를 알고 있다고 가정 시 최적 히트율 계산
+        # 6. WorkflowDAG 저장: _workflows[dag_id] = dag
+        ...
+
+    def schedule(self, requests: List[InferenceRequest]) -> List[InferenceRequest]:
+        """배치 내 각 요청에 dag_node_id와 kv_reuse_probability 주석 추가.
+
+        DAG 등록된 요청: pin() 호출 + kv_reuse_probability 주석
+        DAG 미지 요청: fallback_scheduler 위임
+        Returns: 주석 추가된 요청 목록 (순서 변경 없음)
+        """
+        ...
+
+    def notify_node_complete(self, dag_id: str, agent_id: str) -> None:
+        """DAG 노드 처리 완료 알림 → 해당 세그먼트 핀 해제 + TTL 단축.
+
+        completed_nodes에 agent_id 추가.
+        연결된 WorkloadAwareTTLCache에 unpin() 호출.
+        DAGAwareTTLAdjuster에 완료 이벤트 발행.
+        """
+        ...
+
+    def predict_kv_reuse(self, dag_id: str, agent_id: str) -> float:
+        """특정 DAG 노드의 KV 재사용 확률 반환.
+
+        _workflows[dag_id].nodes[agent_id].kv_reuse_probability
+        DAG 미등록 시 0.0 반환
+        """
+        ...
+
+    def compute_belady_upper_bound(self, dag_id: str) -> float:
+        """Bélády 최적 정책 시뮬레이션으로 캐시 히트율 상한 계산.
+
+        완전 정보 가정(모든 미래 접근 패턴 알고 있음)에서 최적 퇴거 시 달성 가능한 히트율.
+        실제 히트율과의 gap을 측정해 개선 여지를 정량화.
+        Returns: 상한 히트율 (0.0~1.0)
+        """
+        ...
+
+    def save_reuse_histogram(self, output_path: str) -> None:
+        """kv_reuse_probability 히스토그램을 JSON 파일로 저장.
+
+        결과 파일: results/<exp>/kv_reuse_histogram.json
+        """
+        ...
+
+    def _build_children_map(
+        self, nodes: Dict[str, DAGNode]
+    ) -> Dict[str, List[str]]:
+        # {parent_id: [child_id, ...]} 역방향 그래프 구성
+        ...
+```
+
+---
+
+### 4. DAGAwareTTLAdjuster (Cross-1 통합 모듈)
+
+**파일**: `src/scheduler/dag_ttl_adjuster.py`
+
+**핵심 아이디어**:
+- DAGTopologyScheduler에서 `{segment_key, dag_reuse_probability}` 이벤트를 수신.
+- `adjusted_ttl = base_ttl × (1 + dag_reuse_probability × alpha)` 공식으로 TTL 연장.
+- 후속 노드 완료 시 TTL 즉시 0으로 설정(조기 퇴거 허용).
+- 이벤트 수신 → TTL 갱신 지연을 측정해 오버헤드 보고.
+
+```python
+import time
+from typing import Callable, Dict, Optional
+
+
+class DAGAwareTTLAdjuster:
+    """DAG 이벤트를 WorkloadAwareTTLCache TTL 조정으로 변환하는 중간 레이어 (Cross-1).
+
+    DAGTopologyScheduler와 WorkloadAwareTTLCache 사이의 결합을 최소화하는 어댑터.
+    """
+
+    def __init__(
         self,
-        requests: List[InferenceRequest],   # 다음 배치 요청들
-        layer_idx: int = 0,
+        cache: "WorkloadAwareTTLCache",
+        alpha: float = 2.0,              # TTL 연장 계수
+        measure_latency: bool = True,    # 이벤트→TTL 갱신 지연 측정
     ) -> None:
-        # threading.Thread로 _prefetch_worker 실행
-        # _prefetch_cache: Dict[str, dict] — request_id → {chunk_idx → (kv, hit_type)}
+        self.cache = cache
+        self.alpha = alpha
+        self.measure_latency = measure_latency
+        self._latency_samples: list = []   # 이벤트→갱신 지연 (ms) 목록
         ...
 
-    def _prefetch_worker(
+    def on_kv_reuse_event(
         self,
-        requests: List[InferenceRequest],
-        layer_idx: int,
+        segment_key: str,
+        dag_reuse_probability: float,
     ) -> None:
-        # 각 요청의 청크별 get_segment() 호출 (통계 오염 없이 _compressed_store 직접 조회)
-        # 결과를 _prefetch_cache에 저장
+        """KV 재사용 확률 이벤트 수신 → TTL 연장.
+
+        t0 = time.monotonic()
+        entry = cache._store.get(segment_key)
+        if entry is None: return
+        base_ttl = cache._ttl_profiles[entry.category]["ttl_base_sec"]
+        adjusted_ttl = base_ttl × (1 + dag_reuse_probability × alpha)
+        cache.adjust_ttl(segment_key, adjusted_ttl)
+        if measure_latency:
+            _latency_samples.append((time.monotonic() - t0) × 1000)
+        """
         ...
 
-    def get_prefetched(
-        self,
-        request: InferenceRequest,
-        chunk_idx: int,
-        timeout_ms: float = None,  # None이면 max_wait_ms 사용
-    ) -> Optional[Tuple[torch.Tensor, str]]:
-        # _prefetch_cache에서 결과 조회 (있으면 즉시 반환, 없으면 None)
-        # thread.join(timeout=timeout_ms/1000) 후 조회
+    def on_node_complete(self, segment_key: str) -> None:
+        """후속 노드 완료 이벤트 → TTL 즉시 0 설정 (조기 퇴거 허용).
+
+        cache.adjust_ttl(segment_key, new_ttl_sec=0.0)
+        cache.unpin(segment_key)
+        """
         ...
 
-    def clear(self) -> None:
-        # _prefetch_cache 초기화, 실행 중 thread 종료 대기
+    def overhead_stats(self) -> dict:
+        """이벤트→TTL 갱신 지연 통계 반환.
+
+        Returns:
+            {
+              "p50_ms": float,
+              "p99_ms": float,
+              "mean_ms": float,
+              "n_samples": int,
+            }
+        """
         ...
 ```
 
@@ -629,84 +657,88 @@ class SpeculativeSegmentFetcher:
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-**이 섹션은 Activity C 포함으로 인해 반드시 완성되어야 한다. 검증 계획 없이 Spec.md를 완성하지 않는다.**
+**이 섹션은 Activity C(RedundancyAwareEvictionPolicy) 포함으로 인해 반드시 완성한다.
+검증 계획 없이 Spec.md를 완성하지 않는다.**
+
+### 설계상 accuracy-preserving 근거
+
+`RedundancyAwareEvictionPolicy`는 퇴거 후보를 새로 생성하지 않는다. 오직 이미
+`WorkloadAwareTTLCache.evict_candidates()`가 반환한 TTL 만료 세그먼트 중에서 퇴거 순서를
+조정할 뿐이다. 따라서:
+
+1. **중요 토큰 보호**: `eviction_score = (1 - importance) × redundancy`의 곱 구조에 의해,
+   어텐션 스코어가 높은(importance ≈ 1.0) 세그먼트는 eviction_score ≈ 0.0이 되어 퇴거 우선순위
+   최하위로 밀린다. 구조적으로 중요 세그먼트를 퇴거할 수 없다.
+2. **중복 세그먼트 우선 퇴거**: RAG 시나리오에서 동일 문서의 중복 청크(redundancy ≈ 1.0)가
+   먼저 퇴거되어 고유 정보 손실 없이 메모리를 확보한다.
+3. **TTL 만료 후 처리**: TTL이 이미 만료된 세그먼트만 대상이므로, 정상 TTL 범위 내 세그먼트는
+   이 정책으로 퇴거되지 않는다.
 
 ### perplexity 측정 계획
 
 - **데이터셋**: WikiText-2 (wikitext-2-raw-v1, 표준 분할)
-- **모델**: GPT-2 (소형, d_head=64, 12레이어) — CPU에서 실행 가능한 표준 모델
-- **측정 방법**: stride=512, max_length=1024 슬라이딩 윈도우 perplexity 계산
-- **허용 오차**: `|PPL_compressed - PPL_baseline| / PPL_baseline ≤ 0.01` (±1% 이내)
+- **모델**: GPT-2 (소형, 12레이어) — CPU 실행 가능 표준 모델
+- **측정 방법**: stride=512, max_length=1024 슬라이딩 윈도우 perplexity
+- **허용 오차**: `|PPL_with_eviction - PPL_baseline| / PPL_baseline ≤ 0.01` (±1% 이내)
 - **수치 프록시** (단위 테스트, 실제 모델 호출 없이):
-  - KL divergence proxy: `(decoded_kv - original_kv).norm() / original_kv.norm() ≤ 0.10` (10% 정규화 오류)
-  - MSE 비율: `MSE(decoded, original) / MSE(zeros, original) < 0.15` — perplexity ±1% bound 근사
-  - Cosine similarity: `cosine_sim(decoded, original).mean() ≥ 0.95` (FP32 기준)
+  - 중복 세그먼트 퇴거 후 잔존 세그먼트의 Key 벡터 평균 코사인 유사도(퇴거 전 vs 후): ≥ 0.99
+    (중요 정보가 보존됨을 수치로 검증)
+  - 중요도 높은 세그먼트(importance_score > 0.8)가 퇴거 후에도 캐시에 잔존: 100% 보장
+  - 정규화 재구성 오류(잔존 KV 대표성 손실): ≤ 2% (중복 제거로 인한 정보 손실 상한)
 
 ### 태스크 정확도 측정 계획
 
-- **벤치마크 1**: LongBench-QA (단일 문서 QA, ROUGE-L 점수) — 수치 프록시: 방향 보존 cosine ≥ 0.95
-- **벤치마크 2**: LongBench-Summarization (GovReport, ROUGE-1 점수) — 수치 프록시: 정규화 오류 ≤ 10%
-- **벤치마크 3**: LongBench-Few-shot (TriviaQA, exact match 점수) — 수치 프록시: MSE 비율 < 0.15
+- **벤치마크 1**: LongBench-QA (단일 문서 QA, ROUGE-L 점수) — proxy: 중요 세그먼트 보존율 100%
+- **벤치마크 2**: AIME 추론 (CoT 중복성 효과 확인) — proxy: 자기 성찰 패턴 중복 세그먼트
+  퇴거 후 비중복 세그먼트 Hit Rate 변화 ≤ 1%p
 - **허용 오차**: 각 서브태스크 절대 정확도 변화 ±1% 이내
-- **QJL 잔차 보정 효과 검증**: encode → decode 후 코사인 유사도가 QJL 보정 없는 버전 대비
-  ≥ 0.02 향상 (1%p 이상 향상)
+- **이중 스코어 효과 검증**: 단순 LRU 퇴거 vs 이중 스코어 퇴거 비교 시,
+  이중 스코어가 동등 메모리 절감에서 더 낮은 중요 토큰 퇴거율을 달성함을 수치로 검증
 
-### 검증 테스트 파일: `tests/unit/test_turbo_quant_accuracy.py`
-
-이 파일은 실제 모델 호출 없이 수치 프록시로 accuracy-preserving을 검증한다.
-실제 perplexity 측정은 `tests/integration/test_abc_integration.py`에 포함한다.
+### 검증 테스트 파일: `tests/unit/test_redundancy_eviction_accuracy.py`
 
 ```python
-def test_polarquant_rotation_preserves_norms():
-    # 직교 행렬 R 적용 후 L2 노름이 보존됨을 검증
-    # ||R @ v||_2 == ||v||_2 (±1e-5 허용)
+def test_high_importance_segment_never_evicted():
+    # importance_score=1.0인 세그먼트가 score_candidates()에서 eviction_score=0.0
+    # → select_evict_keys()에서 절대 선택되지 않음
 
-def test_encode_decode_roundtrip_cosine_similarity():
-    # 100 × 128 float32 KV 텐서
-    # encode → decode 후 cosine_sim(decoded, original).mean() ≥ 0.95
-    # layer_idx=0 (4비트 민감 레이어)
-    # layer_idx=6 (3비트 일반 레이어)
+def test_redundant_segment_evicted_first():
+    # 두 세그먼트: high_redundancy(cos_sim=0.95) + low_redundancy(cos_sim=0.1)
+    # 동일 importance_score → high_redundancy 먼저 퇴거
 
-def test_qjl_correction_improves_accuracy():
-    # QJL 보정 있는 버전 vs 없는 버전 비교
-    # cosine_sim(with_qjl) ≥ cosine_sim(without_qjl) — 보정이 손해를 끼치지 않음
-    # 정규화 오류 개선: normalized_error(with_qjl) ≤ normalized_error(without_qjl)
+def test_eviction_score_formula():
+    # eviction_score = (1 - importance) × redundancy 공식 수치 검증
+    # importance=0.5, redundancy=0.8 → score=0.40
 
-def test_memory_reduction_target():
-    # memory_bytes_estimate(1000, 128, layer_idx=6)["reduction_ratio"] ≥ 0.60
-    # (3비트 레이어 기준 목표 −60% 이상)
+def test_doc_id_shortcut_detects_duplicates():
+    # 동일 doc_id 접두사 세그먼트 → redundancy=1.0 즉시 부여
 
-def test_sensitive_layer_uses_higher_bits():
-    # _effective_bits(0) == 4  (민감 레이어)
-    # _effective_bits(6) == 3  (일반 레이어, num_layers=8 기준)
+def test_important_tokens_preserved_after_eviction():
+    # 10개 세그먼트, 2개 고중요도(importance>0.8), 3개 중복(redundancy>0.9)
+    # n_evict=3 시 중복 세그먼트 3개 퇴거 + 고중요도 2개 잔존 검증
 
-def test_normalized_reconstruction_error():
-    # 정규화 재구성 오류 = ||decoded - original||_F / ||original||_F ≤ 0.10
-    # WikiText-2 perplexity ±1% 근사 proxy
+def test_perplexity_proxy_residual_cosine_similarity():
+    # 중복 세그먼트 퇴거 후 잔존 Key 벡터 집합의 평균 코사인 유사도 ≥ 0.99
+    # WikiText-2 ±1% perplexity proxy
 
-def test_mse_ratio_proxy():
-    # MSE(decoded, original) / MSE(zeros, original) < 0.15
-    # LongBench 정확도 ±1% 근사 proxy
+def test_task_accuracy_proxy_important_hit_rate():
+    # 퇴거 후 high_importance 세그먼트의 캐시 Hit Rate 변화 ≤ 1%p
+    # LongBench ±1% 정확도 proxy
 
-def test_rotation_matrix_reproducibility():
-    # 동일 layer_idx, d_head → 항상 동일한 R 생성 (시드 고정 재현성)
-    # _get_rotation_matrix(3, 64) 두 번 호출 → torch.allclose(R1, R2)
+def test_no_training_required():
+    # RedundancyAwareEvictionPolicy 인스턴스에 nn.Parameter, nn.Module 없음
 
-def test_qjl_matrix_reproducibility():
-    # 동일 layer_idx, d_head, proj_dim → 항상 동일한 P 생성
-    # _get_qjl_matrix(3, 64, 64) 두 번 호출 → torch.allclose(P1, P2)
+def test_score_candidates_returns_sorted_descending():
+    # score_candidates() 반환값이 eviction_score 내림차순 정렬
 
-def test_encode_decode_different_layers():
-    # layer_idx=0, 3, 6, 11 각각에서 encode→decode cosine_sim ≥ 0.90
-    # 레이어별 독립 회전 행렬 사용 검증 (레이어 간 R이 다름)
+def test_empty_candidates_list():
+    # candidates=[] → score_candidates() 반환 []
 
-def test_edge_case_single_token():
-    # n_tokens=1 → encode, decode 정상 동작
-    # cosine_sim(decoded, original) ≥ 0.85
+def test_single_candidate():
+    # candidates 길이 1 → select_evict_keys(n_evict=1) 정상 동작
 
-def test_compression_accuracy_wikitext2_proxy():
-    # 합성 WikiText-2 스타일 KV (랜덤, 1000×128)
-    # encode→decode MSE 비율 < 0.15 (실제 perplexity ±1% bound 근사)
+def test_redundancy_computation_without_embedding():
+    # embedding=None인 세그먼트 → redundancy=0.0 처리 (에러 없음)
 ```
 
 ---
@@ -714,260 +746,306 @@ def test_compression_accuracy_wikitext2_proxy():
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-03.yaml
-experiment: "2026-05-03-abc-turbo-quant-semantic-dhd"
-date: "2026-05-03"
+# configs/experiments/2026-05-04.yaml
+experiment: "2026-05-04-cross1-dag-ttl"
+date: "2026-05-04"
 activities: [A, B, C]
 
 cache:
-  type: SemanticSegmentCache
-  chunk_size: 128
+  type: WorkloadAwareTTLCache
   max_entries: 1000
-  top_k: 5                         # 유사도 검색 상위-k 후보 수
-  similarity_threshold: 0.80       # 코사인 유사도 최소 임계값
-  deviation_threshold: 0.20        # DHD L2 편차 임계값 (정규화)
-  recompute_budget: 0.20           # 최대 재계산 비율
+  chunk_size: 128
+  ttl_ema_alpha: 0.1               # EMA 온라인 TTL 갱신 계수
 
-codec:
-  type: TurboQuantCodec
-  num_layers: 12
-  bits: 3                          # 일반 레이어 양자화 비트
-  qjl_bits: 1                      # QJL 잔차 보정 비트
-  base_seed: 42
-  sensitive_layers_ratio: 0.25     # 상위 25% 레이어 → 4비트 (민감 레이어)
+  ttl_profiles:
+    code:
+      ttl_base_sec: 600
+      reuse_probability: 0.75
+    chat:
+      ttl_base_sec: 300
+      reuse_probability: 0.60
+    rag:
+      ttl_base_sec: 120
+      reuse_probability: 0.45
+    agentic:
+      ttl_base_sec: 480
+      reuse_probability: 0.80
+
+eviction_policy:
+  type: RedundancyAwareEvictionPolicy
+  redundancy_top_n: 100
+  importance_weight: 1.0
+  redundancy_weight: 1.0
+  doc_id_shortcut: true
 
 scheduler:
-  type: DualMapScheduler
-  num_nodes: 1                     # 단일 노드 시뮬레이션 (1로 설정)
-  slo_ttft_ms: 200.0               # SLO 위반 임계값
-  top_k_semantic: 5                # 의미 히트율 계산 시 상위-k
-  fairness_max_wait: 10            # 공정성 최대 대기 스텝
+  type: DAGTopologyScheduler
+  retain_threshold: 0.5            # KV 보존 결정 최소 확률
+  alpha_ttl_extend: 2.0            # DAGAwareTTLAdjuster TTL 연장 계수
+  fallback: CacheAwareScheduler    # DAG 미지 요청 폴백
 
-speculative_fetcher:
-  enabled: true
-  max_wait_ms: 5.0                 # 프리패치 결과 최대 대기 시간
-  prefetch_depth: 1                # 미래 배치 깊이
+dag_ttl_adjuster:
+  alpha: 2.0
+  measure_latency: true
 
 metrics:
-  target_throughput_gain: 0.20          # +20% tokens/sec
-  target_memory_reduction: 0.60         # -60% KV 메모리 (목표 -75%)
-  target_noncontiguous_hit_rate: 0.30   # 전체 히트의 30% 이상 비연속(의미 기반)
-  max_perplexity_delta_pct: 1.0         # ±1% perplexity
-  max_task_accuracy_delta_pct: 1.0      # ±1% 태스크 정확도
-  min_cosine_similarity: 0.95           # encode→decode cosine sim 하한
-  max_normalized_error: 0.10            # 정규화 재구성 오류 상한
-  max_scheduling_overhead_ttft_pct: 5.0 # 스케줄링 TTFT 오버헤드 상한
+  target_throughput_gain: 0.20          # +20% tokens/sec (§1)
+  target_noncontiguous_hit_rate: 0.30   # 전체 히트의 30% 이상 비연속 (§3)
+  max_scheduling_overhead_ttft_pct: 5.0 # 스케줄링 TTFT 오버헤드 +5% 이내 (§2)
+  min_scheduling_hit_rate_gain: 0.10    # 스케줄링 캐시 히트율 +10%p (§2)
+  max_perplexity_delta_pct: 1.0         # ±1% perplexity (§4)
+  max_task_accuracy_delta_pct: 1.0      # ±1% 태스크 정확도 (§4)
+  cross_throughput_gain_vs_single: 0.05 # 복합 처리량 단일 대비 +5% (§5)
+  cross_memory_reduction_vs_single: 0.10 # 복합 메모리 단일 대비 −10% (§5)
 
 accuracy_benchmarks:
-  - name: wikitext2_proxy
-    metric: normalized_reconstruction_error
-    threshold: 0.10                # ≤ 10% (±1% perplexity proxy)
-  - name: cosine_similarity_proxy
-    metric: cosine_similarity_mean
-    threshold: 0.95                # ≥ 0.95
-  - name: mse_ratio_proxy
-    metric: mse_ratio
-    threshold: 0.15                # < 0.15 (LongBench ±1% proxy)
+  - name: important_segment_preservation
+    metric: high_importance_segment_retention_rate
+    threshold: 1.00                # 100% 보존 (±1% perplexity proxy)
+  - name: residual_cosine_similarity
+    metric: cosine_sim_after_eviction
+    threshold: 0.99                # ≥ 0.99
+  - name: information_loss_proxy
+    metric: normalized_representation_loss
+    threshold: 0.02                # ≤ 2%
   - name: longbench_qa
-    metric: rouge_l
-    tolerance: 0.01
-  - name: longbench_summarization
-    metric: rouge_1
-    tolerance: 0.01
-  - name: longbench_fewshot
-    metric: exact_match
-    tolerance: 0.01
+    metric: important_hit_rate_delta
+    threshold: 0.01                # ≤ 1%p 변화
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_turbo_quant.py` (신규 — TurboQuantCodec 기능 테스트)
-- [ ] `tests/unit/test_turbo_quant_accuracy.py` (신규 — Activity C accuracy-preserving 필수)
-- [ ] `tests/unit/test_dhd_segment_cache.py` (신규 — SemanticSegmentCache 단위 테스트)
-- [ ] `tests/unit/test_dual_map_scheduler.py` (신규 — DualMapScheduler 단위 테스트)
-- [ ] `tests/integration/test_abc_integration.py` (신규 — A+B+C 전체 통합 테스트)
+- [ ] `tests/unit/test_workload_ttl_cache.py` (신규 — WorkloadAwareTTLCache 단위 테스트)
+- [ ] `tests/unit/test_redundancy_eviction_accuracy.py` (신규 — Activity C accuracy-preserving 필수)
+- [ ] `tests/unit/test_dag_topology_scheduler.py` (신규 — DAGTopologyScheduler 단위 테스트)
+- [ ] `tests/unit/test_dag_ttl_adjuster.py` (신규 — DAGAwareTTLAdjuster 단위 테스트)
+- [ ] `tests/integration/test_cross_ab_dag_ttl.py` (신규 — Cross-1 전체 통합 테스트)
 - [ ] 기존 단위·통합 테스트 전부 회귀 없이 통과
 
-### test_turbo_quant.py 필수 테스트 케이스
-
-```python
-def test_encode_returns_dict_with_required_keys():
-    # encode() 반환 dict에 "quantized", "scale", "qjl_packed", "layer_idx" 존재
-
-def test_decode_shape_matches_input():
-    # encode → decode 후 shape == 원래 kv.shape
-
-def test_compression_ratio_3bit():
-    # compression_ratio(layer_idx=6) ≥ 0.60 (60% 이상 절감)
-
-def test_compression_ratio_4bit_sensitive():
-    # compression_ratio(layer_idx=0) ≥ 0.50 (4비트 민감 레이어)
-
-def test_layer_specific_rotation():
-    # 서로 다른 layer_idx → 서로 다른 회전 행렬 (R0 != R6)
-
-def test_edge_case_n_tokens_1():
-    # n_tokens=1 정상 동작
-
-def test_memory_bytes_estimate_format():
-    # memory_bytes_estimate() 반환 dict에 "total_bytes", "baseline_bytes", "reduction_ratio"
-
-def test_cachestore_not_inherited():
-    # TurboQuantCodec은 CacheStore를 상속하지 않음 (codec 역할)
-```
-
-### test_dhd_segment_cache.py 필수 테스트 케이스
+### test_workload_ttl_cache.py 필수 테스트 케이스
 
 ```python
 def test_put_get_exact_hit():
-    # put_segment() → get_segment() 동일 token_ids → hit_type == "exact"
+    # put_segment() → get() 동일 key → hit 반환 (TTL 만료 전)
 
-def test_semantic_hit_similar_tokens():
-    # 의미적으로 유사한 KV 세그먼트(노이즈 추가) → hit_type == "semantic"
-    # similarity_threshold=0.70, deviation_threshold=0.30 완화 설정 사용
+def test_ttl_expiry_returns_miss():
+    # put_segment(ttl_override=0.001초) → 1ms 대기 → get() → None (TTL 만료)
 
-def test_no_hit_dissimilar_tokens():
-    # 완전히 다른 KV 세그먼트 → hit_type == "miss"
+def test_category_classification_code():
+    # "def foo():" 포함 키/토큰 → category == "code"
 
-def test_noncontiguous_ratio_above_30pct():
-    # 여러 의미 히트 발생 후 semantic_hit_rates()["noncontiguous_ratio"] ≥ 0.30
+def test_category_classification_rag():
+    # "retrieved document:" 포함 → category == "rag"
 
-def test_memory_bytes_compressed():
-    # 1000 토큰 저장 후 memory_bytes() < FP32 베이스라인의 50%
+def test_category_classification_agentic():
+    # "tool_call:" 포함 → category == "agentic"
 
-def test_evict_lru_behavior():
-    # max_entries 초과 시 가장 오래된 항목 퇴거
+def test_category_default_chat():
+    # 키워드 미포함 → category == "chat"
+
+def test_ttl_profiles_different_per_category():
+    # code TTL(600s) > chat TTL(300s) > agentic TTL(480s) 순서 검증
+
+def test_pin_prevents_eviction():
+    # pin(key) 후 evict() 시 해당 키 퇴거되지 않음
+
+def test_unpin_allows_eviction():
+    # pin() → unpin() → evict() → 키 퇴거됨
+
+def test_adjust_ttl_extends():
+    # adjust_ttl(key, 9999s) 후 TTL 만료 없이 get() 성공
+
+def test_adjust_ttl_to_zero_immediate_eviction_candidate():
+    # adjust_ttl(key, 0.0) → evict_candidates()에 포함
+
+def test_noncontiguous_hit_rate_ttl_based():
+    # TTL 만료 전 재사용 세그먼트가 ttl_hit_stats()["noncontiguous_ratio"] ≥ 0.30 기여
+
+def test_ema_ttl_update_on_hit():
+    # record_hit() 후 _ttl_profiles[category]["ttl_base_sec"] 변화 확인
+
+def test_evict_ttl_expired_first():
+    # TTL 만료 세그먼트와 미만료 세그먼트 공존 시 만료 세그먼트 우선 퇴거
+
+def test_lru_fallback_when_no_expired():
+    # TTL 만료 없을 때 evict() → LRU (가장 오래된 비핀 세그먼트) 퇴거
 
 def test_cachestore_interface_compliance():
     # put(), get(), evict(), hit_rate(), memory_bytes(), reset_stats() 모두 구현
 
 def test_reset_stats():
-    # reset_stats() 후 exact_hits=0, semantic_hits=0, misses=0, recompute_count=0
+    # reset_stats() 후 exact_hits=0, ttl_preserved_hits=0, misses=0
 
 def test_chunk_key_deterministic():
-    # 동일 token_ids, chunk_idx, layer_idx → 동일 키 반환
-
-def test_cosine_search_returns_top_k():
-    # _cosine_search() 반환 목록 길이 == min(top_k, len(_semantic_index))
+    # 동일 token_ids, chunk_idx, layer_idx → 동일 키 (segmented.py 호환)
 ```
 
-### test_dual_map_scheduler.py 필수 테스트 케이스
+### test_dag_topology_scheduler.py 필수 테스트 케이스
 
 ```python
-def test_route_returns_valid_node_id():
-    # route() 반환값이 nodes 목록의 node_id 중 하나
+def test_register_workflow_returns_dag_id():
+    # register_workflow(valid_dag_spec) → dag_id 문자열 반환
 
-def test_dual_hash_different_nodes():
-    # len(nodes) >= 2 시 h1 != h2 보장
+def test_topological_order_correct():
+    # A→B→C DAG → topological_order == ["A", "B", "C"]
 
-def test_schedule_annotates_target_node():
-    # schedule() 후 각 요청에 target_node_id 속성 존재
+def test_out_degree_computed():
+    # 중간 노드 B가 자식 C를 가질 때 out_degree[B] == 1
 
-def test_slo_violation_uses_load_only():
-    # SLO 위반 노드 설정 시 부하 기준으로만 라우팅
+def test_kv_reuse_probability_nonzero_for_parent():
+    # 자식이 있는 노드의 kv_reuse_probability > 0.0
 
-def test_fairness_max_wait_respected():
-    # wait_steps >= fairness_max_wait 요청이 우선 처리됨
+def test_kv_reuse_probability_zero_for_leaf():
+    # 자식이 없는 리프 노드의 kv_reuse_probability == 0.0
 
-def test_single_node_mode():
-    # num_nodes=1 시 항상 동일 노드 반환
+def test_schedule_annotates_dag_node_id():
+    # schedule() 후 DAG 등록 요청에 dag_node_id 속성 존재
+
+def test_schedule_annotates_kv_reuse_probability():
+    # schedule() 후 요청에 kv_reuse_probability 속성 존재
+
+def test_pin_called_for_high_probability_node():
+    # kv_reuse_probability > retain_threshold 노드 → cache.pin() 호출됨
+
+def test_notify_node_complete_unpins():
+    # notify_node_complete() 호출 → cache.unpin() 호출됨
+
+def test_unknown_dag_falls_back_to_cache_aware():
+    # dag_id 미등록 요청 → fallback_scheduler.schedule() 위임
+
+def test_belady_upper_bound_gte_actual_hit_rate():
+    # compute_belady_upper_bound() ≥ 실제 히트율 (상한 성질 검증)
+
+def test_save_reuse_histogram_creates_file():
+    # save_reuse_histogram(path) → JSON 파일 생성 확인
 
 def test_scheduling_overhead_below_threshold():
-    # schedule() 실행 시간이 요청당 5ms 이내 (100 요청 기준)
+    # schedule() 실행 시간이 배치당 5ms 이내 (100 요청 기준)
+
+def test_cyclic_dag_raises_error():
+    # 순환 DAG(A→B→A) 등록 시 ValueError 발생
 ```
 
-### test_abc_integration.py 필수 테스트 케이스
+### test_dag_ttl_adjuster.py 필수 테스트 케이스
 
 ```python
-def test_cross_bc_pipeline_put_and_get():
-    # SemanticSegmentCache + TurboQuantCodec 통합
-    # put_segment() → get_segment() 정상 동작 (exact hit)
+def test_on_kv_reuse_event_extends_ttl():
+    # dag_reuse_probability=0.8, base_ttl=300, alpha=2.0
+    # → adjusted_ttl = 300 × (1 + 0.8 × 2.0) = 780s 적용 확인
 
-def test_cross_bc_semantic_hit_with_compression():
-    # 압축 저장된 세그먼트에 의미 유사 쿼리 → semantic hit 발생
+def test_on_node_complete_sets_ttl_zero():
+    # on_node_complete(segment_key) → cache.adjust_ttl(key, 0.0) 호출
 
-def test_memory_reduction_with_semantic_cache():
-    # TurboQuantCodec 압축 저장 후 memory_bytes() < FP32 베이스라인 × 0.50
+def test_on_node_complete_calls_unpin():
+    # on_node_complete(segment_key) → cache.unpin(key) 호출
 
-def test_speculative_fetcher_reduces_latency():
-    # SpeculativeSegmentFetcher 프리패치 후 get_prefetched() 결과가 존재
-    # (또는 None이어도 timeout 초과 없이 반환)
+def test_latency_measured():
+    # measure_latency=True → overhead_stats()["n_samples"] > 0
 
-def test_dual_map_scheduler_routes_requests():
-    # DualMapScheduler.schedule() 후 모든 요청에 target_node_id 존재
+def test_overhead_p50_below_1ms():
+    # 100번 on_kv_reuse_event() 호출 → p50 < 1.0ms (경량 연산 검증)
 
-def test_abc_full_pipeline():
-    # DualMapScheduler → SpeculativeSegmentFetcher → SemanticSegmentCache → TurboQuantCodec
-    # 전체 파이프라인 정상 동작 (예외 없이 완료)
+def test_zero_probability_does_not_extend_ttl():
+    # dag_reuse_probability=0.0 → adjusted_ttl = base_ttl × 1.0 (변화 없음)
+```
 
-def test_perplexity_delta_proxy():
-    # 합성 KV (1000×128)에 TurboQuantCodec encode→decode 후
-    # normalized_error ≤ 0.10 (WikiText-2 ±1% perplexity proxy)
+### test_cross_ab_dag_ttl.py 필수 통합 테스트 케이스
+
+```python
+def test_end_to_end_dag_ttl_pipeline():
+    # DAGTopologyScheduler → DAGAwareTTLAdjuster → WorkloadAwareTTLCache 전체 파이프라인
+    # DAG 등록 → 스케줄 → TTL 조정 → 조회 → 예외 없이 완료
+
+def test_dag_kv_reuse_extends_ttl():
+    # 후속 노드가 있는 DAG 노드의 세그먼트 TTL이 기본값보다 길어짐 확인
+
+def test_dag_completion_enables_early_eviction():
+    # notify_node_complete() 후 해당 세그먼트가 evict_candidates()에 포함
+
+def test_redundancy_eviction_in_pipeline():
+    # WorkloadAwareTTLCache + RedundancyAwareEvictionPolicy 통합
+    # TTL 만료 후보 중 중복 세그먼트 우선 퇴거 확인
 
 def test_noncontiguous_hit_rate_above_30pct():
-    # 의미 유사 요청 다수 처리 후 noncontiguous_ratio ≥ 0.30
+    # 다수 TTL 보존 히트 발생 후 ttl_hit_stats()["noncontiguous_ratio"] ≥ 0.30
+
+def test_pinned_segments_not_evicted_during_pipeline():
+    # DAG 핀 고정 세그먼트가 evict() 호출에도 캐시에 잔존
+
+def test_scheduling_overhead_within_5pct():
+    # DAGTopologyScheduler.schedule() 오버헤드 측정 → TTFT +5% 이내 proxy
+
+def test_hit_rate_improvement_with_dag_scheduling():
+    # DAGTopologyScheduler 적용 시 CacheAwareScheduler 대비 캐시 히트율 +10%p 이상
+
+def test_accuracy_preservation_in_full_pipeline():
+    # 중요도 높은 세그먼트가 전체 파이프라인 실행 후에도 캐시에 잔존
+    # test_redundancy_eviction_accuracy.py의 핵심 조건을 통합 환경에서 재확인
 ```
 
 ---
 
 ## 구현 시 주의사항
 
-1. **CacheStore 인터페이스 준수**: `SemanticSegmentCache`는 `CacheStore`를 직접 상속하며,
+1. **CacheStore 인터페이스 준수**: `WorkloadAwareTTLCache`는 `CacheStore`를 직접 상속하며,
    6개 추상 메서드(`put`, `get`, `evict`, `hit_rate`, `memory_bytes`, `reset_stats`)를
-   모두 구현해야 한다. `put_segment()`, `get_segment()` 등은 추가 메서드다.
+   모두 구현해야 한다. `put_segment()`, `adjust_ttl()`, `pin()` 등은 추가 메서드다.
 
-2. **TurboQuantCodec은 CacheStore 미상속**: `CompressionCodec` 역할이므로 `CacheStore`를
-   상속하지 않는다. `compression.py`의 `CompressionCodec` 클래스와 동일한 `encode/decode`
-   인터페이스를 구현해 호환성을 유지한다.
+2. **RedundancyAwareEvictionPolicy는 CacheStore 미상속**: 순수 스코어링 레이어이므로
+   `CacheStore`를 상속하지 않는다. `WorkloadAwareTTLCache` 생성자에서 선택적으로 주입.
 
-3. **랜덤 회전 행렬 직교성 보장**: `torch.linalg.qr(raw)` 사용. QR 분해의 Q 행렬은
-   수치적으로 직교하며, 역행렬이 전치행렬과 같다 (R^T = R^{-1}).
+3. **DAGTopologyScheduler는 스케줄러 역할**: `CacheStore` 미상속. 캐시를 소유하지 않고
+   `WorkloadAwareTTLCache`의 `pin()` / `unpin()` / `adjust_ttl()` API만 호출.
 
-4. **torch.packbits / unpackbits**: PyTorch 1.11+ 필요. `(tensor >= 0).to(torch.uint8)` →
-   `torch.packbits(bits, dim=-1)`. unpack 시 `[:, :proj_dim]`으로 패딩 비트 제거.
+4. **TTL 만료 체크는 get() 시점**: `time.monotonic()` 기반. 저장된 `created_at`과 비교.
+   만료된 세그먼트는 통계에서 miss로 기록하고 즉시 또는 다음 evict() 시 제거.
 
-5. **훈련-무료 제약**: `TurboQuantCodec`, `SemanticSegmentCache`, `DualMapScheduler`,
-   `SpeculativeSegmentFetcher` 모두 학습 파라미터(`nn.Parameter`, `nn.Module`) 미포함.
+5. **순환 DAG 감지**: `register_workflow()` 에서 Kahn 알고리즘 완료 후
+   `len(topological_order) != len(nodes)` 이면 순환 DAG → `ValueError` 발생.
 
 6. **모든 단위 테스트는 CPU 텐서 기준**: `torch.device("cpu")`. GPU 불필요.
 
 7. **시드 고정**: 모든 테스트에서 `torch.manual_seed(42)` 사용. 재현성 보장.
 
-8. **SpeculativeSegmentFetcher 스레드 안전성**: `threading.Lock`으로 `_prefetch_cache`
-   접근 보호. `clear()` 호출 시 진행 중인 thread를 안전하게 종료.
+8. **훈련-무료 제약**: `WorkloadAwareTTLCache`, `RedundancyAwareEvictionPolicy`,
+   `DAGTopologyScheduler`, `DAGAwareTTLAdjuster` 모두 학습 파라미터(`nn.Parameter`,
+   `nn.Module`) 미포함.
 
-9. **N_segments ≤ 10K 가정**: brute-force 코사인 유사도 검색의 전제. 10K 초과 시
-   `_cosine_search()`가 시간 초과될 수 있음을 주석으로 명시.
+9. **thread 안전성**: `WorkloadAwareTTLCache._store` 접근은 단일 스레드 가정 (멀티스레드 환경
+   필요 시 `threading.Lock` 추가 가능하지만 이번 사이클 필수 아님).
 
-10. **DualMapScheduler 단일 노드 모드**: `len(nodes) == 1`일 때 h1과 h2가 동일 노드를
-    가리키더라도 정상 동작해야 한다. `h2 = (h1 + 1) % len(nodes)` 조정이 len(nodes)==1이면
-    h1과 동일하므로, 단일 노드 모드에서 h1==h2는 허용.
+10. **기존 테스트 회귀 없이 통과**: 새로운 파일만 추가하므로 기존 코드가 변경되지 않는다.
+    `test_turbo_quant_accuracy.py`, `test_dhd_segment_cache.py` 등 이전 사이클 테스트는
+    그대로 유지.
 
-11. **기존 테스트 회귀 없이 통과**: 새로운 파일만 추가하므로 기존 코드가 변경되지 않는다.
-    기존 `test_compression_accuracy.py` (이전 사이클용)는 그대로 유지.
+11. **chunk_key() 호환성**: `WorkloadAwareTTLCache.chunk_key()`는 `SegmentedHashCache.chunk_key()`
+    와 동일한 SHA-256 알고리즘을 사용해 기존 캐시와 키 체계 호환.
+
+12. **결과 파일 저장**: `DAGTopologyScheduler.save_reuse_histogram()`이 생성하는 파일은
+    `results/<exp_name>/kv_reuse_histogram.json` 경로에 저장. `results/`는 git-ignored.
 
 ---
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] `tests/unit/test_turbo_quant.py` — 8개 테스트 케이스 전부 통과
-- [ ] `tests/unit/test_turbo_quant_accuracy.py` — 12개 테스트 케이스 전부 통과 (§4 Accuracy 필수)
-- [ ] `tests/unit/test_dhd_segment_cache.py` — 10개 테스트 케이스 전부 통과
-- [ ] `tests/unit/test_dual_map_scheduler.py` — 7개 테스트 케이스 전부 통과
-- [ ] `tests/integration/test_abc_integration.py` — 8개 테스트 케이스 전부 통과
+- [ ] `tests/unit/test_workload_ttl_cache.py` — 17개 테스트 케이스 전부 통과
+- [ ] `tests/unit/test_redundancy_eviction_accuracy.py` — 12개 테스트 케이스 전부 통과 (§4 Accuracy 필수)
+- [ ] `tests/unit/test_dag_topology_scheduler.py` — 14개 테스트 케이스 전부 통과
+- [ ] `tests/unit/test_dag_ttl_adjuster.py` — 6개 테스트 케이스 전부 통과
+- [ ] `tests/integration/test_cross_ab_dag_ttl.py` — 9개 테스트 케이스 전부 통과
 - [ ] 기존 단위·통합 테스트 전부 회귀 없이 통과
-- [ ] `configs/experiments/2026-05-03.yaml` 존재 (§0 설정 YAML 필수)
-- [ ] `evaluation_criteria.md` §4 Activity C (필수):
-  - perplexity 수치 프록시: normalized_error ≤ 0.10 (±1% 이내)
-  - 태스크 정확도 수치 프록시: cosine_sim ≥ 0.95, MSE 비율 < 0.15 (±1% 이내)
-  - KV Memory Reduction ≥ −60% (목표; 평가 최소 −30%)
+- [ ] `configs/experiments/2026-05-04.yaml` 존재 (§0 설정 YAML 필수)
+- [ ] `evaluation_criteria.md` §4 Activity C (보조, 필수):
+  - 중요 세그먼트 보존율 100% (eviction_score 구조적 보장)
+  - 잔존 Key 코사인 유사도 ≥ 0.99 (perplexity ±1% proxy)
+  - 정보 손실 proxy ≤ 2% (LongBench ±1% proxy)
 - [ ] `evaluation_criteria.md` §3 Activity B:
-  - 비연속 세그먼트 히트율(semantic) ≥ 전체 히트의 30%
+  - 비연속 히트율(TTL 보존 히트) ≥ 전체 히트의 30%
   - KV Memory Footprint: 베이스라인 대비 +20% 이내
 - [ ] `evaluation_criteria.md` §2 Activity A:
-  - 스케줄링 오버헤드 TTFT +5% 이내
+  - 스케줄링 오버헤드 TTFT p50 +5% 이내
   - 스케줄링 적용 캐시 히트율 향상 ≥ +10%p
 - [ ] `evaluation_criteria.md` §5 Cross:
   - 복합 Throughput 향상: 단일 Activity 대비 추가 +5%
@@ -975,3 +1053,4 @@ def test_noncontiguous_hit_rate_above_30pct():
   - Accuracy 보존 복합 적용 후 ±1% 이내 (필수)
 - [ ] 타입 힌트 모든 공개 함수·메서드에 존재 (§0 중간)
 - [ ] 불필요한 추상화 없음: 이 Spec에 없는 클래스·인터페이스 도입 금지 (§0 낮음)
+- [ ] `results/<exp>/kv_reuse_histogram.json` 저장 확인 (목표 10 — DAG 재사용 확률 측정)
