@@ -1,0 +1,64 @@
+experiment: "2026-05-04-cross1-dag-ttl"
+date: "2026-05-04"
+activities: [A, B, C]
+
+cache:
+  type: WorkloadAwareTTLCache
+  max_entries: 1000
+  chunk_size: 128
+  ttl_ema_alpha: 0.1               # EMA online TTL update coefficient
+
+  ttl_profiles:
+    code:
+      ttl_base_sec: 600
+      reuse_probability: 0.75
+    chat:
+      ttl_base_sec: 300
+      reuse_probability: 0.60
+    rag:
+      ttl_base_sec: 120
+      reuse_probability: 0.45
+    agentic:
+      ttl_base_sec: 480
+      reuse_probability: 0.80
+
+eviction_policy:
+  type: RedundancyAwareEvictionPolicy
+  redundancy_top_n: 100
+  importance_weight: 1.0
+  redundancy_weight: 1.0
+  doc_id_shortcut: true
+
+scheduler:
+  type: DAGTopologyScheduler
+  retain_threshold: 0.5            # Minimum probability for KV preservation decision
+  alpha_ttl_extend: 2.0            # DAGAwareTTLAdjuster TTL extension coefficient
+  fallback: CacheAwareScheduler    # Fallback for unknown-DAG requests
+
+dag_ttl_adjuster:
+  alpha: 2.0
+  measure_latency: true
+
+metrics:
+  target_throughput_gain: 0.20          # +20% tokens/sec (§1)
+  target_noncontiguous_hit_rate: 0.30   # 30%+ of total hits are non-contiguous (§3)
+  max_scheduling_overhead_ttft_pct: 5.0 # Scheduling TTFT overhead ≤ +5% (§2)
+  min_scheduling_hit_rate_gain: 0.10    # Scheduling cache hit rate +10%p (§2)
+  max_perplexity_delta_pct: 1.0         # ±1% perplexity (§4)
+  max_task_accuracy_delta_pct: 1.0      # ±1% task accuracy (§4)
+  cross_throughput_gain_vs_single: 0.05 # Combined throughput vs single Activity +5% (§5)
+  cross_memory_reduction_vs_single: 0.10 # Combined memory reduction vs single −10% (§5)
+
+accuracy_benchmarks:
+  - name: important_segment_preservation
+    metric: high_importance_segment_retention_rate
+    threshold: 1.00                # 100% retention (±1% perplexity proxy)
+  - name: residual_cosine_similarity
+    metric: cosine_sim_after_eviction
+    threshold: 0.99                # ≥ 0.99
+  - name: information_loss_proxy
+    metric: normalized_representation_loss
+    threshold: 0.02                # ≤ 2%
+  - name: longbench_qa
+    metric: important_hit_rate_delta
+    threshold: 0.01                # ≤ 1%p change
