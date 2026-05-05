@@ -199,14 +199,21 @@ class DiffAwareSegmentStore(CacheStore):
                 master_block = master_kv_f[start:end]
                 agent_block = agent_kv_f[start:end]
 
-            l2_dist = (master_block - agent_block).norm().item()
+            # Use RMS (per-element) distance so the threshold is scale-invariant
+            # to block size — raw L2 grows with sqrt(numel) which makes the threshold
+            # depend on tensor shape.
+            diff_block_raw = master_block - agent_block
+            n_elem = diff_block_raw.numel()
+            rms_dist = (diff_block_raw.pow(2).mean()).sqrt().item()
 
-            if l2_dist > self.diff_threshold:
+            if rms_dist > self.diff_threshold:
                 # Store the diff block in FP16 (original precision, not compressed)
                 diff = (agent_block - master_block).to(torch.float16)
                 diff_entry.diff_blocks[block_idx] = diff
             else:
                 diff_entry.master_ref_blocks.add(block_idx)
+
+            del diff_block_raw  # release memory
 
         if group_id not in self._diffs:
             self._diffs[group_id] = {}
