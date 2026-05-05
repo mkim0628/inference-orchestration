@@ -1,0 +1,62 @@
+experiment: "2026-05-05-cross1-bc-diff-compressed"
+date: "2026-05-05"
+activities: [B, C]
+
+cache:
+  type: CompressedDiffStore      # Cross-1: DiffAwareSegmentStore + NQKVCodec
+  block_size: 64                 # shared block size for diff and quantization
+  diff_threshold: 0.1            # L2 distance threshold (below = master reference)
+  max_groups: 100                # maximum number of groups (LRU eviction)
+
+compression:
+  nqkv:
+    type: NQKVCodec
+    block_size: 64               # quantization block size (elements)
+    # nf4_values: null           # null = use default Normal Float quantile table
+  fireq:
+    type: FireQCodec
+    n_heads: 12                  # model head count (GPT-2 default)
+    d_head: 64                   # head dimension
+    outlier_threshold_sigma: 3.0 # post-RoPE outlier threshold in sigma multiples
+    calib_scale_dir: "results/fireq_calib"
+
+diff_store:
+  type: DiffAwareSegmentStore    # standalone (without CompressedDiffStore)
+  block_size: 64
+  diff_threshold: 0.1
+  max_groups: 100
+
+metrics:
+  target_noncontiguous_hit_rate: 0.30
+  target_kv_memory_reduction: 0.30
+  target_agent_memory_reduction: 0.85
+  target_throughput_gain: 0.20
+  max_perplexity_delta_pct: 1.0
+  max_task_accuracy_delta_pct: 1.0
+  max_encode_decode_ttft_overhead_pct: 10.0
+  cross_throughput_gain_vs_single: 0.05
+  cross_memory_reduction_vs_single: 0.10
+
+accuracy_benchmarks:
+  - name: nqkv_perplexity_wikitext2
+    script: experiments/run_perplexity_nqkv.py
+    metric: delta_pct
+    threshold: 1.0
+    output: results/nqkv_perplexity/metrics.json
+  - name: nqkv_roundtrip_rmse
+    metric: encode_decode_rmse
+    threshold: 0.05
+  - name: channel_rank_spearman
+    metric: spearman_rho
+    threshold: 0.95
+  - name: fireq_outlier_reduction
+    metric: post_smoothing_outlier_pct
+    threshold: 0.05
+
+perplexity_measurement:
+  model: gpt2
+  dataset: wikitext-2-raw-v1
+  split: test
+  stride: 512
+  max_length: 1024
+  output_dir: results/nqkv_perplexity

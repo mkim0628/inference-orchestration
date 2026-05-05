@@ -7,6 +7,10 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-05 | **B** | DiffAwareKVPatch — master + block-sparse diff non-contiguous KV reuse | `src/cache/diff_aware_store.py` |
+| 2026-05-05 | **C** | NQKVCodecPatch — Normal Float INT4 block-quantile KV compression | `src/cache/nqkv_codec.py` |
+| 2026-05-05 | **B+C** | CompressedKVManager — INT4-compressed masters + FP16 diff storage | `src/cache/compressed_diff_store.py` |
+| 2026-05-05 | **C** | FireQAttentionPatch — RoPE-aware 2-stage outlier smoothing attn hook | `src/cache/fireq_codec.py` |
 | 2026-05-04 | **A** | DAGTopologyScheduler — workflow DAG topology KV proactive preservation | `src/scheduler/dag_topology_scheduler.py` |
 | 2026-05-04 | **B** | WorkloadAwareTTLCache — category-specific TTL segment preservation | `src/cache/workload_ttl_cache.py` |
 | 2026-05-04 | **C** | RedundancyAwareEvictionPolicy — importance x redundancy dual-score eviction | `src/cache/redundancy_eviction.py` |
@@ -31,11 +35,105 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 
 ---
 
+## 2026-05-05 Integration: Activity B+C
+
+### Files Added
+
+| File | Activity | Description |
+|------|----------|-------------|
+| `nqkv_codec_patch.py` | C-1 | `NQKVCodecPatch` — NQKVCodec adapted for vLLM paged blocks |
+| `diff_aware_kv_patch.py` | B-1 | `DiffAwareKVPatch` — master + block-sparse diff non-contiguous reuse |
+| `compressed_kv_manager.py` | B+C Cross-1 | `CompressedKVManager` — INT4 masters + FP16 diffs |
+| `fireq_attention_patch.py` | C-2 | `FireQAttentionPatch` + `_FireQCodecCore` — RoPE-aware 2-stage hook |
+
+### Integration Points (vLLM 0.20.1)
+
+| Component | vLLM Integration Point |
+|-----------|------------------------|
+| `NQKVCodecPatch` | Wraps individual KV blocks or layer-wide cache tensors; use alongside `KVCacheManager.allocate_slots()` |
+| `DiffAwareKVPatch` | Augments `KVCacheManager` block_id tracking; call `register_master_block()` on first-write, `put_agent_block()` on subsequent requests |
+| `CompressedKVManager` | Drop-in for `DiffAwareKVPatch` when compressed storage is needed; integrates with `KVCacheManager.cache_blocks()` path |
+| `FireQAttentionPatch` | Wraps `FlashAttentionImpl.forward()` or any `AttentionImpl`; inject via `patch_vllm_model_layers()` after model load |
+
+### NQKVCodecPatch — vLLM block layout
+
+vLLM v1 allocates KV blocks of shape `[num_blocks, block_size, num_kv_heads, head_dim]`.
+`NQKVCodecPatch.encode_layer_kv_cache()` operates on this full tensor.
+For per-block operations, use `encode_vllm_block()` / `decode_vllm_block()`.
+
+Compression ratio: ~3.5x vs FP16 (64-element quantisation blocks, NF4 14-value table).
+Memory reduction: ~71.4% (1/3.5).
+
+### DiffAwareKVPatch — Non-contiguous reuse
+
+```python
+from vllm_integration.diff_aware_kv_patch import DiffAwareKVPatch
+
+patch = DiffAwareKVPatch(seq_block_size=64, diff_threshold=0.1)
+
+# On first prefill for a shared context:
+patch.register_master_block(block_id=42, kv_tensor=shared_kv)
+
+# On per-agent/per-request decode:
+patch.put_agent_block(block_id=42, agent_id="req_001", kv_tensor=agent_kv)
+
+# On KV cache read:
+kv = patch.get_agent_block(block_id=42, agent_id="req_001")
+
+# Stats:
+stats = patch.diff_hit_stats()
+# {'diff_hit_rate': ..., 'master_hit_rate': ..., 'overall_hit_rate': ...,
+#  'n_groups': ..., 'search_space_reduction': ...}
+```
+
+### CompressedKVManager — INT4 compressed masters
+
+```python
+from vllm_integration.compressed_kv_manager import CompressedKVManager
+
+mgr = CompressedKVManager(seq_block_size=64, diff_threshold=0.1, codec_block_size=64)
+
+# Store compressed master:
+mgr.store_block(block_id=10, kv_tensor=kv_fp16)
+
+# Store per-agent diff (master decompressed transiently):
+mgr.store_agent_diff(block_id=10, agent_id="req_001", kv_tensor=agent_kv)
+
+# Retrieve with diff applied:
+kv = mgr.retrieve_block(block_id=10, agent_id="req_001")
+
+# Memory stats:
+summary = mgr.compression_summary(sample_kv=kv_fp16)
+```
+
+### FireQAttentionPatch — attention hook
+
+```python
+from vllm_integration.fireq_attention_patch import FireQAttentionPatch
+
+# Create and calibrate codec:
+codec = FireQAttentionPatch.make_codec(n_heads=32, d_head=128)
+codec.calibrate(calibration_data)  # list of (kv_tensor, layer_idx)
+
+# Patch all attention layers in a loaded vLLM model:
+n_patched = FireQAttentionPatch.patch_vllm_model_layers(model, codec)
+
+# Or wrap a single impl:
+patch = FireQAttentionPatch(original_impl, codec=codec, layer_idx=5)
+output = patch.forward(layer, query, key, value, kv_cache, attn_metadata, output)
+```
+
+---
+
 ## File Map
 
 ```
 vllm_integration/
 ├── __init__.py                   Package marker
+├── nqkv_codec_patch.py           Activity C-1 (2026-05-05): NQKVCodecPatch
+├── diff_aware_kv_patch.py        Activity B-1 (2026-05-05): DiffAwareKVPatch
+├── compressed_kv_manager.py      Activity B+C Cross-1 (2026-05-05): CompressedKVManager
+├── fireq_attention_patch.py      Activity C-2 (2026-05-05): FireQAttentionPatch
 ├── scheduler_patch.py            Activity A (2026-05-04): DAGTopologySchedulerMixin
 │                                  + MultiNodeDAGRouter, DAGNodeCapacity, WorkflowDAG
 │                                  + make_dag_aware_scheduler_class() factory
