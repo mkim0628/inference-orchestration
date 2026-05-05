@@ -205,10 +205,17 @@ class NQKVCodecPatch:
         )
 
     def compression_ratio(self, kv: torch.Tensor) -> float:
-        """Theoretical compression ratio vs FP16 baseline."""
+        """Actual compression ratio vs FP16 baseline.
+
+        Indices are stored as torch.uint8 (1 byte/element, not bit-packed).
+        Each quantisation block of `block_size` elements stores:
+          - block_size × 1 byte  (uint8 indices)
+          - 2 × 2 bytes          (mu + sigma as float16)
+        """
         n_elem = kv.numel()
         n_qblocks = (n_elem + self.block_size - 1) // self.block_size
-        compressed_bytes = n_qblocks * self.block_size * 0.5 + n_qblocks * 4
+        # uint8 indices: 1 byte/element (not 0.5 — torch has no 4-bit tensor type)
+        compressed_bytes = n_qblocks * self.block_size * 1 + n_qblocks * 4
         original_bytes = n_elem * 2  # FP16
         return original_bytes / compressed_bytes
 

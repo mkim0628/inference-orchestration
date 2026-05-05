@@ -228,25 +228,38 @@ class FireQAttentionPatch:
 
     def __init__(
         self,
-        wrapped_impl: object,
+        wrapped_impl: Optional[object] = None,
         codec: Optional[_FireQCodecCore] = None,
         layer_idx: int = 0,
         apply_pre_rope: bool = True,
         apply_post_rope: bool = True,
+        *,
+        num_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
     ) -> None:
         """
         Args:
             wrapped_impl:    Original AttentionImpl instance (e.g. FlashAttentionImpl).
-            codec:           _FireQCodecCore instance (calibrated).  If None, no-op.
+                             Optional — if None, the patch acts as a standalone codec
+                             (useful for calibrate/encode_key workflows without a live impl).
+            codec:           _FireQCodecCore instance (calibrated).  If None and
+                             num_heads+head_dim are provided, one is created automatically.
             layer_idx:       Transformer layer index for scale lookup.
             apply_pre_rope:  Apply Stage 1 pre-RoPE channel pair equalization.
             apply_post_rope: Apply Stage 2 post-RoPE outlier scaling.
+            num_heads:       Number of attention heads (used when codec=None).
+            num_kv_heads:    Number of KV heads (informational, not used in codec).
+            head_dim:        Head dimension (used when codec=None).
         """
         self._impl = wrapped_impl
-        self._codec = codec
         self.layer_idx = layer_idx
         self.apply_pre_rope = apply_pre_rope
         self.apply_post_rope = apply_post_rope
+        # Build a default codec if num_heads/head_dim supplied and no codec given
+        if codec is None and num_heads is not None and head_dim is not None:
+            codec = _FireQCodecCore(n_heads=num_heads, d_head=head_dim)
+        self._codec = codec
 
     @classmethod
     def from_flash_attn_backend(
@@ -343,6 +356,90 @@ class FireQAttentionPatch:
             if self.apply_pre_rope:
                 K = self._codec.invert_pre_rope(K, self.layer_idx)
         return K.half()
+
+    # ------------------------------------------------------------------
+    # Convenience API (standalone usage without wrapped_impl)
+    # ------------------------------------------------------------------
+
+    def calibrate(
+        self,
+        sample: torch.Tensor,
+        layer_idx: Optional[int] = None,
+    ) -> None:
+        """Calibrate the internal codec on a sample key tensor.
+
+        Convenience wrapper so FireQAttentionPatch can be used standalone
+        without constructing _FireQCodecCore manually.
+
+        Args:
+            sample:    Key tensor.  Accepted shapes:
+                         (seq, n_heads, head_dim)         → 3-D
+                         (batch, n_heads, seq, head_dim)  → 4-D
+            layer_idx: Layer index to store calibration for.  Defaults to
+                       self.layer_idx.
+        """
+        idx = layer_idx if layer_idx is not None else self.layer_idx
+        s = sample.float()
+        # Normalise to (1, n_heads, seq, head_dim) for _FireQCodecCore.calibrate
+        if s.dim() == 3:               # (seq, n_heads, d) → (1, n_heads, seq, d)
+            s = s.permute(1, 0, 2).unsqueeze(0)
+        elif s.dim() == 2:             # (seq, d) → (1, 1, seq, d)
+            s = s.unsqueeze(0).unsqueeze(0)
+        # s is now (batch, n_heads, seq, d)
+        if self._codec is None:
+            n_heads, d_head = s.shape[1], s.shape[3]
+            self._codec = _FireQCodecCore(n_heads=n_heads, d_head=d_head)
+        self._codec.calibrate([(s, idx)])
+
+    def encode_key(
+        self,
+        key: torch.Tensor,
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Apply FireQ smoothing to a key tensor (pre-RoPE + post-RoPE).
+
+        Convenience method for standalone quantisation pipelines.
+        Handles (seq, n_heads, d) and (batch, n_heads, seq, d) inputs with
+        correct per-head-channel scale broadcasting.
+
+        Args:
+            key:       Key tensor, shape (seq, n_heads, head_dim) or
+                       (batch, n_heads, seq, head_dim).
+            layer_idx: Override layer index for scale lookup.
+
+        Returns:
+            Smoothed key tensor (same shape, FP16).
+        """
+        idx = layer_idx if layer_idx is not None else self.layer_idx
+        k = key.float()
+        if self._codec is None:
+            return k.half()
+
+        if self.apply_pre_rope:
+            scales = self._codec._pre_rope_scales.get(idx)
+            if scales is not None:
+                # scales: (n_heads, half_d).
+                # Key shapes supported:
+                #   3-D (seq, n_heads, d)        → broadcast s as (n_heads, half_d)
+                #   4-D (batch, n_heads, seq, d) → reshape s to (1, n_heads, 1, half_d)
+                half_d = scales.shape[-1]
+                s = scales.to(k.device)   # (n_heads, half_d)
+                if k.dim() == 4:
+                    s_bc = s.unsqueeze(0).unsqueeze(2)  # (1, n_heads, 1, half_d)
+                else:
+                    s_bc = s  # (n_heads, half_d) → broadcasts over leading seq dim
+                k[..., :half_d] = k[..., :half_d] / s_bc
+                k[..., half_d:] = k[..., half_d:] * s_bc
+
+        if self.apply_post_rope:
+            masks = self._codec._outlier_masks.get(idx)
+            if masks is not None:
+                # Suppress outlier channels: normalise by per-channel max
+                channel_max = k.abs().amax(dim=-2)   # (..., n_heads, d)
+                target = channel_max.clamp(min=1.0)
+                k = k / target.unsqueeze(-2)
+
+        return k.half()
 
     # ------------------------------------------------------------------
     # Factory helpers
