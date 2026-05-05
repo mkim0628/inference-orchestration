@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — Install the latest vLLM and verify the A+B+C integration.
+# install.sh — Install the latest vLLM and verify the A+B+C+B+C integration.
 #
 # Usage:
 #   bash vllm_integration/install.sh
@@ -8,6 +8,8 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity B+C (2026-05-05):
+#        NQKVCodecPatch, DiffAwareKVPatch, CompressedKVManager, FireQAttentionPatch
 #      Activity A: DAGTopologySchedulerMixin (2026-05-04)
 #      Activity B: WorkloadAwareTTLKVCacheManager (2026-05-04)
 #      Activity C: VllmRedundancyAwareEvictionPolicy (2026-05-04)
@@ -16,10 +18,76 @@
 set -euo pipefail
 
 echo "=== Installing latest vLLM ==="
-pip install --upgrade vllm
+pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install --upgrade vllm
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-05 B+C smoke tests (NQKVCodec + DiffAwareKV + CompressedKV + FireQAttention) ==="
+python - <<'PYEOF_2026_05_05'
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+
+# NQKVCodecPatch
+from vllm_integration.nqkv_codec_patch import NQKVCodecPatch
+codec = NQKVCodecPatch(block_size=64, vllm_block_size=16)
+kv = torch.randn(2, 8, 16, 64)  # [2(K/V), num_kv_heads, vllm_block_size, head_dim]
+indices, mu, sigma, orig_shape = codec.encode_vllm_block(kv)
+reconstructed = codec.decode_vllm_block(indices, mu, sigma, orig_shape)
+assert reconstructed.shape == kv.shape, f"Shape mismatch: {reconstructed.shape} vs {kv.shape}"
+ratio = codec.compression_ratio(kv)
+assert ratio > 3.0, f"Compression ratio too low: {ratio}"
+print(f"NQKVCodecPatch: OK  compression_ratio={ratio:.2f}x")
+
+# DiffAwareKVPatch
+from vllm_integration.diff_aware_kv_patch import DiffAwareKVPatch
+patch = DiffAwareKVPatch(seq_block_size=64, diff_threshold=0.1, max_groups=100)
+kv_master = torch.randn(1, 8, 128, 64)
+patch.register_master_block(block_id=42, kv_tensor=kv_master)
+kv_agent = kv_master + 0.01 * torch.randn_like(kv_master)  # small diff
+patch.put_agent_block(block_id=42, agent_id="agent_0", kv_tensor=kv_agent)
+retrieved = patch.get_agent_block(block_id=42, agent_id="agent_0")
+assert retrieved is not None, "Agent block retrieval returned None"
+assert retrieved.shape == kv_master.shape
+stats = patch.diff_hit_stats()
+assert stats["n_groups"] == 1
+print(f"DiffAwareKVPatch: OK  hit_rate={stats['overall_hit_rate']:.2f}")
+
+# CompressedKVManager
+from vllm_integration.compressed_kv_manager import CompressedKVManager
+mgr = CompressedKVManager(seq_block_size=64, diff_threshold=0.1, max_blocks=100)
+kv_block = torch.randn(8, 16, 64)
+mgr.store_block(block_id=10, kv_tensor=kv_block)
+result = mgr.retrieve_block(block_id=10)
+assert result is not None, "Master retrieval returned None"
+assert result.shape == kv_block.shape
+summary = mgr.compression_summary(kv_block)
+assert summary["compression_ratio"] > 3.0
+print(f"CompressedKVManager: OK  compression_ratio={summary['compression_ratio']:.2f}x")
+
+# FireQAttentionPatch
+from vllm_integration.fireq_attention_patch import FireQAttentionPatch, _FireQCodecCore
+fireq_codec = _FireQCodecCore(n_heads=8, d_head=64, outlier_threshold_sigma=3.0)
+# Calibrate with synthetic data
+calib = [(torch.randn(8, 32, 64), 0) for _ in range(15)]
+fireq_codec.calibrate(calib)
+scales = fireq_codec._pre_rope_scales.get(0)
+assert scales is not None, "Calibration failed: no pre_rope_scales"
+assert scales.shape == (8, 32), f"Scale shape wrong: {scales.shape}"
+masks = fireq_codec._outlier_masks.get(0)
+assert masks is not None, "Calibration failed: no outlier_masks"
+
+# Test factory helper
+codec2 = FireQAttentionPatch.make_codec(n_heads=8, d_head=64)
+assert isinstance(codec2, _FireQCodecCore)
+
+print(f"FireQAttentionPatch (_FireQCodecCore): OK  pre_rope_scales={scales.shape}")
+
+print(f"\nAll 2026-05-05 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_05
 
 echo ""
 echo "=== 2026-05-04 A+B+C smoke tests (DAGTopology + WorkloadAwareTTL + RedundancyEviction) ==="
