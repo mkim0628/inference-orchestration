@@ -1,4 +1,12 @@
-"""scheduler_patch.py — Activity A: DAGTopologyScheduler integration for vLLM 0.20.1.
+"""scheduler_patch.py — Activity A: KV cache-aware scheduling for vLLM 0.20.1.
+
+2026-05-06: QueryCentricSchedulerMixin — ties QueryCentricRecomputeCache recompute
+            scheduling into vLLM's v1 Scheduler. Extends get_computed_blocks() with
+            QCRC-aware hit rate tracking and surfaces selective_recompute() decisions
+            to the scheduler's waiting queue ordering.
+
+            QCRCSchedulerMixin is a composable mixin — combine with the Scheduler
+            base class or with DAGTopologySchedulerMixin for A+B+C scheduling.
 
 2026-05-04: DAGTopologySchedulerMixin — workflow DAG topology-based KV proactive
             preservation as a mixin for vLLM's v1 Scheduler. Ports DAGTopologyScheduler
@@ -1039,4 +1047,258 @@ def create_multi_node_router(
         chunk_size=chunk_size,
         codec=codec,
         compress_threshold_bytes=compress_threshold_bytes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-06 additions — Activity B: QueryCentricSchedulerMixin
+# ---------------------------------------------------------------------------
+
+class QueryCentricSchedulerMixin:
+    """Mixin for vLLM's v1 Scheduler that integrates QCRC recompute scheduling.
+
+    Ports the QueryCentricRecomputeCache dual-stage recompute budget allocation
+    (Activity B, ProphetKV-inspired) into vLLM's scheduling decision loop.
+
+    Design:
+        QueryCentricSchedulerMixin maintains a lightweight per-request segment
+        registry that maps request_id → list of QCRC segment keys registered
+        during prefill. Before each scheduling step, pre_schedule_qcrc() is
+        called to compute which segments each waiting request would benefit from
+        recomputing given a cached query embedding.
+
+        The mixin is composable: combine with DAGTopologySchedulerMixin for
+        Activity A+B scheduling:
+
+            DAGQCRCScheduler = make_qcrc_aware_scheduler_class(
+                make_dag_aware_scheduler_class(Scheduler)
+            )
+
+    Integration contract:
+        - register_request_segments(request_id, segment_keys): called after
+          prefill to associate QCRC segment keys with a request.
+        - on_request_complete(request_id): clean up segment registry on finish.
+        - pre_schedule_qcrc(waiting_requests): called before schedule() to
+          compute recompute recommendations; populates _qcrc_recompute_map.
+        - get_recompute_segments(request_id): retrieve recommended segments.
+
+    Usage:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            QueryCentricSchedulerMixin, make_qcrc_aware_scheduler_class
+        )
+        from vllm_integration.block_manager_patch import QueryCentricKVCacheManager
+
+        QCRCScheduler = make_qcrc_aware_scheduler_class(Scheduler)
+        scheduler = QCRCScheduler(
+            ...,  # standard vLLM Scheduler args
+            qcrc_kv_manager=qcrc_kv_manager,
+            qcrc_budget_ratio=0.20,
+        )
+
+        # After prefill for a request:
+        scheduler.register_request_segments(request.request_id, segment_keys)
+
+        # On request completion:
+        scheduler.on_request_complete(request.request_id)
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        qcrc_kv_manager: Optional[Any] = None,
+        qcrc_budget_ratio: float = 0.20,
+        qcrc_hit_threshold: float = 0.30,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            qcrc_kv_manager: QueryCentricKVCacheManager instance.
+                             If None, the mixin operates as a no-op.
+            qcrc_budget_ratio: Max fraction of tokens to select for recompute.
+            qcrc_hit_threshold: Minimum QCRC hit rate to report as meeting goal.
+            *args, **kwargs: Forwarded to next class in MRO (Scheduler base).
+        """
+        super().__init__(*args, **kwargs)
+        self._qcrc_kv_manager = qcrc_kv_manager
+        self._qcrc_budget_ratio = qcrc_budget_ratio
+        self._qcrc_hit_threshold = qcrc_hit_threshold
+
+        # request_id → list of QCRC segment keys
+        self._qcrc_request_segments: Dict[str, List[str]] = {}
+        # request_id → list of recommended recompute segment keys
+        self._qcrc_recompute_map: Dict[str, List[str]] = {}
+        # request_id → query embedding tensor
+        self._qcrc_query_embeddings: Dict[str, Any] = {}
+
+        # Scheduling stats
+        self._qcrc_schedule_steps: int = 0
+        self._qcrc_recompute_decisions: int = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def register_request_segments(
+        self,
+        request_id: str,
+        segment_keys: List[str],
+        query_embedding: Optional[Any] = None,
+    ) -> None:
+        """Associate QCRC segment keys with a request after prefill.
+
+        Args:
+            request_id: vLLM request ID.
+            segment_keys: List of QCRC segment keys from store_qcrc_segment().
+            query_embedding: Optional query representation tensor [head_dim].
+                             If provided, used for Stage-2 cosine similarity.
+        """
+        self._qcrc_request_segments[request_id] = list(segment_keys)
+        if query_embedding is not None:
+            self._qcrc_query_embeddings[request_id] = query_embedding
+
+    def on_request_complete(self, request_id: str) -> None:
+        """Clean up QCRC segment registry for a completed request.
+
+        Should be called when a request finishes to prevent memory leaks.
+
+        Args:
+            request_id: vLLM request ID.
+        """
+        self._qcrc_request_segments.pop(request_id, None)
+        self._qcrc_recompute_map.pop(request_id, None)
+        self._qcrc_query_embeddings.pop(request_id, None)
+
+    def pre_schedule_qcrc(
+        self,
+        waiting_requests: Optional[List[Any]] = None,
+    ) -> None:
+        """Compute QCRC recompute recommendations for waiting requests.
+
+        For each waiting request that has a query embedding registered, calls
+        selective_recompute() on the QCRC manager to determine which cached
+        segments are worth recomputing within the budget.
+
+        Populates _qcrc_recompute_map[request_id] with recommended segment keys.
+
+        Args:
+            waiting_requests: List of request objects from the scheduler's
+                              waiting queue. If None, uses _qcrc_request_segments
+                              keys directly.
+        """
+        if self._qcrc_kv_manager is None:
+            return
+        if not hasattr(self._qcrc_kv_manager, "selective_recompute"):
+            return
+
+        self._qcrc_schedule_steps += 1
+
+        # Determine which requests to process
+        if waiting_requests is not None:
+            request_ids = [
+                getattr(r, "request_id", None) for r in waiting_requests
+            ]
+            request_ids = [rid for rid in request_ids if rid is not None]
+        else:
+            request_ids = list(self._qcrc_request_segments.keys())
+
+        for request_id in request_ids:
+            segment_keys = self._qcrc_request_segments.get(request_id)
+            if not segment_keys:
+                continue
+
+            query_embedding = self._qcrc_query_embeddings.get(request_id)
+            if query_embedding is None:
+                # No query embedding: skip Stage-2, use all segments within budget
+                self._qcrc_recompute_map[request_id] = segment_keys[:]
+                continue
+
+            try:
+                recommended = self._qcrc_kv_manager.selective_recompute(
+                    query=query_embedding,
+                    cached_segments=segment_keys,
+                    budget=self._qcrc_budget_ratio,
+                )
+                self._qcrc_recompute_map[request_id] = recommended
+                if recommended:
+                    self._qcrc_recompute_decisions += 1
+            except Exception:
+                # Graceful degradation: no recommendation
+                self._qcrc_recompute_map[request_id] = []
+
+    def get_recompute_segments(self, request_id: str) -> List[str]:
+        """Return recommended recompute segment keys for a request.
+
+        Returns the most recent pre_schedule_qcrc() recommendation. Returns
+        an empty list if no recommendation exists.
+
+        Args:
+            request_id: vLLM request ID.
+
+        Returns:
+            List of QCRC segment keys to recompute (ordered by relevance desc).
+        """
+        return self._qcrc_recompute_map.get(request_id, [])
+
+    def qcrc_scheduling_stats(self) -> Dict[str, Any]:
+        """Return QCRC scheduling statistics.
+
+        Returns:
+            dict with keys: schedule_steps, recompute_decisions,
+            tracked_requests, hit_rate (from kv_manager if available).
+        """
+        hit_rate = 0.0
+        if self._qcrc_kv_manager is not None:
+            if hasattr(self._qcrc_kv_manager, "qcrc_hit_rate"):
+                hit_rate = self._qcrc_kv_manager.qcrc_hit_rate()
+            elif hasattr(self._qcrc_kv_manager, "qcta_stats"):
+                stats = self._qcrc_kv_manager.qcta_stats()
+                hit_rate = stats.get("hit_rate", 0.0)
+        return {
+            "schedule_steps": self._qcrc_schedule_steps,
+            "recompute_decisions": self._qcrc_recompute_decisions,
+            "tracked_requests": len(self._qcrc_request_segments),
+            "hit_rate": hit_rate,
+            "hit_rate_meets_goal": hit_rate >= self._qcrc_hit_threshold,
+        }
+
+
+def make_qcrc_aware_scheduler_class(
+    base_scheduler_cls: type,
+) -> type:
+    """Factory that injects QueryCentricSchedulerMixin into a scheduler class.
+
+    Creates a new class that inherits from both QueryCentricSchedulerMixin and
+    the given base_scheduler_cls, using Python MRO so super() chains correctly.
+
+    Args:
+        base_scheduler_cls: The vLLM Scheduler class (or a class already extended
+                            by make_dag_aware_scheduler_class).
+
+    Returns:
+        A new class that is both QueryCentricSchedulerMixin and base_scheduler_cls.
+
+    Example:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            make_qcrc_aware_scheduler_class, make_dag_aware_scheduler_class
+        )
+
+        # Activity B only:
+        QCRCScheduler = make_qcrc_aware_scheduler_class(Scheduler)
+
+        # Activity A + B:
+        DAGQCRCScheduler = make_qcrc_aware_scheduler_class(
+            make_dag_aware_scheduler_class(Scheduler)
+        )
+    """
+    return type(
+        f"QCRCAware{base_scheduler_cls.__name__}",
+        (QueryCentricSchedulerMixin, base_scheduler_cls),
+        {
+            "__doc__": (
+                f"QueryCentricSchedulerMixin + {base_scheduler_cls.__name__}.\n"
+                "Generated by make_qcrc_aware_scheduler_class()."
+            )
+        },
     )

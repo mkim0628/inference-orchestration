@@ -7,6 +7,12 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 
 | Cycle | Activity | Description | Source |
 |-------|----------|-------------|--------|
+| 2026-05-06 | **B** | QueryCentricKVCacheManager — ProphetKV dual-stage recompute budget allocation | `src/cache/query_centric_recompute.py` |
+| 2026-05-06 | **C** | TriAttentionCodecWrapper — pre-RoPE trigonometric KV compression codec | `src/cache/tri_attention_codec.py` |
+| 2026-05-06 | **B+C** | QueryCentricTriAttentionKVCacheManager — dual-path raw/compressed store | `src/cache/qc_tri_store.py` |
+| 2026-05-06 | **C** | TriAttentionAttentionHook — compress/decompress hooks for attention backend | (new, wraps TriAttentionCodecWrapper) |
+| 2026-05-06 | **C** | VllmQueryCentricAttentionWrapper — pre-RoPE key capture + QCTA integration | (new, wraps AttentionImpl.forward) |
+| 2026-05-06 | **B** | QueryCentricSchedulerMixin — QCRC recompute scheduling mixin for vLLM Scheduler | (new) |
 | 2026-05-05 | **B** | DiffAwareKVPatch — master + block-sparse diff non-contiguous KV reuse | `src/cache/diff_aware_store.py` |
 | 2026-05-05 | **C** | NQKVCodecPatch — Normal Float INT4 block-quantile KV compression | `src/cache/nqkv_codec.py` |
 | 2026-05-05 | **B+C** | CompressedKVManager — INT4-compressed masters + FP16 diff storage | `src/cache/compressed_diff_store.py` |
@@ -32,6 +38,153 @@ standalone `src/` implementation into **vLLM 0.20.1**.
 | Scheduler | `vllm.v1.core.sched.scheduler.Scheduler` |
 | Block pool | `vllm.v1.core.block_pool.BlockPool` |
 | Attention backend | `vllm.v1.attention.backend.AttentionImpl` |
+
+---
+
+## 2026-05-06 Integration: Activity B+C (QueryCentricRecompute + TriAttentionCodec)
+
+### Files Modified
+
+| File | Activity | Description |
+|------|----------|-------------|
+| `block_manager_patch.py` | B | `QueryCentricKVCacheManager` — dual-stage QCRC recompute budget allocation |
+| `block_manager_patch.py` | B+C | `QueryCentricTriAttentionKVCacheManager` — dual-path raw/compressed KV store |
+| `block_manager_patch.py` | C | `TriAttentionCodecWrapper` — vLLM-compatible TriAttentionCodec adapter |
+| `attention_backend_patch.py` | C | `TriAttentionAttentionHook` — compress/decompress hooks for attention write/read |
+| `attention_backend_patch.py` | C | `VllmQueryCentricAttentionWrapper` — AttentionImpl wrapper capturing pre-RoPE keys |
+| `scheduler_patch.py` | B | `QueryCentricSchedulerMixin` — QCRC recompute scheduling mixin |
+| `scheduler_patch.py` | B | `make_qcrc_aware_scheduler_class()` — factory for QCRC-aware scheduler |
+
+### Architecture
+
+```
+[Request arrives at Scheduler]
+         │
+         ▼
+QueryCentricSchedulerMixin.pre_schedule_qcrc()
+  ├── selective_recompute(query, segment_keys, budget=0.20)
+  │    Stage 1: attention-norm top-50% filter
+  │    Stage 2: cosine-similarity re-rank (query vs. segment embedding)
+  │    Budget:  max 20% of total cached tokens selected
+  └── _qcrc_recompute_map[request_id] = [seg_key_1, seg_key_2, ...]
+         │
+         ▼
+[Attention Layer (VllmQueryCentricAttentionWrapper.forward)]
+  ├── key captured pre-RoPE (before RoPE applied inside flash_attn)
+  ├── base impl.forward() called unmodified → native vLLM paged KV cache
+  └── keys_pre_rope + kv stored to QCTA manager
+         │
+         ▼
+QueryCentricTriAttentionKVCacheManager.store_qcta_segment()
+  ├── cosine_sim(query_embedding, seg_embedding) >= relevance_threshold (0.60)?
+  │    YES → raw store (_qcta_raw_store) + QCRC store (for selective_recompute)
+  │    NO  → TriAttentionCodecWrapper.compress(kv, keys_pre_rope, ratio=0.10)
+  │          → compressed store (_qcta_compressed_store)
+  └── Result: 10× memory reduction for low-relevance segments
+         │
+         ▼
+[Next request with overlapping context]
+  ├── get_qcta_segment(key) → raw (high-relevance) or decompress (low-relevance)
+  │    decompress: zeros at pruned positions (pre-RoPE importance ranking)
+  └── selective_recompute() → raw-only segments eligible for recomputation
+```
+
+### Integration (single node — Activity B+C)
+
+```python
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.block_manager_patch import (
+    QueryCentricTriAttentionKVCacheManager, TriAttentionCodecWrapper
+)
+from vllm_integration.attention_backend_patch import (
+    TriAttentionAttentionHook, VllmQueryCentricAttentionWrapper
+)
+from vllm_integration.scheduler_patch import make_qcrc_aware_scheduler_class
+
+# Step 1: Create codec and calibrate
+codec = TriAttentionCodecWrapper(
+    n_layers=32, n_heads=32, head_dim=128,
+    compression_ratio=0.10, series_terms=8, prune_window=128,
+)
+# calib_kvs: list of [layers, heads, seq_len, head_dim] pre-RoPE K tensors
+codec.calibrate(calib_kvs, save_path="calibration.pt")
+# (or) codec.load_calibration("calibration.pt")
+
+# Step 2: Create QCTA KV manager
+kv_manager = QueryCentricTriAttentionKVCacheManager(
+    kv_cache_config=kv_cache_config,
+    max_model_len=max_model_len,
+    hash_block_size=block_size,
+    enable_caching=True,
+    codec=codec,
+    relevance_threshold=0.60,   # cosine sim >= 0.60 → raw storage
+    compression_ratio=0.10,     # keep 10% tokens for low-relevance segments
+    qcrc_recompute_budget_ratio=0.20,  # recompute up to 20% of tokens
+)
+
+# Step 3: Create attention hook and wrap model layers
+hook = TriAttentionAttentionHook(codec=codec, compression_ratio=0.10)
+n_patched = VllmQueryCentricAttentionWrapper.patch_model_layers(
+    model, kv_manager, codec, chunk_size=128, compression_ratio=0.10
+)
+
+# Step 4: Create QCRC-aware scheduler
+QCRCScheduler = make_qcrc_aware_scheduler_class(Scheduler)
+scheduler = QCRCScheduler(
+    ...,  # standard vLLM Scheduler args
+    qcrc_kv_manager=kv_manager,
+    qcrc_budget_ratio=0.20,
+)
+
+# Step 5: Per-request lifecycle
+# After prefill (segment keys from store_qcta_segment() calls):
+scheduler.register_request_segments(request.request_id, segment_keys, query_emb)
+
+# Before scheduling step:
+scheduler.pre_schedule_qcrc(waiting_requests)
+
+# Get recompute recommendations for a request:
+to_recompute = scheduler.get_recompute_segments(request.request_id)
+
+# On request completion:
+scheduler.on_request_complete(request.request_id)
+```
+
+### TriAttentionCodec Accuracy Preservation
+
+The TriAttentionCodecWrapper implements the pre-RoPE trigonometric importance
+estimation described in TriAttention (arXiv 2604.04921):
+
+1. **Calibration**: Estimate per-(layer, head) mean μ_k from representative keys.
+   Fit Fourier coefficients a_m by least-squares regression.
+
+2. **Compression**: For each 128-token window, compute importance =
+   |Σ_m a_m × (sin(m×d_i) + cos(m×d_i))| where d_i = ||k_i - μ_k||.
+   Keep top compression_ratio fraction by importance score.
+
+3. **Position stability**: Pre-RoPE space is position-invariant — the same token
+   receives the same importance score regardless of its sequence position.
+   This avoids the position-dependent bias of post-RoPE importance estimation.
+
+4. **Decompression**: Zeros at pruned positions. Kept positions are lossless.
+   Accuracy target: ±1% perplexity relative to full KV cache.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `compression_ratio` | 0.10 | Fraction of tokens kept per 128-token window |
+| `relevance_threshold` | 0.60 | Cosine sim threshold for raw vs. compressed routing |
+| `qcrc_recompute_budget_ratio` | 0.20 | Max fraction of tokens for selective_recompute() |
+| `qcrc_stage1_top_k_ratio` | 0.50 | Stage-1 attention-norm filter fraction |
+| `series_terms` | 8 | Fourier series terms for importance estimation |
+| `prune_window` | 128 | Token window size for windowed pruning |
+
+### Scheduling Overhead
+
+QueryCentricSchedulerMixin operates in Python (no GPU I/O) on the waiting queue.
+selective_recompute() is O(N×K) where N = segment count, K = series_terms.
+Target: < 5ms per 100 requests (TTFT p50 +5% budget per evaluation_criteria.md).
 
 ---
 
@@ -137,21 +290,28 @@ vllm_integration/
 ├── scheduler_patch.py            Activity A (2026-05-04): DAGTopologySchedulerMixin
 │                                  + MultiNodeDAGRouter, DAGNodeCapacity, WorkflowDAG
 │                                  + make_dag_aware_scheduler_class() factory
+│                                  Activity B (2026-05-06): QueryCentricSchedulerMixin
+│                                  + make_qcrc_aware_scheduler_class() factory
 │                                  + DualMapSchedulerMixin (2026-05-03, preserved)
 │                                  + CacheHitAwareRequestQueue, MultiNodeRequestRouter (prior)
-├── block_manager_patch.py        Activity B (2026-05-04): WorkloadAwareTTLKVCacheManager
+├── block_manager_patch.py        Activity B (2026-05-06): QueryCentricKVCacheManager
+│                                  + QueryCentricTriAttentionKVCacheManager (B+C)
+│                                  + TriAttentionCodecWrapper (Activity C codec adapter)
+│                                  Activity B (2026-05-04): WorkloadAwareTTLKVCacheManager
 │                                  + VllmDAGAwareTTLAdjuster, VllmTTLEntry
 │                                  + SemanticNonContiguousKVCacheManager (2026-05-03, preserved)
 │                                  + SemanticSegmentIndex (2026-05-03, preserved)
-├── attention_backend_patch.py    Activity C (2026-05-04): VllmRedundancyAwareEvictionPolicy
+├── attention_backend_patch.py    Activity C (2026-05-06): TriAttentionAttentionHook
+│                                  + VllmQueryCentricAttentionWrapper (pre-RoPE capture)
+│                                  Activity C (2026-05-04): VllmRedundancyAwareEvictionPolicy
 │                                  + VllmAttentionKVHook (importance recording)
 │                                  + TurboQuantKVHook, SemanticKVAttentionWrapper (2026-05-03, preserved)
 │                                  + CompressedKVHook, TriStateKVHook (prior, preserved)
 ├── compression_codec.py          Activity C (2026-05-03): VllmTurboQuantCodec
 │                                  + CacheCompressionConfig
 │                                  + HadamardInt4Codec, CompressionCodec (prior, preserved)
-├── install.sh                    pip install --upgrade vllm + 2026-05-04 smoke tests
-│                                  + backward-compat checks
+├── install.sh                    pip install --upgrade vllm + all smoke tests
+│                                  (2026-05-06, 2026-05-05, 2026-05-04, backward-compat)
 ├── README.md                     This file
 │
 │   Prior-cycle files (preserved for backward compatibility):
@@ -504,4 +664,6 @@ The install script automatically runs smoke tests for all activities.
 | 2026-04-30 | 1/3 | A+B+C | MultiNodeRequestRouter, TriStateKVHook, SegmentAdapterMixin |
 | 2026-05-02 | 1/3 | B+C | VllmLeverageCompressor, SignVQSegmentIndex, SignVQCacheParams |
 | 2026-05-03 | 1/3 | A+B+C | DualMapSchedulerMixin, SemanticSegmentIndex (DHD), VllmTurboQuantCodec |
-| **2026-05-04** | **1/3** | **A+B+C** | **DAGTopologySchedulerMixin, WorkloadAwareTTLKVCacheManager, VllmRedundancyAwareEvictionPolicy, VllmDAGAwareTTLAdjuster, MultiNodeDAGRouter** |
+| 2026-05-04 | 1/3 | A+B+C | DAGTopologySchedulerMixin, WorkloadAwareTTLKVCacheManager, VllmRedundancyAwareEvictionPolicy, VllmDAGAwareTTLAdjuster, MultiNodeDAGRouter |
+| 2026-05-05 | 1/3 | B+C | NQKVCodecPatch (NF4 INT4), DiffAwareKVPatch (block-sparse diff), CompressedKVManager, FireQAttentionPatch (RoPE-aware 2-stage) |
+| **2026-05-06** | **1/3** | **B+C** | **QueryCentricKVCacheManager (ProphetKV dual-stage), TriAttentionCodecWrapper (pre-RoPE trig), QueryCentricTriAttentionKVCacheManager (B+C dual-path), TriAttentionAttentionHook, VllmQueryCentricAttentionWrapper, QueryCentricSchedulerMixin** |

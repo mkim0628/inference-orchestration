@@ -1,4 +1,12 @@
-"""block_manager_patch.py — Activity B: WorkloadAwareTTLCache integration for vLLM 0.20.1.
+"""block_manager_patch.py — Activity B: KV cache non-contiguous reuse integration for vLLM 0.20.1.
+
+2026-05-06: QueryCentricKVCacheManager — subclasses KVCacheManager and adds
+            ProphetKV-inspired dual-stage recompute budget allocation using
+            QueryCentricRecomputeCache. Ports src/cache/query_centric_recompute.py.
+
+            QueryCentricTriAttentionKVCacheManager — extends the above with
+            TriAttentionCodec compression (Activity C) for a dual-path B+C store.
+            Ports src/cache/qc_tri_store.QueryCentricTriAttentionCache.
 
 2026-05-04: WorkloadAwareTTLKVCacheManager — subclasses KVCacheManager and adds
             TTL-based segment preservation using WorkloadAwareTTLCache logic.
@@ -838,3 +846,709 @@ class SemanticNonContiguousKVCacheManager(KVCacheManager):
 
     def segment_memory_bytes(self) -> int:
         return self._segment_index.memory_bytes()
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-06 additions — Activity B (QueryCentricRecomputeCache port)
+# ---------------------------------------------------------------------------
+
+class QueryCentricKVCacheManager(KVCacheManager):
+    """KVCacheManager subclass adding ProphetKV dual-stage recompute budget allocation.
+
+    Ports QueryCentricRecomputeCache (src/cache/query_centric_recompute.py) into
+    the vLLM KVCacheManager layer.
+
+    Design:
+        A parallel segment store (OrderedDict keyed by SHA-256 segment hash) holds
+        KV segment embeddings and attention norms alongside vLLM's native paged
+        block pool. After each prefill step, the caller registers segments via
+        store_qcrc_segment(). Before scheduling, selective_recompute() returns
+        the segment keys worth recomputing given a query and a token-count budget.
+
+    Stage 1: global attention-norm filter — top-50% by ||K||_mean.
+    Stage 2: query cosine-similarity re-rank — budget-limited to recompute_budget_ratio.
+
+    Block boundary contract:
+        qcrc_chunk_size must divide vLLM's block_size so segment boundaries align
+        with KV page boundaries. Default 128 aligns with vLLM's typical block_size=16
+        multiples and the TriAttentionCodec prune_window.
+
+    Usage:
+        kv_manager = QueryCentricKVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            hash_block_size=block_size,
+            enable_caching=True,
+            qcrc_capacity_bytes=512 * 1024 * 1024,  # 512 MB parallel store
+            qcrc_chunk_size=128,
+            qcrc_recompute_budget_ratio=0.20,
+            qcrc_stage1_top_k_ratio=0.50,
+        )
+        # After prefill:
+        key = kv_manager.store_qcrc_segment(token_ids, chunk_idx, kv_tensor, layer_idx)
+        # Before next request with same context:
+        to_recompute = kv_manager.selective_recompute(query_emb, all_seg_keys)
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        qcrc_capacity_bytes: int = 512 * 1024 * 1024,
+        qcrc_chunk_size: int = 128,
+        qcrc_recompute_budget_ratio: float = 0.20,
+        qcrc_stage1_top_k_ratio: float = 0.50,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            qcrc_capacity_bytes: Max bytes for the parallel QCRC segment store.
+            qcrc_chunk_size: Token chunk size for segment key computation.
+            qcrc_recompute_budget_ratio: Max fraction of tokens to recompute (budget).
+            qcrc_stage1_top_k_ratio: Fraction kept after Stage-1 attention-norm filter.
+            *args, **kwargs: Forwarded to KVCacheManager.__init__().
+        """
+        super().__init__(*args, **kwargs)
+        self._qcrc_chunk_size = qcrc_chunk_size
+        self._qcrc_capacity_bytes = qcrc_capacity_bytes
+        self._qcrc_recompute_budget_ratio = qcrc_recompute_budget_ratio
+        self._qcrc_stage1_top_k_ratio = qcrc_stage1_top_k_ratio
+
+        # {segment_key: {"kv": Tensor, "embedding": Tensor, "attn_norm": float}}
+        self._qcrc_store: OrderedDict[str, dict] = OrderedDict()
+        self._qcrc_hit_count: int = 0
+        self._qcrc_miss_count: int = 0
+
+    # ------------------------------------------------------------------
+    # QCRC segment API
+    # ------------------------------------------------------------------
+
+    def store_qcrc_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        kv_tensor: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> str:
+        """Store a KV segment in the parallel QCRC store after block allocation.
+
+        The segment is keyed by SHA-256(layer_idx || token_chunk). If the key
+        already exists, it is moved to the most-recent position (LRU touch).
+
+        Args:
+            token_ids: Full prompt token ID list.
+            chunk_idx: Index of the 128-token chunk within the prompt.
+            kv_tensor: KV tensor [layers, heads, seq_len, head_dim].
+            layer_idx: Transformer layer index (for keying).
+
+        Returns:
+            Segment key (64-char SHA-256 hex string).
+        """
+        key = self._qcrc_chunk_key(token_ids, chunk_idx, layer_idx)
+
+        if key in self._qcrc_store:
+            self._qcrc_store.move_to_end(key)
+            return key
+
+        # Evict LRU until under capacity
+        while (
+            self._qcrc_memory_bytes() + kv_tensor.nbytes > self._qcrc_capacity_bytes
+            and self._qcrc_store
+        ):
+            self._qcrc_evict_lru()
+
+        embedding = kv_tensor.float().mean(dim=(0, 1, 2))  # [head_dim]
+        attn_norm = float(kv_tensor.norm(dim=-1).mean().item())
+
+        self._qcrc_store[key] = {
+            "kv": kv_tensor.detach().clone(),
+            "embedding": embedding.detach().clone(),
+            "attn_norm": attn_norm,
+        }
+        return key
+
+    def get_qcrc_segment(self, segment_key: str) -> Optional[torch.Tensor]:
+        """Look up a segment by key. Returns KV tensor or None on miss.
+
+        Args:
+            segment_key: Key from store_qcrc_segment().
+
+        Returns:
+            KV tensor [layers, heads, seq_len, head_dim] or None.
+        """
+        entry = self._qcrc_store.get(segment_key)
+        if entry is None:
+            self._qcrc_miss_count += 1
+            return None
+        self._qcrc_store.move_to_end(segment_key)
+        self._qcrc_hit_count += 1
+        return entry["kv"]
+
+    def selective_recompute(
+        self,
+        query: torch.Tensor,
+        cached_segments: List[str],
+        budget: Optional[float] = None,
+    ) -> List[str]:
+        """Two-stage recompute budget allocation (ProphetKV algorithm).
+
+        Stage 1: global attention-norm saliency filter (top stage1_top_k_ratio).
+        Stage 2: query cosine-similarity re-rank, budget-limited by token count.
+
+        Args:
+            query: Query representation vector [head_dim].
+            cached_segments: Candidate segment key list.
+            budget: Max fraction of total cached tokens to recompute.
+                    Defaults to qcrc_recompute_budget_ratio.
+
+        Returns:
+            List of segment keys selected for recomputation, ordered by
+            descending relevance, within budget.
+        """
+        import torch.nn.functional as _F
+        budget = budget if budget is not None else self._qcrc_recompute_budget_ratio
+        present = [k for k in cached_segments if k in self._qcrc_store]
+        if not present:
+            return []
+
+        # Stage 1: global saliency filter (attention norm top-50%)
+        attn_norms = {k: self._qcrc_store[k]["attn_norm"] for k in present}
+        sorted_by_norm = sorted(attn_norms, key=lambda k: attn_norms[k], reverse=True)
+        n_stage1 = max(1, int(len(sorted_by_norm) * self._qcrc_stage1_top_k_ratio))
+        stage1_candidates = sorted_by_norm[:n_stage1]
+
+        # Stage 2: query cosine-similarity re-rank
+        relevance_scores: Dict[str, float] = {}
+        for seg_key in stage1_candidates:
+            seg_emb = self._qcrc_store[seg_key]["embedding"]
+            score = _F.cosine_similarity(
+                query.unsqueeze(0).float(), seg_emb.unsqueeze(0).float()
+            ).item()
+            relevance_scores[seg_key] = score
+
+        sorted_by_relevance = sorted(
+            relevance_scores, key=lambda k: relevance_scores[k], reverse=True
+        )
+
+        # Enforce token-count budget
+        total_tokens = sum(
+            self._qcrc_store[k]["kv"].shape[2] for k in sorted_by_relevance
+        )
+        token_budget = max(1, int(total_tokens * budget))
+        selected: List[str] = []
+        accumulated = 0
+        for seg_key in sorted_by_relevance:
+            seg_len = self._qcrc_store[seg_key]["kv"].shape[2]
+            if accumulated + seg_len > token_budget:
+                break
+            selected.append(seg_key)
+            accumulated += seg_len
+
+        return selected
+
+    def qcrc_hit_rate(self) -> float:
+        """Cumulative cache hit rate for QCRC segment store."""
+        total = self._qcrc_hit_count + self._qcrc_miss_count
+        return self._qcrc_hit_count / total if total > 0 else 0.0
+
+    def qcrc_stats(self) -> dict:
+        """Return QCRC hit/miss/memory statistics."""
+        return {
+            "hit_count": self._qcrc_hit_count,
+            "miss_count": self._qcrc_miss_count,
+            "hit_rate": self.qcrc_hit_rate(),
+            "num_segments": len(self._qcrc_store),
+            "memory_bytes": self._qcrc_memory_bytes(),
+        }
+
+    def reset_qcrc_stats(self) -> None:
+        """Reset QCRC hit/miss counters."""
+        self._qcrc_hit_count = 0
+        self._qcrc_miss_count = 0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _qcrc_chunk_key(
+        self, token_ids: List[int], chunk_idx: int, layer_idx: int = 0
+    ) -> str:
+        """SHA-256 chunk key — compatible with QueryCentricRecomputeCache keying."""
+        start = chunk_idx * self._qcrc_chunk_size
+        chunk = token_ids[start: start + self._qcrc_chunk_size]
+        if not chunk:
+            chunk = [0]
+        raw = _struct.pack(f"{len(chunk)}I", *chunk)
+        layer_prefix = _struct.pack("I", layer_idx)
+        return _hashlib.sha256(layer_prefix + raw).hexdigest()
+
+    def _qcrc_memory_bytes(self) -> int:
+        return sum(e["kv"].nbytes for e in self._qcrc_store.values())
+
+    def _qcrc_evict_lru(self) -> None:
+        if self._qcrc_store:
+            self._qcrc_store.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-06 additions — Activity B+C (QueryCentricTriAttentionCache port)
+# ---------------------------------------------------------------------------
+
+class QueryCentricTriAttentionKVCacheManager(QueryCentricKVCacheManager):
+    """KVCacheManager subclass combining QCRC (Activity B) + TriAttentionCodec (Activity C).
+
+    Ports src/cache/qc_tri_store.QueryCentricTriAttentionCache into the vLLM
+    KVCacheManager layer as a dual-path storage strategy:
+
+    High-relevance segments (cosine sim >= relevance_threshold):
+        Stored as raw KV in the QCRC store for quality recomputation.
+
+    Low-relevance segments (cosine sim < relevance_threshold):
+        Compressed with TriAttentionCodec (pre-RoPE trigonometric importance
+        estimation, windowed pruning to compression_ratio fraction) and stored in
+        a separate compressed store. Pre-RoPE keys MUST be passed to compress().
+
+    Accuracy preservation:
+        - selective_recompute() only returns raw KV segments (never compressed).
+        - Compressed segments are decompressed on read: zeros at pruned positions.
+        - No quantization or approximation beyond the windowed top-K pruning that
+          TriAttentionCodec applies (which is pre-calibrated to minimize perplexity).
+
+    Usage:
+        codec = TriAttentionCodecWrapper(n_layers=32, n_heads=32, head_dim=128)
+        codec.load_calibration("calibration.pt")
+
+        kv_manager = QueryCentricTriAttentionKVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            hash_block_size=block_size,
+            enable_caching=True,
+            codec=codec,
+            relevance_threshold=0.60,
+            compression_ratio=0.10,
+        )
+
+        # After prefill with query context:
+        kv_manager.store_qcta_segment(
+            token_ids, chunk_idx, kv_tensor, keys_pre_rope, query_embedding, layer_idx
+        )
+
+        # Recompute (raw KV only):
+        to_recompute = kv_manager.selective_recompute(query_emb, all_seg_keys)
+
+        # Read back (raw or decompressed):
+        kv = kv_manager.get_qcta_segment(segment_key)
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        codec: Optional[Any] = None,
+        relevance_threshold: float = 0.60,
+        compression_ratio: float = 0.10,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            codec: TriAttentionCodecWrapper instance (must be calibrated before use).
+                   If None, all segments fall back to raw QCRC storage.
+            relevance_threshold: Cosine similarity threshold for raw vs. compressed routing.
+            compression_ratio: Fraction of tokens kept per 128-token window by codec.
+            *args, **kwargs: Forwarded to QueryCentricKVCacheManager.
+        """
+        super().__init__(*args, **kwargs)
+        self._qcta_codec = codec
+        self._qcta_relevance_threshold = relevance_threshold
+        self._qcta_compression_ratio = compression_ratio
+
+        # {segment_key: compressed_dict} for low-relevance segments
+        self._qcta_compressed_store: Dict[str, dict] = {}
+        # {segment_key: torch.Tensor} for high-relevance segments (fast lookup)
+        self._qcta_raw_store: Dict[str, torch.Tensor] = {}
+
+        self._qcta_hit_count: int = 0
+        self._qcta_miss_count: int = 0
+        self._qcta_compressed_hits: int = 0
+        self._qcta_raw_hits: int = 0
+
+    # ------------------------------------------------------------------
+    # Query-aware dual-path API
+    # ------------------------------------------------------------------
+
+    def store_qcta_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        kv_tensor: torch.Tensor,
+        keys_pre_rope: torch.Tensor,
+        query_embedding: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> str:
+        """Store with query-context-aware routing: raw or compressed.
+
+        High-relevance segments (cosine sim >= relevance_threshold):
+            Stored in _qcta_raw_store AND forwarded to QCRC (for selective_recompute).
+
+        Low-relevance segments (cosine sim < relevance_threshold):
+            Compressed by TriAttentionCodec and stored in _qcta_compressed_store.
+            Falls back to QCRC raw storage if codec is uncalibrated.
+
+        Args:
+            token_ids: Full prompt token ID list.
+            chunk_idx: Chunk index within the prompt.
+            kv_tensor: KV tensor [layers, heads, seq_len, head_dim].
+            keys_pre_rope: Pre-RoPE K tensor (same shape as kv_tensor). MUST be pre-RoPE.
+            query_embedding: Query mean K vector [head_dim].
+            layer_idx: Transformer layer index.
+
+        Returns:
+            Segment key (64-char SHA-256 hex string).
+        """
+        import torch.nn.functional as _F
+        key = self._qcrc_chunk_key(token_ids, chunk_idx, layer_idx)
+
+        seg_emb = kv_tensor.float().mean(dim=(0, 1, 2))  # [head_dim]
+        relevance = _F.cosine_similarity(
+            query_embedding.unsqueeze(0).float(),
+            seg_emb.unsqueeze(0).float(),
+        ).item()
+
+        if relevance >= self._qcta_relevance_threshold:
+            # High-relevance: raw storage for quality recomputation
+            self._qcta_raw_store[key] = kv_tensor.detach().clone()
+            # Also register in QCRC for selective_recompute()
+            self.store_qcrc_segment(token_ids, chunk_idx, kv_tensor, layer_idx)
+        else:
+            # Low-relevance: compress to save capacity
+            codec = self._qcta_codec
+            if codec is not None and getattr(codec, "mu_k", None) is not None:
+                try:
+                    compressed = codec.compress(
+                        kv_tensor, keys_pre_rope, self._qcta_compression_ratio
+                    )
+                    self._qcta_compressed_store[key] = compressed
+                except Exception:
+                    # Graceful fallback: store raw in QCRC
+                    self.store_qcrc_segment(token_ids, chunk_idx, kv_tensor, layer_idx)
+            else:
+                # Codec not calibrated: fall back to raw QCRC storage
+                self.store_qcrc_segment(token_ids, chunk_idx, kv_tensor, layer_idx)
+
+        return key
+
+    def get_qcta_segment(self, segment_key: str) -> Optional[torch.Tensor]:
+        """Retrieve a segment: raw store → compressed store → QCRC.
+
+        Compressed segments are decompressed (zeros at pruned positions).
+
+        Args:
+            segment_key: Key from store_qcta_segment().
+
+        Returns:
+            KV tensor [layers, heads, seq_len, head_dim] or None on miss.
+        """
+        # Raw store (high-relevance)
+        if segment_key in self._qcta_raw_store:
+            self._qcta_hit_count += 1
+            self._qcta_raw_hits += 1
+            return self._qcta_raw_store[segment_key]
+
+        # Compressed store (low-relevance)
+        if segment_key in self._qcta_compressed_store:
+            self._qcta_hit_count += 1
+            self._qcta_compressed_hits += 1
+            codec = self._qcta_codec
+            if codec is not None:
+                try:
+                    return codec.decompress(self._qcta_compressed_store[segment_key])
+                except Exception:
+                    pass
+            # Fallback: return the compressed KV directly
+            return self._qcta_compressed_store[segment_key].get("kv")
+
+        # QCRC store fallback
+        result = self.get_qcrc_segment(segment_key)
+        if result is None:
+            self._qcta_miss_count += 1
+        else:
+            self._qcta_hit_count += 1
+        return result
+
+    def selective_recompute(
+        self,
+        query: torch.Tensor,
+        cached_segments: List[str],
+        budget: Optional[float] = None,
+    ) -> List[str]:
+        """Two-stage recompute budget allocation using only raw KV segments.
+
+        Compressed segments are excluded — reconstruction quality is insufficient
+        for recomputation (lossy windowed pruning).
+
+        Delegates to QueryCentricKVCacheManager.selective_recompute() with only
+        the segments that have raw KV available (in _qcta_raw_store or QCRC).
+
+        Args:
+            query: Query mean K vector [head_dim].
+            cached_segments: Candidate segment keys.
+            budget: Max fraction of total tokens to recompute.
+
+        Returns:
+            Selected segment keys for recomputation.
+        """
+        # Only raw-KV and QCRC-stored segments are eligible
+        raw_segments = [k for k in cached_segments if k in self._qcta_raw_store]
+        qcrc_segments = [
+            k for k in cached_segments
+            if k not in self._qcta_raw_store
+            and k not in self._qcta_compressed_store
+        ]
+        eligible = raw_segments + qcrc_segments
+        return super().selective_recompute(query, eligible, budget)
+
+    def qcta_stats(self) -> dict:
+        """Return QCTA dual-path statistics."""
+        total = self._qcta_hit_count + self._qcta_miss_count
+        return {
+            "hit_count": self._qcta_hit_count,
+            "miss_count": self._qcta_miss_count,
+            "hit_rate": self._qcta_hit_count / total if total > 0 else 0.0,
+            "raw_hits": self._qcta_raw_hits,
+            "compressed_hits": self._qcta_compressed_hits,
+            "num_raw_segments": len(self._qcta_raw_store),
+            "num_compressed_segments": len(self._qcta_compressed_store),
+            "raw_memory_bytes": sum(t.nbytes for t in self._qcta_raw_store.values()),
+            "compressed_memory_bytes": sum(
+                v.get("kv").nbytes if isinstance(v.get("kv"), torch.Tensor) else 0
+                for v in self._qcta_compressed_store.values()
+            ),
+        }
+
+    def reset_qcta_stats(self) -> None:
+        """Reset QCTA hit/miss counters."""
+        self._qcta_hit_count = 0
+        self._qcta_miss_count = 0
+        self._qcta_compressed_hits = 0
+        self._qcta_raw_hits = 0
+
+
+# ---------------------------------------------------------------------------
+# TriAttentionCodecWrapper — vLLM-compatible adapter for TriAttentionCodec
+# ---------------------------------------------------------------------------
+
+class TriAttentionCodecWrapper:
+    """vLLM-compatible wrapper for TriAttentionCodec (Activity C).
+
+    Wraps src/cache/tri_attention_codec.TriAttentionCodec with vLLM-specific
+    shape handling and provides calibrate/compress/decompress as used by
+    QueryCentricTriAttentionKVCacheManager.
+
+    vLLM KV block shape convention:
+        [num_blocks, block_size, num_kv_heads, head_dim]   (FlashAttention layout)
+
+    TriAttentionCodec shape convention:
+        [n_layers, n_heads, seq_len, head_dim]
+
+    This wrapper handles the shape translation transparently.
+
+    Calibration:
+        Must be called before compress(). Requires at least 10 pre-RoPE K tensors
+        from representative requests.
+
+        codec = TriAttentionCodecWrapper(n_layers=32, n_heads=32, head_dim=128)
+        codec.calibrate(calibration_kvs, save_path="calib.pt")
+
+    Compression (Activity C):
+        compressed = codec.compress(kv_tensor, keys_pre_rope)
+        # compressed["kv"] shape: [n_layers, n_heads, kept_tokens, head_dim]
+
+    Decompression:
+        reconstructed = codec.decompress(compressed)
+        # shape: [n_layers, n_heads, original_seq_len, head_dim]
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        n_heads: int,
+        head_dim: int,
+        compression_ratio: float = 0.10,
+        series_terms: int = 8,
+        prune_window: int = 128,
+    ) -> None:
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.compression_ratio = compression_ratio
+        # Calibration tensors (set by calibrate() or load_calibration())
+        self.mu_k: Optional[torch.Tensor] = None   # [n_layers, n_heads, head_dim]
+        self.a_m: Optional[torch.Tensor] = None    # [n_layers, n_heads, series_terms]
+        self._series_terms = series_terms
+        self._prune_window = prune_window
+
+    # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+
+    def calibrate(
+        self,
+        calibration_kvs: List[torch.Tensor],
+        save_path: Optional[str] = None,
+    ) -> None:
+        """Estimate mu_k and a_m from calibration KV tensors.
+
+        Delegates to TriAttentionCodec.calibrate() from src/cache/.
+
+        Args:
+            calibration_kvs: List of tensors [layers, heads, seq_len, head_dim].
+            save_path: Optional .pt file path to save calibration.
+        """
+        try:
+            import sys, os
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            from src.cache.tri_attention_codec import TriAttentionCodec as _TAC
+            _codec = _TAC(
+                n_layers=self.n_layers,
+                n_heads=self.n_heads,
+                head_dim=self.head_dim,
+                compression_ratio=self.compression_ratio,
+                series_terms=self._series_terms,
+                prune_window=self._prune_window,
+            )
+            _codec.calibrate(calibration_kvs, save_path=save_path)
+            self.mu_k = _codec.mu_k
+            self.a_m = _codec.a_m
+        except ImportError:
+            # Fallback: inline calibration without src/ dependency
+            self._inline_calibrate(calibration_kvs, save_path)
+
+    def load_calibration(self, load_path: str) -> None:
+        """Load previously saved calibration from disk."""
+        import torch
+        ckpt = torch.load(load_path, map_location="cpu", weights_only=True)
+        self.mu_k = ckpt["mu_k"]
+        self.a_m = ckpt["a_m"]
+
+    # ------------------------------------------------------------------
+    # Compression / decompression
+    # ------------------------------------------------------------------
+
+    def compress(
+        self,
+        kv_tensor: torch.Tensor,
+        keys_pre_rope: torch.Tensor,
+        compression_ratio: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Compress KV tensor using pre-RoPE trigonometric importance scores.
+
+        Args:
+            kv_tensor: KV tensor [layers, heads, seq_len, head_dim].
+            keys_pre_rope: Pre-RoPE K tensor (same shape). MUST be pre-RoPE.
+            compression_ratio: Fraction of tokens to keep (overrides instance default).
+
+        Returns:
+            Dict with "kv", "kept_indices", "original_seq_len", "compression_ratio".
+        """
+        if self.mu_k is None or self.a_m is None:
+            raise RuntimeError("calibrate() or load_calibration() must be called first")
+
+        ratio = compression_ratio if compression_ratio is not None else self.compression_ratio
+        seq_len = kv_tensor.shape[2]
+
+        importance = self._estimate_importance(keys_pre_rope)  # [L, H, S]
+        token_importance = importance.mean(dim=(0, 1))           # [S]
+
+        kept_parts: List[torch.Tensor] = []
+        for window_start in range(0, seq_len, self._prune_window):
+            window_end = min(window_start + self._prune_window, seq_len)
+            window_imp = token_importance[window_start:window_end]
+            n_keep = max(1, int(len(window_imp) * ratio))
+            top_local = window_imp.topk(n_keep).indices + window_start
+            kept_parts.append(top_local)
+
+        kept_indices = torch.cat(kept_parts).sort().values
+        compressed_kv = kv_tensor[:, :, kept_indices, :]
+
+        return {
+            "kv": compressed_kv,
+            "kept_indices": kept_indices,
+            "original_seq_len": seq_len,
+            "compression_ratio": ratio,
+        }
+
+    def decompress(self, compressed: Dict[str, Any]) -> torch.Tensor:
+        """Reconstruct full-length KV with zeros at pruned positions.
+
+        Args:
+            compressed: Dict returned by compress().
+
+        Returns:
+            Reconstructed tensor [layers, heads, original_seq_len, head_dim].
+        """
+        kv_c = compressed["kv"]
+        kept_indices = compressed["kept_indices"]
+        original_len = compressed["original_seq_len"]
+        layers, heads, _, dim = kv_c.shape
+        reconstructed = torch.zeros(
+            layers, heads, original_len, dim,
+            dtype=kv_c.dtype, device=kv_c.device,
+        )
+        reconstructed[:, :, kept_indices, :] = kv_c
+        return reconstructed
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _estimate_importance(self, keys_pre_rope: torch.Tensor) -> torch.Tensor:
+        """Trigonometric Fourier series importance (mirrors TriAttentionCodec)."""
+        device = keys_pre_rope.device
+        mu_k = self.mu_k.to(device=device, dtype=keys_pre_rope.dtype)
+        a_m = self.a_m.to(device=device, dtype=keys_pre_rope.dtype)
+
+        diff = keys_pre_rope - mu_k.unsqueeze(2)
+        d = diff.norm(dim=-1)
+
+        importance = torch.zeros_like(d)
+        for m in range(1, self._series_terms + 1):
+            m_d = m * d
+            importance = importance + a_m[:, :, m - 1].unsqueeze(2) * (
+                torch.sin(m_d) + torch.cos(m_d)
+            )
+        return importance.abs()
+
+    def _inline_calibrate(
+        self,
+        calibration_kvs: List[torch.Tensor],
+        save_path: Optional[str],
+    ) -> None:
+        """Inline calibration (used when src/ is not importable)."""
+        all_keys = torch.cat(calibration_kvs, dim=2).float()
+        self.mu_k = all_keys.mean(dim=2)
+        distances = (all_keys - self.mu_k.unsqueeze(2)).norm(dim=-1)
+        layers, heads, T = distances.shape
+        self.a_m = torch.zeros(layers, heads, self._series_terms)
+        target_norms = all_keys.norm(dim=-1)
+        for li in range(layers):
+            for hi in range(heads):
+                dist = distances[li, hi]
+                y = target_norms[li, hi]
+                X = torch.stack(
+                    [torch.sin(m * dist) + torch.cos(m * dist)
+                     for m in range(1, self._series_terms + 1)],
+                    dim=1,
+                )
+                try:
+                    result = torch.linalg.lstsq(X, y.unsqueeze(1))
+                    coeff = result.solution.squeeze(1)
+                    if coeff.shape[0] < self._series_terms:
+                        pad = torch.zeros(self._series_terms - coeff.shape[0])
+                        coeff = torch.cat([coeff, pad])
+                    self.a_m[li, hi] = coeff[: self._series_terms]
+                except Exception:
+                    self.a_m[li, hi] = torch.ones(self._series_terms)
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            torch.save({"mu_k": self.mu_k, "a_m": self.a_m}, save_path)
