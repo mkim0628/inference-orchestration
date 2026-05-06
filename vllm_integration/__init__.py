@@ -1,5 +1,14 @@
 # vllm_integration: Activity A+B+C KV cache port for vLLM 0.20.1
 #
+# 2026-05-06 cycle additions:
+#   block_manager_patch      — QueryCentricKVCacheManager: ProphetKV dual-stage recompute (B)
+#                             + QueryCentricTriAttentionKVCacheManager: dual-path raw/compressed (B+C)
+#                             + TriAttentionCodecWrapper: pre-RoPE trigonometric codec (C)
+#   attention_backend_patch  — TriAttentionAttentionHook: compress/decompress for attention (C)
+#                             + VllmQueryCentricAttentionWrapper: pre-RoPE key capture (C)
+#   scheduler_patch          — QueryCentricSchedulerMixin: QCRC recompute scheduling (B)
+#                             + make_qcrc_aware_scheduler_class() factory
+#
 # 2026-05-05 cycle additions:
 #   nqkv_codec_patch         — NQKVCodecPatch: NF4 INT4 block-quantile KV compression
 #   diff_aware_kv_patch      — DiffAwareKVPatch: master + block-sparse diff non-contiguous reuse

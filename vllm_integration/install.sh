@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — Install the latest vLLM and verify the A+B+C+B+C integration.
+# install.sh — Install the latest vLLM and verify the A+B+C integration.
 #
 # Usage:
 #   bash vllm_integration/install.sh
@@ -8,6 +8,10 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity B+C (2026-05-06):
+#        QueryCentricKVCacheManager, QueryCentricTriAttentionKVCacheManager,
+#        TriAttentionCodecWrapper, TriAttentionAttentionHook,
+#        VllmQueryCentricAttentionWrapper, QueryCentricSchedulerMixin
 #      Activity B+C (2026-05-05):
 #        NQKVCodecPatch, DiffAwareKVPatch, CompressedKVManager, FireQAttentionPatch
 #      Activity A: DAGTopologySchedulerMixin (2026-05-04)
@@ -22,6 +26,301 @@ pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install -
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-06 B+C smoke tests (QueryCentricRecompute + TriAttentionCodec + QCTA + scheduler) ==="
+python - <<'PYEOF_2026_05_06'
+import sys, pathlib
+repo_root = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(repo_root))
+import torch
+
+# -----------------------------------------------------------------------
+# TriAttentionCodecWrapper — Activity C
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import TriAttentionCodecWrapper
+
+codec = TriAttentionCodecWrapper(
+    n_layers=2, n_heads=4, head_dim=16,
+    compression_ratio=0.5, series_terms=4, prune_window=8,
+)
+
+# Calibrate with synthetic pre-RoPE K tensors
+calib_kvs = [torch.randn(2, 4, 32, 16) for _ in range(12)]
+codec.calibrate(calib_kvs)
+assert codec.mu_k is not None, "mu_k not set after calibrate()"
+assert codec.mu_k.shape == (2, 4, 16), f"Wrong mu_k shape: {codec.mu_k.shape}"
+assert codec.a_m is not None, "a_m not set after calibrate()"
+
+# Compress + decompress roundtrip
+kv = torch.randn(2, 4, 32, 16)
+keys_pre_rope = torch.randn(2, 4, 32, 16)
+compressed = codec.compress(kv, keys_pre_rope, compression_ratio=0.5)
+assert "kv" in compressed and "kept_indices" in compressed
+assert compressed["original_seq_len"] == 32
+assert compressed["kv"].shape[2] < 32, "Compressed should have fewer tokens"
+
+reconstructed = codec.decompress(compressed)
+assert reconstructed.shape == kv.shape, f"Reconstructed shape mismatch: {reconstructed.shape}"
+# Kept positions should be reconstructed exactly
+kept = compressed["kept_indices"]
+torch.testing.assert_close(reconstructed[:, :, kept, :], compressed["kv"], atol=1e-5, rtol=0)
+print(f"TriAttentionCodecWrapper: OK  kept={kept.shape[0]}/32  mu_k={codec.mu_k.shape}")
+
+# -----------------------------------------------------------------------
+# QueryCentricKVCacheManager — Activity B (standalone, no GPU)
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import QueryCentricKVCacheManager
+from collections import OrderedDict
+
+class MinimalQCRCManager(QueryCentricKVCacheManager):
+    """Bypass KVCacheManager.__init__() for smoke testing."""
+    def __init__(self, **kwargs):
+        self._qcrc_chunk_size = kwargs.get("qcrc_chunk_size", 128)
+        self._qcrc_capacity_bytes = kwargs.get("qcrc_capacity_bytes", 64 * 1024 * 1024)
+        self._qcrc_recompute_budget_ratio = kwargs.get("qcrc_recompute_budget_ratio", 0.20)
+        self._qcrc_stage1_top_k_ratio = kwargs.get("qcrc_stage1_top_k_ratio", 0.50)
+        self._qcrc_store = OrderedDict()
+        self._qcrc_hit_count = 0
+        self._qcrc_miss_count = 0
+
+mgr = MinimalQCRCManager(
+    qcrc_chunk_size=16,
+    qcrc_capacity_bytes=64 * 1024 * 1024,
+    qcrc_recompute_budget_ratio=0.20,
+)
+
+token_ids = list(range(64))
+kv_seg = torch.randn(2, 4, 16, 16)
+
+# Store segment
+key0 = mgr.store_qcrc_segment(token_ids, chunk_idx=0, kv_tensor=kv_seg, layer_idx=0)
+assert len(key0) == 64, f"Expected 64-char SHA-256 hex, got {len(key0)}"
+assert len(mgr._qcrc_store) == 1
+
+# Get hit
+result = mgr.get_qcrc_segment(key0)
+assert result is not None, "Expected cache hit"
+assert mgr._qcrc_hit_count == 1
+
+# Miss
+result2 = mgr.get_qcrc_segment("nonexistent" * 4)
+assert result2 is None
+assert mgr._qcrc_miss_count == 1
+
+# Store second segment
+key1 = mgr.store_qcrc_segment(token_ids, chunk_idx=1, kv_tensor=kv_seg, layer_idx=0)
+
+# selective_recompute — two-stage budget allocation
+query_emb = torch.randn(16)
+selected = mgr.selective_recompute(query_emb, [key0, key1], budget=0.20)
+assert isinstance(selected, list), "selective_recompute must return a list"
+# Budget=0.20 of 32 tokens = 6 tokens. Each segment has 16 tokens, so 0 or 1 selected.
+assert len(selected) <= 2, f"Too many segments selected: {selected}"
+
+stats = mgr.qcrc_stats()
+assert "hit_rate" in stats
+assert "num_segments" in stats
+print(f"QueryCentricKVCacheManager: OK  hit_rate={stats['hit_rate']:.2f}  segments={stats['num_segments']}")
+
+# -----------------------------------------------------------------------
+# QueryCentricTriAttentionKVCacheManager — Activity B+C (standalone)
+# -----------------------------------------------------------------------
+from vllm_integration.block_manager_patch import QueryCentricTriAttentionKVCacheManager
+import torch.nn.functional as F
+
+class MinimalQCTAManager(QueryCentricTriAttentionKVCacheManager):
+    """Bypass KVCacheManager.__init__() for smoke testing."""
+    def __init__(self, **kwargs):
+        # Init QCRC state
+        self._qcrc_chunk_size = kwargs.get("qcrc_chunk_size", 16)
+        self._qcrc_capacity_bytes = kwargs.get("qcrc_capacity_bytes", 64 * 1024 * 1024)
+        self._qcrc_recompute_budget_ratio = kwargs.get("qcrc_recompute_budget_ratio", 0.20)
+        self._qcrc_stage1_top_k_ratio = kwargs.get("qcrc_stage1_top_k_ratio", 0.50)
+        self._qcrc_store = OrderedDict()
+        self._qcrc_hit_count = 0
+        self._qcrc_miss_count = 0
+        # Init QCTA state
+        self._qcta_codec = kwargs.get("codec", None)
+        self._qcta_relevance_threshold = kwargs.get("relevance_threshold", 0.60)
+        self._qcta_compression_ratio = kwargs.get("compression_ratio", 0.50)
+        self._qcta_compressed_store = {}
+        self._qcta_raw_store = {}
+        self._qcta_hit_count = 0
+        self._qcta_miss_count = 0
+        self._qcta_compressed_hits = 0
+        self._qcta_raw_hits = 0
+
+qcta_mgr = MinimalQCTAManager(
+    qcrc_chunk_size=16,
+    codec=codec,
+    relevance_threshold=0.0,  # all segments go to compressed (low threshold)
+    compression_ratio=0.5,
+)
+
+kv_seg2 = torch.randn(2, 4, 16, 16)
+pre_rope = torch.randn(2, 4, 16, 16)
+query_emb2 = torch.randn(16)
+
+# threshold=0.0 means all segments go to compressed store (cosine_sim > 0.0 is typical)
+# We need high relevance to go to raw — set threshold above 1.0 to force compressed path
+qcta_mgr._qcta_relevance_threshold = 2.0  # impossible threshold → all compressed
+seg_key = qcta_mgr.store_qcta_segment(
+    token_ids=list(range(64)), chunk_idx=0,
+    kv_tensor=kv_seg2, keys_pre_rope=pre_rope,
+    query_embedding=query_emb2, layer_idx=0,
+)
+assert seg_key in qcta_mgr._qcta_compressed_store, "Expected compressed store hit"
+
+# Read back decompressed
+retrieved = qcta_mgr.get_qcta_segment(seg_key)
+assert retrieved is not None, "Expected non-None on compressed read"
+assert retrieved.shape[-1] == 16, f"Wrong head_dim: {retrieved.shape}"
+
+# Now test high-relevance path (threshold=0.0 → all go to raw)
+qcta_mgr._qcta_relevance_threshold = -2.0  # always above cosine_sim range [-1,1]
+seg_key2 = qcta_mgr.store_qcta_segment(
+    token_ids=list(range(64)), chunk_idx=1,
+    kv_tensor=kv_seg2, keys_pre_rope=pre_rope,
+    query_embedding=query_emb2, layer_idx=0,
+)
+assert seg_key2 in qcta_mgr._qcta_raw_store, "Expected raw store hit"
+
+# selective_recompute must only use raw segments (not compressed)
+selected2 = qcta_mgr.selective_recompute(query_emb2, [seg_key, seg_key2])
+# seg_key is compressed → excluded; seg_key2 is raw → eligible
+assert seg_key not in selected2, "Compressed segment should not be in recompute list"
+
+qcta_stats = qcta_mgr.qcta_stats()
+assert "compressed_hits" in qcta_stats
+print(f"QueryCentricTriAttentionKVCacheManager: OK  raw={qcta_stats['num_raw_segments']}  compressed={qcta_stats['num_compressed_segments']}")
+
+# -----------------------------------------------------------------------
+# TriAttentionAttentionHook — Activity C write/read hooks
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import TriAttentionAttentionHook
+
+hook = TriAttentionAttentionHook(codec=codec, compression_ratio=0.5, enabled=True)
+
+kv_hook = torch.randn(2, 4, 32, 16)
+pre_rope_hook = torch.randn(2, 4, 32, 16)
+
+# write_to_cache: should return compressed dict
+compressed_hook = hook.write_to_cache(kv_hook, pre_rope_hook)
+assert "kv" in compressed_hook or "raw" in compressed_hook, f"Unexpected keys: {compressed_hook.keys()}"
+if "kv" in compressed_hook:
+    assert compressed_hook["kv"].shape[2] < 32, "Expected fewer tokens after compression"
+
+# read_from_cache: decompress before attention kernel
+reconstructed_hook = hook.read_from_cache(compressed_hook)
+assert reconstructed_hook.shape == kv_hook.shape, f"Reconstructed shape: {reconstructed_hook.shape}"
+
+# Disabled hook: identity passthrough
+hook_off = TriAttentionAttentionHook(codec=codec, enabled=False)
+raw_out = hook_off.write_to_cache(kv_hook, pre_rope_hook)
+assert "raw" in raw_out, "Disabled hook should return raw dict"
+recon_off = hook_off.read_from_cache(raw_out)
+assert recon_off.shape == kv_hook.shape
+
+stats_hook = hook.hook_stats()
+assert stats_hook["compress_count"] >= 1
+print(f"TriAttentionAttentionHook: OK  compress_count={stats_hook['compress_count']}  decompress_count={stats_hook['decompress_count']}")
+
+# -----------------------------------------------------------------------
+# VllmQueryCentricAttentionWrapper — stand-alone test (no GPU model)
+# -----------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import VllmQueryCentricAttentionWrapper
+
+class MockImpl:
+    """Minimal stand-in for FlashAttentionImpl."""
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output,
+                output_scale=None, output_block_scale=None):
+        return output
+
+mock_impl = MockImpl()
+wrapper = VllmQueryCentricAttentionWrapper(
+    impl=mock_impl,
+    kv_manager=qcta_mgr,
+    hook=hook,
+    layer_idx=0,
+    chunk_size=16,
+)
+
+# Forward pass: should not raise
+query_t = torch.randn(32, 16)
+key_t = torch.randn(32, 16)
+value_t = torch.randn(32, 16)
+out_t = torch.zeros(32, 16)
+result_t = wrapper.forward(
+    layer=None, query=query_t, key=key_t, value=value_t,
+    kv_cache=None, attn_metadata=None, output=out_t,
+)
+assert result_t.shape == out_t.shape, f"Output shape mismatch: {result_t.shape}"
+
+wstats = wrapper.wrapper_stats()
+assert wstats["forward_count"] == 1
+print(f"VllmQueryCentricAttentionWrapper: OK  forward_count={wstats['forward_count']}  qcta_store_count={wstats['qcta_store_count']}")
+
+# -----------------------------------------------------------------------
+# QueryCentricSchedulerMixin — Activity B scheduler integration
+# -----------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    QueryCentricSchedulerMixin, make_qcrc_aware_scheduler_class
+)
+
+# Stand-alone mixin test (no vLLM Scheduler base needed)
+class _StandaloneMixin(QueryCentricSchedulerMixin):
+    def __init__(self, **kwargs):
+        # Manually initialize mixin state without calling super().__init__()
+        self._qcrc_kv_manager = kwargs.get("qcrc_kv_manager")
+        self._qcrc_budget_ratio = kwargs.get("qcrc_budget_ratio", 0.20)
+        self._qcrc_hit_threshold = kwargs.get("qcrc_hit_threshold", 0.30)
+        self._qcrc_request_segments = {}
+        self._qcrc_recompute_map = {}
+        self._qcrc_query_embeddings = {}
+        self._qcrc_schedule_steps = 0
+        self._qcrc_recompute_decisions = 0
+
+sched_mixin = _StandaloneMixin(qcrc_kv_manager=mgr, qcrc_budget_ratio=0.20)
+
+# Register request segments
+sched_mixin.register_request_segments("req_001", [key0, key1], query_embedding=query_emb)
+assert "req_001" in sched_mixin._qcrc_request_segments
+assert len(sched_mixin._qcrc_request_segments["req_001"]) == 2
+
+# pre_schedule_qcrc
+class MockReq2:
+    def __init__(self, rid):
+        self.request_id = rid
+
+sched_mixin.pre_schedule_qcrc(waiting_requests=[MockReq2("req_001")])
+assert sched_mixin._qcrc_schedule_steps == 1
+
+recommended = sched_mixin.get_recompute_segments("req_001")
+assert isinstance(recommended, list), "Expected list of segment keys"
+print(f"QueryCentricSchedulerMixin: OK  recommended={len(recommended)} segments")
+
+# on_request_complete: clean up
+sched_mixin.on_request_complete("req_001")
+assert "req_001" not in sched_mixin._qcrc_request_segments
+assert "req_001" not in sched_mixin._qcrc_recompute_map
+
+# make_qcrc_aware_scheduler_class factory: creates composite class
+class MinimalSchedulerBase:
+    def __init__(self, *args, **kwargs):
+        pass
+QCRCScheduler = make_qcrc_aware_scheduler_class(MinimalSchedulerBase)
+assert issubclass(QCRCScheduler, QueryCentricSchedulerMixin)
+assert issubclass(QCRCScheduler, MinimalSchedulerBase)
+print(f"make_qcrc_aware_scheduler_class: OK  class={QCRCScheduler.__name__}")
+
+sched_stats = sched_mixin.qcrc_scheduling_stats()
+assert "schedule_steps" in sched_stats
+assert "hit_rate" in sched_stats
+print(f"QueryCentricSchedulerMixin stats: OK  steps={sched_stats['schedule_steps']}  hit_rate={sched_stats['hit_rate']:.2f}")
+
+print(f"\nAll 2026-05-06 B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_06
 
 echo ""
 echo "=== 2026-05-05 B+C smoke tests (NQKVCodec + DiffAwareKV + CompressedKV + FireQAttention) ==="
