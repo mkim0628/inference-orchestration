@@ -1,0 +1,34 @@
+experiment:
+  date: "2026-05-06"
+  activity: "B+C"
+  description: "QueryCentricRecomputeCache + TriAttentionCodec (B+C Cross-1)"
+
+cache:
+  type: "qc_tri"                    # QueryCentricTriAttentionCache
+  capacity_bytes: 4294967296        # 4 GiB
+  recompute_budget_ratio: 0.20      # fraction of total tokens eligible for recompute
+  stage1_top_k_ratio: 0.50          # Stage1: attention-norm top-50% filter
+  relevance_threshold: 0.60         # cosine similarity threshold for raw vs compressed storage
+
+compression:
+  method: "tri_attention"           # TriAttentionCodec
+  compression_ratio: 0.10           # keep top-10% of tokens per window (10× compression)
+  series_terms: 8                   # Fourier series terms M=1..8
+  prune_window: 128                 # sliding window size (tokens)
+  calibration_min_requests: 10      # minimum number of KV samples for calibration
+  calibration_save_path: "results/2026-05-06/tri_attention_calibration.pt"
+
+scheduler:
+  type: "default"                   # Activity A not included in this cycle
+
+reorder:
+  enabled: true                     # InfoFlowChunkReorderCache activated
+  max_chunks: 50                    # maximum chunk count for reorder (O(N log N))
+
+dual_filter:
+  enabled: true                     # DualFilterSegmentSelector activated
+  stage1_filter_ratio: 0.40         # Stage 1: keep top-40% by query relevance
+  stage2_token_budget: 0.20         # Stage 2: keep top-20% of tokens by importance
+
+seed: 42
+results_dir: "results/2026-05-06"
