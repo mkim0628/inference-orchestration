@@ -212,6 +212,49 @@ class TestSLATierAAccuracyPreserved:
         assert "sla_req" not in pipeline.scheduler._preempted
 
 
+class TestRegisterCompressedKV:
+    def test_register_compressed_kv_stores_payload(self) -> None:
+        """register_compressed_kv() stores payload and marks record as compressed."""
+        pipeline, codec = _make_pipeline(d_head=32, num_layers=2)
+        torch.manual_seed(99)
+        kv_key = torch.randn(64, 32)
+        kv_val = torch.randn(64, 32)
+
+        # Build a compressed payload externally (simulates vLLM integration path)
+        payload = codec.encode(kv_key, kv_val, layer_idx=0)
+        cpu_payload = {k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+                       for k, v in payload.items()
+                       if k in ("key", "val", "layer_idx", "n_tokens", "d_head")}
+        # Move nested tensors to CPU
+        import copy
+        cpu_payload = copy.deepcopy(payload)
+
+        pipeline.register_compressed_kv("external_req", cpu_payload)
+
+        record = pipeline.scheduler._preempted.get("external_req")
+        assert record is not None, "PreemptionRecord should be created"
+        assert record.is_compressed, "Record must be marked compressed"
+        assert record.offloaded_kv is not None, "Payload must be stored"
+
+    def test_register_compressed_kv_enables_restore(self) -> None:
+        """register_compressed_kv() payload can be restored via restore_with_decompression."""
+        pipeline, codec = _make_pipeline(d_head=32, num_layers=2)
+        torch.manual_seed(55)
+        kv_key = torch.randn(64, 32)
+        kv_val = torch.randn(64, 32)
+
+        payload = codec.encode(kv_key, kv_val, layer_idx=0)
+        pipeline.register_compressed_kv("ext_req2", payload)
+
+        result = pipeline.restore_with_decompression("ext_req2", layer_idx=0)
+        assert result is not None
+        key_approx, val_approx = result
+        cos_key = F.cosine_similarity(
+            kv_key.flatten().unsqueeze(0), key_approx.flatten().unsqueeze(0)
+        ).item()
+        assert cos_key >= 0.85, f"Restored key cosine similarity too low: {cos_key:.4f}"
+
+
 class TestCrossAcThroughputImprovement:
     def test_cross_ac_throughput_improvement(self) -> None:
         """Compression reduces transfer bytes (proxy for throughput improvement).

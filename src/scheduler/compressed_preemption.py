@@ -185,6 +185,32 @@ class CompressedPreemptionPipeline:
             return 0.0
         return 1.0 - self._total_bytes_after / self._total_bytes_before
 
+    def register_compressed_kv(self, request_id: str, payload: object) -> None:
+        """Register an externally compressed KV payload for a preempted request.
+
+        Allows callers (e.g. vLLM integration, test harnesses) to inject a
+        pre-compressed KV payload without going through offload_with_compression().
+        The payload must be compatible with eOptShrinkQCodec.decode() (EncodedKVPayload).
+
+        Args:
+            request_id: ID of the preempted request to associate the payload with.
+            payload: Compressed KV dict (EncodedKVPayload) on CPU.
+        """
+        from src.scheduler.preemptive_kv_offload import PreemptionRecord
+
+        bytes_estimate = sum(
+            t.nbytes for t in _flatten_tensors(payload) if isinstance(t, torch.Tensor)
+        )
+        if request_id not in self.scheduler._preempted:
+            self.scheduler._preempted[request_id] = PreemptionRecord(
+                request_id=request_id,
+                offloaded_kv=None,
+                offload_bytes=0,
+            )
+        self.scheduler._preempted[request_id].offloaded_kv = payload
+        self.scheduler._preempted[request_id].is_compressed = True
+        self.scheduler._preempted[request_id].offload_bytes = bytes_estimate
+
     def record_processed_tokens(self, token_count: int) -> None:
         """Delegate token recording to the underlying scheduler."""
         self.scheduler.record_processed_tokens(token_count)

@@ -8,12 +8,37 @@ Effective compression: ~2.2 bits/element.
 
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import torch
 import torch.nn.functional as F
 
 from src.cache.turbo_quant import TurboQuantCodec
+
+
+class LowRankComponents(TypedDict):
+    """Float16 low-rank decomposition components: U[:, :r], S[:r], V[:r, :]."""
+
+    U: torch.Tensor  # [n_tokens, r_eff] float16
+    S: torch.Tensor  # [r_eff] float16
+    V: torch.Tensor  # [r_eff, d_head] float16
+
+
+class SingleComponentPayload(TypedDict):
+    """Encoded payload for one KV component (key or value)."""
+
+    lowrank: Optional[LowRankComponents]  # None when SVD failed
+    residual: Any  # TurboQuantCodec compressed dict
+
+
+class EncodedKVPayload(TypedDict):
+    """Full output of eOptShrinkQCodec.encode()."""
+
+    key: SingleComponentPayload
+    val: SingleComponentPayload
+    layer_idx: int
+    n_tokens: int
+    d_head: int
 
 
 class eOptShrinkQCodec:
@@ -112,7 +137,7 @@ class eOptShrinkQCodec:
         kv_key: torch.Tensor,
         kv_val: torch.Tensor,
         layer_idx: int,
-    ) -> Dict:
+    ) -> EncodedKVPayload:
         """Low-rank decomposition + TurboQuantCodec residual quantization.
 
         Returns compressed dict with lowrank components and quantized residuals.
@@ -159,7 +184,7 @@ class eOptShrinkQCodec:
     # Decoding                                                             #
     # ------------------------------------------------------------------ #
 
-    def decode(self, compressed: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    def decode(self, compressed: EncodedKVPayload) -> Tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct key and value tensors from compressed representation.
 
         Returns: (key_approx, val_approx), each [n_tokens, d_head] float32.
