@@ -200,11 +200,10 @@ print(f"pko_scheduling_stats: OK  preempt_count={pko_stats['preempt_count']}")
 
 class MockCompressedSched(CompressedPreemptionMixin):
     """Minimal stand-alone test class for CompressedPreemptionMixin."""
-    def __init__(self, **kwargs):
-        pko_args = {k: v for k, v in kwargs.items() if k.startswith("pko_")}
-        cpm_args = {k: v for k, v in kwargs.items() if k.startswith("cpm_")}
-        self._pko_capacity_bytes = pko_args.get("pko_cache_capacity_bytes", 4 * 1024**3)
-        self._pko_threshold = pko_args.get("pko_threshold_preempt", 0.85)
+    def __init__(self, cpm_encode_fn=None, cpm_decode_fn=None, **kwargs):
+        # pko state 수동 초기화 (vLLM Scheduler base 없이)
+        self._pko_capacity_bytes = 4 * 1024**3
+        self._pko_threshold = 0.85
         self._pko_rate_window = 32
         self._pko_fairness_max_wait = 10
         self._pko_sla_tier_a = set()
@@ -213,16 +212,19 @@ class MockCompressedSched(CompressedPreemptionMixin):
         self._pko_token_history = []
         self._pko_preempt_count = 0
         self._pko_resume_count = 0
-        self.cpm_codec = cpm_args.get("cpm_codec")
-        self.cpm_use_dual_stream = False  # CPU-only test
-        self.cpm_sla_tier_a_no_compress = True
-        self._cpm_compute_stream = None
-        self._cpm_memory_stream = None
-        self._cpm_overlap_history = []
-        self._cpm_bytes_before = 0
-        self._cpm_bytes_after = 0
+        # CompressedPreemptionMixin 속성 초기화
+        self._cpm_encode_fn = cpm_encode_fn
+        self._cpm_decode_fn = cpm_decode_fn
+        self._cpm_offload_count = 0
+        self._cpm_restore_count = 0
+        self._cpm_compress_count = 0
+        self._cpm_total_bytes_before = 0
+        self._cpm_total_bytes_after = 0
 
-cpm_sched = MockCompressedSched(cpm_codec=codec)
+cpm_sched = MockCompressedSched(
+    cpm_encode_fn=lambda k, v, li: codec.encode(k, v, li),
+    cpm_decode_fn=codec.decode,
+)
 
 torch.manual_seed(42)
 kv_k2 = torch.randn(256, 64)
@@ -244,8 +246,8 @@ assert cos_k_cpm >= 0.85, f"CompressedPreemptionMixin key cosine too low: {cos_k
 assert cos_v_cpm >= 0.85, f"CompressedPreemptionMixin val cosine too low: {cos_v_cpm:.4f}"
 
 stats_cpm = cpm_sched.cpm_stats()
-assert "compression_ratio" in stats_cpm and "preempt_count" in stats_cpm
-print(f"CompressedPreemptionMixin: OK  cos_k={cos_k_cpm:.4f}  cos_v={cos_v_cpm:.4f}  ratio={stats_cpm['compression_ratio']:.2%}")
+assert "cpm_compression_ratio" in stats_cpm and "preempt_count" in stats_cpm
+print(f"CompressedPreemptionMixin: OK  cos_k={cos_k_cpm:.4f}  cos_v={cos_v_cpm:.4f}  ratio={stats_cpm['cpm_compression_ratio']:.2%}")
 
 # make_preemptive_scheduler_class factory
 class MinimalSchedBase:
