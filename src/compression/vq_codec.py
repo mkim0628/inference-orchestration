@@ -308,29 +308,38 @@ class VQCodec:
     def compression_ratio(self) -> float:
         """Effective compression ratio for the VQ+recent_window scheme.
 
-        Bits per element:
-          VQ portion: n_residuals * ceil(log2(M)) bits per value
-          FP16 portion: 16 bits per value
-        With recent_window fraction kept FP16, overall compression ratio is
-        the memory saved relative to full FP16.
+        VQ operates on vectors of d_head dimensions: each residual stage encodes
+        an entire d_head-dimensional vector into one code index.  So the VQ storage
+        cost for one token-head entry is:
+            n_residuals × ceil(log2(M)) bits       [for the codes]
+        vs the FP16 baseline:
+            d_head × 16 bits                        [for the raw tensor]
+
+        With recent_window tokens kept as FP16, the effective ratio across a
+        typical block of `typical_total` tokens is:
+            vq_fraction  = (total - recent_window) / total
+            avg_bits_per_dhead_fp16 = d_head × 16
+            avg_bits_vq  = n_r × bits_per_code
+            ratio = 1 - (vq_fraction × avg_bits_vq + fp16_fraction × avg_bits_fp16)
+                                     / avg_bits_fp16
         """
         M = self.config.codebook_size
         n_r = self.config.n_residuals
+        d_head = self.config.d_head
         bits_per_code = math.ceil(math.log2(max(M, 2)))
-        # Bits per element in VQ region
-        vq_bits_per_elem = n_r * bits_per_code
-        fp16_bits = 16.0
 
-        # Estimate fraction of tokens that are VQ-compressed vs FP16
-        # recent_window tokens stay FP16; we assume a typical block of 512 tokens
+        # Bits to represent one token-head vector
+        fp16_bits_per_vec = d_head * 16.0          # FP16 baseline
+        vq_bits_per_vec = n_r * bits_per_code       # VQ codes (one code per residual stage)
+
+        # Fraction of tokens that are VQ-compressed vs kept FP16
         typical_total = 512
         recent_w = self.config.recent_window
         vq_fraction = max(0.0, (typical_total - recent_w) / typical_total)
         fp16_fraction = 1.0 - vq_fraction
 
-        # Average bits per element across VQ and FP16 regions
-        avg_bits = vq_fraction * vq_bits_per_elem + fp16_fraction * fp16_bits
-        ratio = 1.0 - avg_bits / fp16_bits
+        avg_bits = vq_fraction * vq_bits_per_vec + fp16_fraction * fp16_bits_per_vec
+        ratio = 1.0 - avg_bits / fp16_bits_per_vec
         return max(0.0, ratio)
 
     def save(self, path: str) -> None:
@@ -344,7 +353,8 @@ class VQCodec:
         )
 
     def load(self, path: str) -> None:
-        data = torch.load(path, map_location="cpu")
+        # weights_only=False needed because VQCodebookConfig dataclass is not a plain tensor
+        data = torch.load(path, map_location="cpu", weights_only=False)
         self.key_codebooks = data["key_codebooks"]
         self.val_codebooks = data["val_codebooks"]
         self.config = data["config"]

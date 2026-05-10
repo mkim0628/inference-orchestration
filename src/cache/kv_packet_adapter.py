@@ -84,6 +84,8 @@ class KVPacketSoftAdapterCache(CacheStore):
         self._misses = 0
         self._noncontiguous_hits = 0
         self._access_order: List[str] = []
+        # Maintains doc insertion order (not mutated by LRU moves) for non-contiguous detection
+        self._insertion_order: List[str] = []
 
     # ------------------------------------------------------------------ #
     # CacheStore interface                                                 #
@@ -98,6 +100,7 @@ class KVPacketSoftAdapterCache(CacheStore):
             self.evict()
         packet = self.create_packet(key, value)
         self._store[key] = packet
+        self._insertion_order.append(key)
 
     def get(self, key: str) -> Optional[torch.Tensor]:
         """Return adapter-adapted KV block, or None on miss."""
@@ -108,14 +111,17 @@ class KVPacketSoftAdapterCache(CacheStore):
         self._store.move_to_end(key)
         self._hits += 1
 
-        # Track non-contiguous access: hit is non-contiguous if the previously
-        # accessed doc_id is not the immediately prior key in insertion order
+        # Track non-contiguous access using stable insertion order (not LRU order).
+        # A hit is non-contiguous when the current and previous accessed keys are
+        # not adjacent in insertion order, signalling a "skip" across segments.
         if self._access_order:
             prev_key = self._access_order[-1]
-            store_keys = list(self._store.keys())
-            if key in store_keys and prev_key in store_keys:
-                prev_pos = store_keys.index(prev_key)
-                curr_pos = store_keys.index(key)
+            if (
+                key in self._insertion_order
+                and prev_key in self._insertion_order
+            ):
+                prev_pos = self._insertion_order.index(prev_key)
+                curr_pos = self._insertion_order.index(key)
                 if abs(curr_pos - prev_pos) != 1:
                     self._noncontiguous_hits += 1
             else:
@@ -132,6 +138,8 @@ class KVPacketSoftAdapterCache(CacheStore):
             return 0
         key, packet = next(iter(self._store.items()))
         self._store.pop(key)
+        if key in self._insertion_order:
+            self._insertion_order.remove(key)
         freed = packet.kv_block.nbytes
         for p in packet.adapter.parameters():
             freed += p.nbytes
@@ -154,6 +162,7 @@ class KVPacketSoftAdapterCache(CacheStore):
         self._misses = 0
         self._noncontiguous_hits = 0
         self._access_order.clear()
+        # Note: _insertion_order is not reset — it tracks structural order, not hit stats
 
     # ------------------------------------------------------------------ #
     # Packet-level API                                                     #
