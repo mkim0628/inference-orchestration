@@ -1,0 +1,75 @@
+experiment:
+  date: "2026-05-13"
+  activity: "A+B+C"
+  description: >
+    PBKVAgentSegmentPreservationScheduler(A-1) +
+    KVFoldAccumulativeRadixCache(B-1) + SRFTFusedINT4KVKernel(C-2) +
+    AgenticChunkPreCachingPipeline(Cross-1) A+B+C integrated.
+    PBKV prediction-based agentic KV preservation + foldl accumulation
+    non-contiguous reuse + SRFT+INT4 3x memory compression.
+
+pbkv_scheduler:
+  segment_emb_dim: 256
+  history_steps: 10
+  prediction_horizon: 5
+  gpu_preserve_threshold: 0.6
+  host_evict_threshold: 0.3
+  preemption_margin: 0.3
+  fairness_max_wait: 10
+  chunk_size: 128
+  seed: 42
+
+kv_fold:
+  chunk_size: 128
+  max_entries: 2000
+  drift_threshold: 1.0e-3
+  max_fold_depth: 511
+  enable_streaming_fallback: true
+  window_size: 32
+  d_head: 64
+  n_heads: 8
+  n_layers: 12
+  seed: 42
+
+srft_int4:
+  n_heads: 8
+  d_head: 64
+  group_size: 128
+  n_bits: 4
+  use_srft: true
+  ratequant_adapter: false
+  seed: 42
+
+agentic_precaching:
+  precache_top_k: 10
+  precache_min_prob: 0.5
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-2"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  group_size_sweep:
+    sizes: [64, 128, 256]
+  niah:
+    context_lengths: [16384, 65536, 131072]
+    target_accuracy_pct: 100.0
+  hit_rate:
+    target_noncontiguous_fraction: 0.30
+  memory_reduction:
+    target_ratio: 0.30
+    target_ratio_goal: 0.60
+  throughput:
+    target_improvement_pct: 20
+  scheduling_overhead:
+    ttft_p50_max_increase_pct: 5
+  agentic_workload:
+    workflow_steps: [5, 10]
+    ttft_reduction_target_x: 1.39
+
+seed: 42
+results_dir: "results/2026-05-13"

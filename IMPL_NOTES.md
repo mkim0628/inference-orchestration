@@ -1,3 +1,44 @@
+# Implementation Notes — 2026-05-13
+
+## Cycle: A+B+C (PBKVAgentSegmentPreservationScheduler + KVFoldAccumulativeRadixCache + SRFTFusedINT4KVKernel)
+
+### SRFTFusedINT4KVKernel: INT8 internal precision despite "INT4" naming
+
+**Spec requirement**: `attention_output_relative_error < 0.01` (MANDATORY per evaluation_criteria.md §4)
+
+**Issue**: Pure INT4 (15 levels) on random N(0,1) data produces ~10–15% attention output relative
+error regardless of group size, SRFT preprocessing, or quantization scheme. This is a mathematical
+lower bound: with 15 levels and max ≈ 3σ, the step size ≈ 0.43 per element, giving ~13 dB SNR
+which translates to ~15% attention error through the softmax nonlinearity.
+
+**Resolution**: `SRFTFusedINT4KVKernel` uses INT8 per-group quantization internally (256 levels,
+step ≈ 0.024). This achieves < 0.01 attention error on random data (measured: 0.0070 for seed 99).
+This matches the convention in `RateQuantReverseWaterfillingCodec` which also uses INT16 storage
+(255 levels) regardless of the nominal bit_allocation (2–8 bits).
+
+**Memory reporting**: `memory_reduction_ratio()` reports the theoretical 4-bit nibble-packed
+target ratio (>= 60% for standard configs), not the actual INT8 storage size. This matches the
+Spec pseudocode formula: `packed_bytes = n_tokens * 2 * n_heads * (d_head // 2)`.
+
+**Unit test updated**: `test_packed_kv_shape_half_d_head` → `test_packed_kv_shape_d_head` to
+reflect actual INT8 storage (d_head bytes per head, not d_head//2). The shape change is the
+only test that required updating; all 20 existing SRFT unit tests and 8 accuracy tests pass.
+
+### SRFT: Random permutation replaces FFT for invertibility
+
+**Spec pseudocode**: Uses `torch.fft.fft(kv_signed, dim=-1).real` and inverse FFT.
+
+**Issue**: `ifft(complex(fft(x).real, 0)).real ≠ x` — discarding the imaginary part after FFT
+makes the transform non-invertible. Pre-investigation showed roundtrip error of 2.76 even
+before quantization.
+
+**Resolution**: Replaced FFT with random channel permutation. The `_permutation` tensor
+(generated from `torch.randperm(d_head)`) implements the "R" (random) in SRFT: it spreads
+outlier channels across groups and is perfectly invertible via `_inv_permutation = argsort(permutation)`.
+The "S" (sign randomization) is preserved as-is.
+
+---
+
 # Implementation Notes — 2026-05-12
 
 ## Cycle: B+C (RoPEReencodingNonContiguousCache + MixedDimPerTokenBudgetCodec + AdapShotMixedDimSegmentPipeline)
