@@ -196,6 +196,7 @@ __all__ = [
     "FibQuantVQSegmentKVManager",
     "make_fibquant_kv_cache_manager_class",
     "FibQuantAttentionHook",
+    "apply_fibquant_patch",
     "extend_cache_config_fibquant",
     # 2026-05-12
     "AdapShotBlockManager",

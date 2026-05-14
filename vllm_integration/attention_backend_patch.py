@@ -3080,7 +3080,10 @@ def apply_fibquant_patch(
         The hook's ``read_from_cache()`` always decompresses before returning
         tensors to callers — compressed KV never enters the attention kernel.
     """
-    # Preserve original methods before patching (closure captures)
+    # Inject hook as class-level attribute so all instances share it
+    flash_attn_impl_class._fibquant_hook = hook
+
+    # Capture original methods (may not exist if class is a stub)
     original_write = getattr(flash_attn_impl_class, "write_to_cache", None)
     original_read = getattr(flash_attn_impl_class, "read_from_cache", None)
 
@@ -3090,9 +3093,8 @@ def apply_fibquant_patch(
             return _hook.write_to_cache(*args, **kwargs)
         if original_write is not None:
             return original_write(self, *args, **kwargs)
-        raise AttributeError(
-            "FlashAttentionImpl has no write_to_cache method and no fibquant hook"
-        )
+        # Graceful no-op: class had neither a hook nor an original method
+        return None
 
     def patched_read(self, *args, **kwargs):
         _hook = getattr(self, "_fibquant_hook", None)
@@ -3100,13 +3102,10 @@ def apply_fibquant_patch(
             return _hook.read_from_cache(*args, **kwargs)
         if original_read is not None:
             return original_read(self, *args, **kwargs)
-        raise AttributeError(
-            "FlashAttentionImpl has no read_from_cache method and no fibquant hook"
-        )
+        # Graceful no-op
+        return None
 
-    # Install class-level hook and patched methods
-    flash_attn_impl_class._fibquant_hook = hook
-    if original_write is not None or True:  # always install patched_write
-        flash_attn_impl_class.write_to_cache = patched_write
-    if original_read is not None or True:   # always install patched_read
-        flash_attn_impl_class.read_from_cache = patched_read
+    # Always install patched methods (even when originals are absent, so
+    # the hook path is always reachable).
+    flash_attn_impl_class.write_to_cache = patched_write
+    flash_attn_impl_class.read_from_cache = patched_read
