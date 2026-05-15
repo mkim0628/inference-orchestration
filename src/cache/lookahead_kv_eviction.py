@@ -203,6 +203,26 @@ class LookaheadKVEvictionCodec(CacheStore):
 
         with torch.no_grad():
             importance = self._lookahead.forward(k, layer_idx=layer_idx)
+            # Blend with key-norm importance (L2 norm across d_head, avg over heads).
+            # Key norm is a robust, always-available signal for token saliency;
+            # it acts as a strong prior when lookahead weights are near-zero (untrained).
+            key_norm_importance = k.norm(dim=-1).mean(dim=-1)  # [n_tokens]
+            # Normalise both signals to [0, 1] before blending
+            la_range = importance.max() - importance.min()
+            if la_range > 1e-8:
+                la_norm = (importance - importance.min()) / la_range
+            else:
+                la_norm = torch.zeros_like(importance)
+            kn_range = key_norm_importance.max() - key_norm_importance.min()
+            if kn_range > 1e-8:
+                kn_norm = (key_norm_importance - key_norm_importance.min()) / kn_range
+            else:
+                kn_norm = torch.zeros_like(key_norm_importance)
+            # blend_ratio=0.0 means pure LookaheadKV; use 0.5 as key-norm weight
+            # when lookahead has near-zero discriminative power (untrained state).
+            la_discriminative = la_range > 1e-4
+            key_norm_blend = 0.0 if la_discriminative else 0.5
+            importance = (1.0 - key_norm_blend) * la_norm + key_norm_blend * kn_norm
 
         # Always preserve the most recent recent_window tokens
         if self.config.recent_window > 0 and n_tokens > 0:
