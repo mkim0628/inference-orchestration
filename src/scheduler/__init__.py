@@ -6,6 +6,8 @@ from src.scheduler.preemptive_kv_offload import PreemptiveKVOffloadScheduler, Pr
 from src.scheduler.compressed_preemption import CompressedPreemptionPipeline
 from src.scheduler.ppd_append_prefill_router import PPDAppendPrefillRouter, PPDRoutingDecision
 from src.scheduler.hit_aware_ppd_router import HitAwarePPDRouter
+from src.scheduler.nath_ddr_offloading import NAtHDDROffloadingScheduler, NAtHDDROffloadingConfig
+from src.scheduler.nath_retention_tier_decider import NAtHRetentionTierDecider, NAtHRetentionTierDeciderConfig
 
 __all__ = [
     "CacheAwareScheduler",
@@ -19,4 +21,8 @@ __all__ = [
     "PPDAppendPrefillRouter",
     "PPDRoutingDecision",
     "HitAwarePPDRouter",
+    "NAtHDDROffloadingScheduler",
+    "NAtHDDROffloadingConfig",
+    "NAtHRetentionTierDecider",
+    "NAtHRetentionTierDeciderConfig",
 ]

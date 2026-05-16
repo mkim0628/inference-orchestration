@@ -1,0 +1,80 @@
+experiment:
+  date: "2026-05-16"
+  activity: "A+C"
+  description: >
+    C-2 GlobalRetentionGateEvictionCodec (전역 크로스-레이어 경쟁 퇴거 코덱) +
+    A-2 NAtHDDROffloadingScheduler (의미-인식 4-티어 DDR 오프로딩 최소-퇴거 스케줄러) +
+    Cross-1 NAtHRetentionTierDecider (이중 신호 A+C 4-티어 결정기)
+  cache_type: global_retention_gate
+  compression_method: eviction
+  scheduler_type: nath_ddr_offloading
+
+global_retention_gate_eviction:
+  n_layers: 12
+  n_heads: 8
+  d_model: 512           # n_heads * d_head (8 * 64)
+  budget_ratio: 0.3      # 기본 전역 보존 비율 (30%만 보존, 70% 퇴거)
+                         # sweep: 0.1 / 0.2 / 0.3 / 0.5 / 0.7
+  recent_window: 32      # 최근 N 토큰 항상 보존
+  ensemble_ratio: 0.0    # LaProx 앙상블 비율 (0.0=순수 전역 리텐션)
+  max_entries: 1000
+  seed: 42
+
+nath_ddr_offloading:
+  tier_boundaries: [0.30, 0.70, 0.97]  # [p1, p2, p3] 백분위 경계
+  max_eviction_ratio: 0.03              # 영구 퇴거 비율 상한 (3%)
+  ema_alpha: 0.95                       # 누적 어텐션 점수 EMA 감쇠 계수
+  prefetch_chunk_size: 64               # DDR→HBM 비동기 프리페치 단위
+  max_wait_ratio: 2.0                   # 요청 최대 대기 시간 배수
+  seed: 42
+
+nath_retention_tier_decider:
+  alpha: 0.5            # 이중 신호 결합 가중치 (0.5=균등)
+  max_eviction_ratio: 0.03
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01           # 1% attention output error limit
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-2"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  budget_sweep:
+    ratios: [0.1, 0.2, 0.3, 0.5, 0.7]  # 전역 예산 비율 sweep
+  nath_eviction:
+    max_eviction_ratio: 0.03       # 영구 퇴거 비율 상한 검증
+    eviction_sweep_ratios: [0.01, 0.03, 0.05, 0.10]  # GSM8K 정확도 곡선용
+  memory_reduction:
+    target_ratio: 0.30             # 최소: -30%
+    target_ratio_goal: 0.70        # 목표: -70% (budget_ratio=0.3)
+  throughput:
+    target_improvement_pct: 20    # +20% 이상
+  effective_context:
+    target_multiplier: 2.0        # 2× 이상
+  scheduling:
+    ttft_overhead_limit_pct: 5.0  # TTFT p50 +5% 이내
+  comparison:
+    methods: ["global_retention_gate", "laprox", "lookahead_kv"]
+    budget_ratio: 0.3
+    cosine_tolerance: 0.005       # GlobalRetentionGate >= LookaheadKV - 0.005
+  long_context:
+    n_tokens: 512                 # 긴 컨텍스트 테스트 토큰 수
+    check_noise_reduction: true   # "전체 캐시 초과 성능" 측정
+
+retention_gate_training:
+  n_samples: 500
+  n_epochs: 5
+  lr: 1.0e-3
+  budget_ratio: 0.3
+  output: "configs/retention_gate_weights.pt"
+
+nath_calibration:
+  n_sequences: 100
+  max_eviction_ratio: 0.03
+  output: "configs/nath_tier_boundaries.yaml"
+
+seed: 42
+results_dir: "results/2026-05-16"
