@@ -1,0 +1,9 @@
+calibration:
+  max_eviction_ratio: 0.03
+  n_sequences: 100
+  n_tokens_total: 29015
+  seed: 42
+nath_tier_boundaries:
+  p1: 0.3
+  p2: 0.7
+  p3: 0.97
