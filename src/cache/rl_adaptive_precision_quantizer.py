@@ -22,9 +22,9 @@ PrecisionLevel = Literal["fp16", "int8", "int4"]
 @dataclass
 class RLAdaptivePrecisionConfig:
     # Precision ratios (order: FP16, INT8, INT4 — sum must equal 1.0)
-    precision_ratio_fp16: float = 0.20      # top 20%: FP16 (low entropy, high importance)
+    precision_ratio_fp16: float = 0.40      # top 40%: FP16 (low entropy, high importance)
     precision_ratio_int8: float = 0.60      # middle 60%: INT8
-    precision_ratio_int4: float = 0.20      # bottom 20%: INT4 (high entropy, low importance)
+    precision_ratio_int4: float = 0.00      # bottom 0%: INT4 (disabled by default for accuracy)
 
     # RL detection parameters
     warmup_steps: int = 10                  # initial N steps: keep full FP16 precision
@@ -439,13 +439,13 @@ class RLAdaptivePrecisionQuantizer(CacheStore):
     # ------------------------------------------------------------------ #
 
     def memory_reduction_ratio(self) -> float:
-        """Actual memory reduction ratio (bytes basis).
+        """Theoretical memory reduction ratio based on precision ratios (not actual bytes).
 
-        For mixed [0.2, 0.6, 0.2] precision:
-          - FP16 tokens: 2 bytes/element
-          - INT8 tokens: ~1 byte/element stored as FP16 → compression is semantic,
-            but stored as FP16 so bytes-on-disk is same shape.
-          - We report the theoretical reduction based on precision ratios.
+        For default [0.4 FP16, 0.6 INT8, 0.0 INT4] precision:
+          - All precision levels are stored as FP16 in memory (same byte count).
+          - Theoretical reduction reflects semantic compression savings vs FP32 baseline:
+              INT8 saves 50% vs FP32; INT4 saves 75% vs FP32.
+          - theoretical ratio based on precision ratios (not actual bytes)
         """
         if self._total_bytes_original == 0:
             return 0.0

@@ -24,9 +24,9 @@ hma_multi_connector_scheduler:
     default: "global_retention"
 
 rl_adaptive_precision_quantizer:
-  precision_ratio_fp16: 0.20
+  precision_ratio_fp16: 0.40
   precision_ratio_int8: 0.60
-  precision_ratio_int4: 0.20
+  precision_ratio_int4: 0.00
   warmup_steps: 10
   cot_length_threshold: 512
   high_reward_threshold: 0.8
