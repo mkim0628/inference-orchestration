@@ -1,0 +1,91 @@
+experiment:
+  date: "2026-05-17"
+  activity: "A+C"
+  description: >
+    A-1 HMAMultiConnectorCompressionPluginScheduler (HMA multi-connector plugin meta-scheduler) +
+    C-1 RLAdaptivePrecisionQuantizer (RL workload online adaptive precision KV quantizer) +
+    Cross-1 HMAChainedACPipeline (A+C integration pipeline)
+  cache_type: rl_adaptive_precision
+  compression_method: quantization
+  scheduler_type: hma_multi_connector
+
+hma_multi_connector_scheduler:
+  long_ctx_threshold: 4096
+  memory_pressure_threshold: 0.8
+  default_connector: "global_retention"
+  pipeline_mode: false
+  max_wait_ratio: 2.0
+  seed: 42
+
+  connector_dispatch_policy:
+    rl_mode_connector: "rl_adaptive"
+    long_ctx_connector: "global_retention"
+    high_pressure_connector: "ratequant"
+    default: "global_retention"
+
+rl_adaptive_precision_quantizer:
+  precision_ratio_fp16: 0.20
+  precision_ratio_int8: 0.60
+  precision_ratio_int4: 0.20
+  warmup_steps: 10
+  cot_length_threshold: 512
+  high_reward_threshold: 0.8
+  reward_aggression_step: 0.05
+  reward_recovery_step: 0.05
+  max_entries: 1000
+  seed: 42
+  precision_sweep:
+    - [0.20, 0.60, 0.20]
+    - [0.30, 0.50, 0.20]
+    - [0.20, 0.20, 0.60]
+    - [1.00, 0.00, 0.00]
+
+hma_chained_ac_pipeline:
+  chain_mode: false
+  default_connector: "global_retention"
+  long_ctx_threshold: 4096
+  memory_pressure_threshold: 0.8
+  seed: 42
+
+global_retention_gate_eviction:
+  n_layers: 4
+  n_heads: 4
+  d_model: 256
+  budget_ratio: 0.3
+  recent_window: 32
+  max_entries: 1000
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-2"
+    perplexity_tolerance_pct: 1.0
+    task_accuracy_tolerance_pct: 1.0
+  rl_simulation:
+    n_rounds: 10
+    reward_sequence: [0.9, 0.9, 0.9, 0.3, 0.3, 0.9, 0.9, 0.9, 0.9, 0.9]
+    convergence_error_threshold: 0.01
+  memory_reduction:
+    target_ratio: 0.30
+    target_ratio_goal: 0.50
+  throughput:
+    target_improvement_pct: 20
+  effective_context:
+    target_multiplier: 2.0
+  scheduling:
+    ttft_overhead_limit_pct: 5.0
+    connector_selection_overhead_ms: 0.1
+  comparison:
+    methods: ["rl_adaptive", "global_retention", "baseline_fp16"]
+    cosine_tolerance: 0.01
+  cross_ac_comparison:
+    methods: ["solo_a1", "solo_c1", "cross_combined", "prior_cross_nath_retention"]
+    throughput_min_improvement_vs_solo: 5.0
+    memory_min_improvement_vs_solo: 10.0
+
+seed: 42
+results_dir: "results/2026-05-17"
