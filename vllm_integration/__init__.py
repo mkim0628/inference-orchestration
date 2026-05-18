@@ -135,6 +135,71 @@ from __future__ import annotations
 import warnings
 from typing import Any, Optional
 
+# 2026-05-18 imports (Activity A+B+C)
+try:
+    from vllm_integration.scheduler_patch import (
+        AMPDLazySegmentFetchSchedulerConfig,
+        AMPDLazySegmentFetchSchedulerMixin,
+        make_ampd_lazy_segment_fetch_scheduler_class,
+    )
+except Exception as _e_a18:
+    import warnings as _warnings_18a
+    _warnings_18a.warn(
+        f"vllm_integration: 2026-05-18 Activity A import failed: {_e_a18}",
+        RuntimeWarning,
+    )
+    AMPDLazySegmentFetchSchedulerConfig = None  # type: ignore
+    AMPDLazySegmentFetchSchedulerMixin = None   # type: ignore
+    make_ampd_lazy_segment_fetch_scheduler_class = None  # type: ignore
+
+try:
+    from vllm_integration.block_manager_patch import (
+        AMPDAdapShotKVManagerConfig,
+        AMPDAdapShotLazyLoadKVCacheManagerMixin,
+        make_ampd_adapshot_kv_cache_manager_class,
+    )
+except Exception as _e_b18:
+    import warnings as _warnings_18b
+    _warnings_18b.warn(
+        f"vllm_integration: 2026-05-18 Activity B import failed: {_e_b18}",
+        RuntimeWarning,
+    )
+    AMPDAdapShotKVManagerConfig = None              # type: ignore
+    AMPDAdapShotLazyLoadKVCacheManagerMixin = None  # type: ignore
+    make_ampd_adapshot_kv_cache_manager_class = None  # type: ignore
+
+try:
+    from vllm_integration.attention_backend_patch import (
+        DPAttentionAwareCompressionConfig_c18,
+        DPAttentionAwareCompressionAttentionHook,
+        extend_cache_config_dp_attn_aware_compression,
+        apply_dp_attn_aware_compression_patch,
+    )
+except Exception as _e_c18:
+    import warnings as _warnings_18c
+    _warnings_18c.warn(
+        f"vllm_integration: 2026-05-18 Activity C attention hook import failed: {_e_c18}",
+        RuntimeWarning,
+    )
+    DPAttentionAwareCompressionConfig_c18 = None     # type: ignore
+    DPAttentionAwareCompressionAttentionHook = None  # type: ignore
+    extend_cache_config_dp_attn_aware_compression = None  # type: ignore
+    apply_dp_attn_aware_compression_patch = None     # type: ignore
+
+try:
+    from vllm_integration.compression_codec import (
+        DPAttentionAwareVllmCodec,
+        DPAttentionCrossABCCodec,
+    )
+except Exception as _e_cc18:
+    import warnings as _warnings_18cc
+    _warnings_18cc.warn(
+        f"vllm_integration: 2026-05-18 Activity C codec import failed: {_e_cc18}",
+        RuntimeWarning,
+    )
+    DPAttentionAwareVllmCodec = None   # type: ignore
+    DPAttentionCrossABCCodec = None    # type: ignore
+
 # 2026-05-16 imports (Activity A+C)
 try:
     from vllm_integration.scheduler_patch import (
@@ -307,6 +372,19 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-18
+    "AMPDLazySegmentFetchSchedulerConfig",
+    "AMPDLazySegmentFetchSchedulerMixin",
+    "make_ampd_lazy_segment_fetch_scheduler_class",
+    "AMPDAdapShotKVManagerConfig",
+    "AMPDAdapShotLazyLoadKVCacheManagerMixin",
+    "make_ampd_adapshot_kv_cache_manager_class",
+    "DPAttentionAwareCompressionConfig_c18",
+    "DPAttentionAwareCompressionAttentionHook",
+    "extend_cache_config_dp_attn_aware_compression",
+    "apply_dp_attn_aware_compression_patch",
+    "DPAttentionAwareVllmCodec",
+    "DPAttentionCrossABCCodec",
     # 2026-05-16
     "NAtHDDROffloadingSchedulerConfig",
     "NAtHDDROffloadingSchedulerMixin",
