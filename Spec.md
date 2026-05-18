@@ -1,83 +1,92 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-16 대비):
-이전 사이클(2026-05-16)은 A+C 조합이었다:
-  - C-2 GlobalRetentionGateEvictionCodec (전역 크로스-레이어 경쟁 퇴거)
-  - A-2 NAtHDDROffloadingScheduler (누적 어텐션 점수 EMA 기반 4-티어 DDR 오프로딩)
-  - Cross-1 NAtHRetentionTierDecider (이중 신호 A+C 4-티어 결정기)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-17 대비):
+이전 사이클(2026-05-17)은 A+C 조합이었다:
+  - A-1 HMAMultiConnectorCompressionPluginScheduler (HMA 멀티-커넥터 플러그인 메타-스케줄러)
+  - C-1 RLAdaptivePrecisionQuantizer (RL 워크로드 온라인 적응 정밀도 양자화기)
+  - Cross-1 HMAChainedACPipeline (A+C 통합 파이프라인)
 
-이번 사이클(2026-05-17)은 A+C 조합을 유지하되 설계 축이 완전히 전환된다.
+이번 사이클(2026-05-18)은 A+B+C 조합으로 전환하며 설계 축이 완전히 교체된다.
 
 주요 변경:
-1. [Activity A 교체] NAtHDDROffloadingScheduler(단일 정책) →
-   HMAMultiConnectorCompressionPluginScheduler(멀티-커넥터 플러그인 레지스트리 기반 메타-스케줄러).
-   이전 A 기법들이 단일 오프로딩/퇴거 정책을 고정 적용한 반면, 이번 A-1은
-   vLLM v0.21.0 HMA 멀티-커넥터 공식 API를 활용해 요청 특성(컨텍스트 길이, RL 여부,
-   메모리 압박)에 따라 런타임에 적절한 압축 커넥터를 선택·조합한다.
-   기구현 코덱(GlobalRetentionGateEvictionCodec, LookaheadKVEvictionCodec,
-   RateQuantReverseWaterfillingCodec)을 즉시 커넥터로 재활용.
+1. [Activity A 교체] HMAMultiConnectorCompressionPluginScheduler(플러그인 레지스트리) →
+   AMPDLazySegmentFetchScheduler(AMPD pull-on-demand 지연 페치 스케줄러).
+   세그먼트 재사용 집합 확정 전까지 KV 전송 자체를 보류하는 pull-on-demand 타이밍 제어로,
+   이전 모든 A 기법(push/사전-오프로딩)과 근본 원리가 다르다.
 
-2. [Activity C 신규] GlobalRetentionGateEvictionCodec(정적 캘리브레이션) →
-   RLAdaptivePrecisionQuantizer(RL 워크로드 온라인 적응 정밀도 양자화).
-   이전 16개 사이클 전체에 없던 "RL 리워드 피드백 + 온라인 어텐션 엔트로피 기반
-   실시간 정밀도 결정" 패러다임. vLLM Q2 2026 온라인 양자화 리팩터 방향과 직접 정렬.
+2. [Activity B 신규 추가] 이전 사이클에 없던 Activity B를 포함:
+   AMPDAdapShotLazyLoadPipeline — 세그먼트 집합 확정 후 로드와
+   AdapShot RoPE 재인코딩을 비동기 오버랩하는 3단계 파이프라인.
 
-3. [Cross A+C 신규] NAtHRetentionTierDecider(이중 신호 티어 결정) →
-   HMAChainedACPipeline(멀티-커넥터 플러그인 체이닝 + A+C 통합).
-   A-1 HMAMultiConnectorScheduler 커넥터 레지스트리에
-   C-1 RLAdaptivePrecisionQuantizer + 기구현 GlobalRetentionGateEvictionCodec을
-   등록하고 요청별 동적 디스패치를 수행하는 완전한 A+C 파이프라인.
+3. [Activity C 교체] RLAdaptivePrecisionQuantizer(RL 리워드 피드백) →
+   DPAttentionAwareCompressionSelector(DP Attention 상태 인식 환경별 압축 선택기).
+   단일/멀티 GPU 환경에서 DP Attention KV 중복 제거 상태를 압축 정책 결정 입력으로 사용하는
+   최초의 C 기법. 기구현 코덱 3종을 환경 인식 래퍼로 재활용.
 
-4. [보존 파일] 기존 모든 파일(global_retention_gate_eviction.py,
-   nath_ddr_offloading.py 등)은 이번 사이클에서 수정하지 않는다.
-   기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
+4. [Cross 교체] HMAChainedACPipeline(A+C 플러그인 체이닝) →
+   AMPDPrefillShareNonContiguousStack(A+B+C 완전 통합 스택).
+   5단계 처리 흐름: 메타데이터 선행 전달 → 팬아웃 배포 → 지연 로드·재인코딩 →
+   환경 인식 압축 → 비연속 어텐션 계산.
 
-5. [인터페이스 유지] src/cache/base.py는 이번 사이클에서 수정하지 않는다.
+5. [보존 파일] 기존 모든 파일(rl_adaptive_precision_quantizer.py,
+   hma_multi_connector_scheduler.py, hma_chained_ac_pipeline.py 등)은
+   이번 사이클에서 수정하지 않는다. 기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
+
+6. [인터페이스 유지] src/cache/base.py는 이번 사이클에서 수정하지 않는다.
    CacheStore 6개 추상 메서드를 모든 신규 구현체가 완전 구현한다.
 
-6. [Activity C 필수] RLAdaptivePrecisionQuantizer는 accuracy-preserving 검증 계획 없이
-   완성 불가. WikiText-2 perplexity ±1% + RL 워크로드 시뮬레이션(동일 프롬프트 10회 반복) +
-   리워드 피드백 수렴 곡선 + GlobalRetentionGateEvictionCodec과 동일 설정 비교.
+7. [Activity C 필수] DPAttentionAwareCompressionSelector는 accuracy-preserving
+   검증 계획(WikiText-2 perplexity ±1% + LongBench 8개 서브태스크 + 환경별 교차 검증)
+   없이 완성 불가.
 -->
 
-# Spec — 2026-05-17
+# Spec — 2026-05-18
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-17.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-18.md`
 
 **최우선 구현 타겟**:
-- **A-1 (주)**: HMAMultiConnectorCompressionPluginScheduler — vLLM v0.21.0 HMA 멀티-커넥터
-  플러그인 기반 압축 정책 동적 디스패치 메타-스케줄러
-- **C-1 (주)**: RLAdaptivePrecisionQuantizer — RL 워크로드용 온라인 적응 정밀도 KV 양자화기
-  (어텐션 엔트로피 기반 채널별 FP16/INT8/INT4 동적 할당 + RL 리워드 피드백 루프)
-- **Cross-1 (주)**: HMAChainedACPipeline — A-1 + C-1 + 기구현 코덱 통합 A+C 파이프라인
+- **A-1 (주)**: AMPDLazySegmentFetchScheduler — AMPD pull-on-demand 원칙 기반
+  세그먼트 집합 확정 전 KV 전송 보류 + 확정 후 비동기 pull 스케줄러
+- **B-1 (주)**: AMPDAdapShotLazyLoadPipeline — 세그먼트 집합 확정 후
+  로드-AdapShot RoPE 재인코딩 비동기 오버랩 3단계 파이프라인 (CacheStore 구현)
+- **C-1 (주)**: DPAttentionAwareCompressionSelector — DP Attention 환경 상태 인식
+  압축 정책 자동 선택기 (단일/멀티 GPU 환경별 최적 코덱 선택)
+- **Cross-1 (주)**: AMPDPrefillShareNonContiguousStack — A-1+B-1+C-1 5단계
+  완전 통합 스택
 
 **해결하려는 문제**:
 
-- **Activity A**: 기존 모든 A 기법이 단일 스케줄링 정책(한 가지 오프로딩·퇴거 전략)을 모든
-  요청에 일률 적용하는 한계. HMAMultiConnectorScheduler는 vLLM v0.21.0의 공식 HMA
-  멀티-커넥터 API를 레지스트리 추상화로 래핑해 요청 특성(RL/긴 컨텍스트/메모리 압박)에 따라
-  최적 압축 커넥터를 런타임에 선택·체이닝한다. 커넥터 선택 오버헤드는 O(1) 딕셔너리 룩업으로
-  TTFT +5% 이내를 보장한다.
+- **Activity A**: 기존 모든 A 기법이 스케줄러가 세그먼트 재사용 결정 확정 여부와
+  관계없이 KV 블록을 선제 전송(push) 또는 사전 오프로딩하는 방식으로 불필요 전송이
+  발생한다. AMPDLazySegmentFetchScheduler는 AMPD(2602.14516) "KV 지연 읽기" 원칙을
+  비연속 세그먼트 경로에 적용해, 세그먼트 재사용 집합이 Louver 탐색으로 확정된 시점
+  이후에만 pull-on-demand 방식으로 KV를 읽는다. 메타데이터만 먼저 전달하고 KV 데이터
+  전송은 확정 후로 보류함으로써 불필요 전송 −40~65%를 달성한다.
 
-- **Activity C**: 기존 모든 C 기법(RateQuantReverseWaterfillingCodec,
-  GlobalRetentionGateEvictionCodec, LookaheadKVEvictionCodec)이 정적 캘리브레이션 또는
-  고정 정밀도 정책을 사용해 RL 추론의 동적 리워드 신호를 반영하지 못하는 한계.
-  RLAdaptivePrecisionQuantizer는 RL 추론 사이클의 누적 리워드 스코어를 양자화 정밀도 결정에
-  피드백으로 사용하는 "리워드-인식 온라인 적응 KV 양자화기"로, 고중요도 토큰 FP16 보존
-  + 저중요도 토큰 INT8/INT4 압축의 자동 균형을 달성한다.
+- **Activity B**: 기존 모든 B 기법은 세그먼트가 이미 메모리에 있다고 가정하고 재사용
+  결정을 내렸다. AMPDAdapShotLazyLoadPipeline은 Stage 1(세그먼트 탐색·확정) →
+  Stage 2(비동기 로드) → Stage 3(AdapShot RoPE 재인코딩 오버랩)의 3단계 비동기
+  파이프라인으로 로드와 재인코딩을 오버랩해 직렬 지연을 병렬 지연(이론적 최솟값)으로
+  줄인다. CacheStore 인터페이스를 완전 구현한다.
 
-- **Cross A+C**: HMAChainedACPipeline은 A-1 커넥터 레지스트리에 C-1 코덱을 등록하고
-  요청 프로파일에 따라 RL 워크로드는 C-1(적응 정밀도), 긴 컨텍스트는 기구현
-  GlobalRetentionGateEvictionCodec, 짧은 고처리량 요청은 RateQuantReverseWaterfillingCodec을
-  동적 선택·조합한다. chain_mode=True 시 복수 커넥터를 순차 적용한다.
+- **Activity C**: 기존 모든 C 기법이 단일 GPU 환경을 암묵적으로 가정하거나 멀티 GPU
+  환경에서의 DP Attention KV 중복 제거 상태를 고려하지 않았다.
+  DPAttentionAwareCompressionSelector는 SGLang v0.5.11 DP Attention이 N-GPU 환경에서
+  KV 복사본을 1/N으로 줄이는 상태를 압축 정책 결정 입력으로 사용해,
+  단일 GPU(고압축 코덱 우선)와 멀티 GPU+DP Attention(한계 효용 기반 선택적 압축)에서
+  각각 최적 코덱을 자동 선택한다. 기구현 코덱 3종을 래퍼로 재활용.
+
+- **Cross A+B+C**: AMPDPrefillShareNonContiguousStack은 5단계 처리 흐름을 통해
+  지연 스케줄링(A-1) → 지연 로드·재인코딩 파이프라인(B-1) → 환경 인식 압축(C-1)의
+  복합 효과(처리량 +35~55%, 메모리 −70~95%, accuracy delta ±0.6% 이내)를 달성한다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling (HMAMultiConnectorCompressionPluginScheduler)
-- [ ] Activity B: Non-Contiguous KV Cache Reuse (이번 사이클 미포함)
-- [x] Activity C: KV Cache Compression (RLAdaptivePrecisionQuantizer)
+- [x] Activity A: KV Cache-aware Scheduling (AMPDLazySegmentFetchScheduler)
+- [x] Activity B: Non-Contiguous KV Cache Reuse (AMPDAdapShotLazyLoadPipeline)
+- [x] Activity C: KV Cache Compression (DPAttentionAwareCompressionSelector)
 
 ---
 
@@ -85,25 +94,27 @@
 
 - [ ] 목표 1 (evaluation_criteria.md §4 Activity C 필수): perplexity 변화 ±1% 이내
       — WikiText-2 proxy: attention_output_relative_error < 0.01
-      — FP16/INT8/INT4 정밀도 레벨별 각각 측정
+      — 단일 GPU / DP Attention 활성화 멀티 GPU 환경 각각 독립 측정
 - [ ] 목표 2 (evaluation_criteria.md §4 Activity C 필수): downstream 태스크 정확도 변화 ±1% 이내
-      — GSM8K/MATH-500 RL 워크로드 proxy (KL divergence < 0.015, cosine >= 0.99)
-      — RL 워크로드 시뮬레이션: 동일 프롬프트 10회 반복 생성 후 리워드 수렴 확인
+      — LongBench 8개 서브태스크 proxy: KL divergence < 0.015, cosine >= 0.99
+      — {DP Attention ON/OFF} × {압축 기법} 교차 행렬 검증
 - [ ] 목표 3 (evaluation_criteria.md §4 Activity C): KV Cache Memory Reduction >= −30%
-      — RL 워크로드 mixed precision −40~70% 목표 (INT8/INT4 압축 토큰 비율에 따라)
+      — 단일 GPU: 고압축 코덱 적용 시 −50~70% 목표
+      — 멀티 GPU + DP Attention: 이중 절감 곱 효과 −70~95% 이론 검증
 - [ ] 목표 4 (evaluation_criteria.md §4 Activity C): Effective Context Length 동일 메모리 2× 이상
-      — precision_ratio_int4=0.2 최저 정밀도 구간에서 컨텍스트 길이 확장 측정
+      — 압축 + DP Attention 결합 시 유효 KV 크기 측정
 - [ ] 목표 5 (evaluation_criteria.md §2 Activity A): 스케줄링 오버헤드 TTFT p50 +5% 이내
-      — 커넥터 선택 오버헤드: O(1) 딕셔너리 룩업 + 요청 프로파일 평가 < 0.1ms/요청
-- [ ] 목표 6 (evaluation_criteria.md §2 Activity A): 캐시 히트율 향상 스케줄링 미적용 대비 +10%p
-      — 요청별 최적 커넥터 선택으로 압축 효율 향상 → 동일 메모리에 더 많은 캐시 유지
-- [ ] 목표 7 (evaluation_criteria.md §1 처리량): 베이스라인 대비 tokens/sec +20% 이상
-      — HMA 멀티-커넥터 선택 오버헤드 포함 전체 처리량 측정
-- [ ] 목표 8 (evaluation_criteria.md §5 크로스 조합 C 포함): 복합 적용 후 accuracy ±1% 이내
-      — HMAChainedACPipeline(A-1 + C-1) 기준 복합 적용 후 측정
-      — 단독 A-1 / 단독 C-1 / 결합 Cross-1 + 기구현 Cross-1(NAtHRetentionTierDecider) 4방향 비교
-- [ ] 목표 9 (evaluation_criteria.md §4 Activity C): GlobalRetentionGateEvictionCodec과 동일 설정 비교
-      — 동일 budget_ratio=0.3 / precision_ratio [0.2, 0.6, 0.2] 설정에서 정확도·메모리 비교
+      — 메타데이터 선행 전달 오버헤드 < 0.1ms/요청
+      — unnecessary_transfer_ratio 지표 수집 및 검증
+- [ ] 목표 6 (evaluation_criteria.md §2 Activity A): 캐시 히트율 향상 +10%p
+      — 지연 페치로 확정된 세그먼트만 로드 → 불필요 로드 −35~55%
+- [ ] 목표 7 (evaluation_criteria.md §3 Activity B): 비연속 세그먼트 히트율 전체 히트의 30% 이상
+      — AMPDAdapShotLazyLoadPipeline의 noncontiguous_hit_rate() >= 0.30
+- [ ] 목표 8 (evaluation_criteria.md §1 처리량): 베이스라인 대비 tokens/sec +20% 이상
+      — 지연 페치 + 로드-재인코딩 오버랩 + 환경 인식 압축 복합 효과
+- [ ] 목표 9 (evaluation_criteria.md §5 크로스 조합 C 포함): 복합 적용 후 accuracy ±1% 이내
+      — AMPDPrefillShareNonContiguousStack 5단계 통합 적용 후 cosine >= 0.99
+      — 단독 A-1 / 단독 B-1 / 단독 C-1 / 결합 Cross-1 4방향 비교
 
 ---
 
@@ -113,14 +124,16 @@
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/cache/rl_adaptive_precision_quantizer.py` | C | RLAdaptivePrecisionQuantizer: 어텐션 엔트로피 기반 FP16/INT8/INT4 온라인 적응 정밀도 양자화 + RL 리워드 피드백 루프 |
-| `src/scheduler/hma_multi_connector_scheduler.py` | A | HMAMultiConnectorCompressionPluginScheduler: HMAConnectorInterface 레지스트리 + 요청 특성 기반 커넥터 동적 선택 + pipeline_mode 체이닝 |
-| `src/engine/hma_chained_ac_pipeline.py` | A+C | HMAChainedACPipeline: A-1 커넥터 레지스트리 + C-1/기구현 코덱 통합 + 요청 프로파일 기반 커넥터 디스패치 |
-| `tests/unit/test_rl_adaptive_precision_quantizer.py` | C | Activity C accuracy-preserving 검증 (필수) |
-| `tests/unit/test_hma_multi_connector_scheduler.py` | A | HMA 멀티-커넥터 스케줄러 단위 테스트 |
-| `tests/unit/test_hma_chained_ac_pipeline.py` | A+C | Cross A+C 통합 파이프라인 단위 테스트 |
-| `tests/integration/test_cross_ac_hma_chained.py` | A+C | E2E 통합 테스트: 다중 요청 커넥터 선택 + RL 적응 정밀도 압축 흐름 |
-| `configs/experiments/2026-05-17-hma-rl-ac.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `src/scheduler/ampd_lazy_segment_fetch.py` | A | AMPDLazySegmentFetchScheduler: pull-on-demand 지연 페치 스케줄러 + SegmentMetadataRegistry |
+| `src/cache/ampd_adapshot_lazy_pipeline.py` | B | AMPDAdapShotLazyLoadPipeline: 3단계 비동기 파이프라인 (resolve→load→reencode), CacheStore 구현 |
+| `src/cache/dp_attention_aware_compression.py` | C | DPAttentionAwareCompressionSelector: DP Attention 상태 인식 환경별 압축 정책 선택기 |
+| `src/engine/ampd_prefill_share_stack.py` | A+B+C | AMPDPrefillShareNonContiguousStack: 5단계 완전 통합 스택 |
+| `tests/unit/test_ampd_lazy_segment_fetch.py` | A | Activity A 단위 테스트 |
+| `tests/unit/test_ampd_adapshot_lazy_pipeline.py` | B | Activity B 단위 테스트 |
+| `tests/unit/test_dp_attention_aware_compression.py` | C | Activity C 단위 테스트 (accuracy-preserving 검증 필수) |
+| `tests/unit/test_ampd_prefill_share_stack.py` | A+B+C | Cross A+B+C 통합 단위 테스트 |
+| `tests/integration/test_cross_abc_ampd_stack.py` | A+B+C | E2E 통합 테스트: 다중 요청 지연 페치 + 파이프라인 + 압축 |
+| `configs/experiments/2026-05-18.yaml` | 공통 | 이번 사이클 실험 설정 |
 
 ### 변경할 파일
 
@@ -132,276 +145,246 @@
 
 ## 알고리즘 상세
 
-### HMAConnectorInterface 추상 베이스 + 어댑터 (Activity A)
-
-`HMAConnectorInterface`는 기구현 코덱들을 HMA 커넥터로 래핑하는 추상 계약이다.
-기구현 코덱 3종은 `HMAConnectorAdapter`로 래핑해 레지스트리에 등록한다.
+### SegmentMeta 데이터클래스 (공통)
 
 ```python
-# src/scheduler/hma_multi_connector_scheduler.py 상단부
+# src/scheduler/ampd_lazy_segment_fetch.py 상단
+from dataclasses import dataclass
+from typing import Literal
 
-from abc import ABC, abstractmethod
-from typing import Dict, Optional
-import torch
-from src.cache.base import CacheStore
+SegmentTier = Literal["HBM", "DDR", "REMOTE"]
 
-
-class HMAConnectorInterface(ABC):
-    """vLLM v0.21.0 HMA 멀티-커넥터 인터페이스 추상 베이스.
-
-    각 압축 코덱을 독립 HMA 커넥터로 래핑하는 계약.
-    compress()는 CacheStore.compression_hook() 시맨틱을 따른다.
-    """
-
-    @abstractmethod
-    def compress(
-        self,
-        kv: torch.Tensor,           # [n_tokens, ...] — 원본 KV 텐서
-        request_profile: Dict,      # 요청 메타데이터 (context_length, is_rl_mode 등)
-    ) -> torch.Tensor:
-        """KV 텐서를 압축해 반환. shape은 달라질 수 있음(퇴거) 또는 동일(양자화)."""
-
-    @abstractmethod
-    def decompress(
-        self,
-        compressed_kv: torch.Tensor,
-        request_profile: Dict,
-    ) -> torch.Tensor:
-        """압축된 KV를 복원. 양자화 코덱의 경우 역양자화 수행."""
-
-    @property
-    @abstractmethod
-    def connector_name(self) -> str:
-        """커넥터 식별자 (레지스트리 키와 일치)."""
-
-
-class HMAConnectorAdapter(HMAConnectorInterface):
-    """기구현 코덱(CacheStore/CompressionCodec)을 HMAConnectorInterface로 래핑.
-
-    compression_hook() 또는 encode/decode 인터페이스를 감지해 자동 위임.
-    """
-
-    def __init__(self, name: str, codec: object) -> None:
-        self._name = name
-        self._codec = codec
-
-    @property
-    def connector_name(self) -> str:
-        return self._name
-
-    def compress(self, kv: torch.Tensor, request_profile: Dict) -> torch.Tensor:
-        # CacheStore.compression_hook() 우선 사용
-        if hasattr(self._codec, "compression_hook"):
-            return self._codec.compression_hook("__hma__", kv)
-        # encode(kv, layer_idx=0) fallback
-        if hasattr(self._codec, "encode"):
-            return self._codec.encode(kv, layer_idx=0)
-        return kv
-
-    def decompress(self, compressed_kv: torch.Tensor, request_profile: Dict) -> torch.Tensor:
-        if hasattr(self._codec, "decode"):
-            return self._codec.decode(compressed_kv, layer_idx=0)
-        return compressed_kv
+@dataclass
+class SegmentMeta:
+    segment_id: str          # 세그먼트 content hash (chunk_key와 동일 형식)
+    source_node_id: str      # 세그먼트가 있는 노드 식별자 ("local" 또는 IP)
+    tier: SegmentTier        # HBM / DDR / REMOTE
+    approx_size_bytes: int   # KV 텐서 예상 크기 (bytes)
+    position_range: tuple    # (start_token_idx, end_token_idx)
 ```
 
 ---
 
-### HMAMultiConnectorCompressionPluginScheduler (Activity A)
-
-스케줄링 결정 단위: **요청(request) 단위** — 각 요청 프로파일을 평가해 커넥터를 선택.
-캐시 상태 접근: `_connector_registry` Dict + `_dispatch_policy` YAML 설정.
+### SegmentMetadataRegistry (Activity A)
 
 ```python
-# src/scheduler/hma_multi_connector_scheduler.py
+# src/scheduler/ampd_lazy_segment_fetch.py
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
+class SegmentMetadataRegistry:
+    """세그먼트 ID → SegmentMeta 매핑을 관리하는 경량 레지스트리.
+
+    역할:
+      - 요청 수신 시 KV 데이터 없이 메타데이터만 등록
+      - 스케줄 확정 후 pull 대상 세그먼트 조회
+      - 불필요 전송 비율(unnecessary_transfer_ratio) 추적
+
+    단일 노드 환경: source_node_id = "local", gRPC 스트림 없이 in-process 동작.
+    멀티 노드 환경: register_remote() 호출로 외부 노드 세그먼트 등록.
+    """
+
+    def __init__(self) -> None:
+        self._registry: Dict[str, SegmentMeta] = {}
+        self._pre_resolved_count: int = 0   # 후보로 등록된 세그먼트 수
+        self._cancelled_count: int = 0      # 확정 전 취소된 세그먼트 수
+
+    def register(self, meta: SegmentMeta) -> None:
+        """세그먼트 메타데이터 등록 (KV 데이터 없음)."""
+        self._registry[meta.segment_id] = meta
+        self._pre_resolved_count += 1
+
+    def get(self, segment_id: str) -> Optional[SegmentMeta]:
+        """세그먼트 메타데이터 조회. 없으면 None."""
+        return self._registry.get(segment_id)
+
+    def cancel(self, segment_id: str) -> None:
+        """확정 전 취소 (pull하지 않기로 결정된 세그먼트)."""
+        if segment_id in self._registry:
+            self._cancelled_count += 1
+
+    def unnecessary_transfer_ratio(self) -> float:
+        """불필요 전송 비율 = 취소된 세그먼트 / 사전 등록된 후보 세그먼트."""
+        if self._pre_resolved_count == 0:
+            return 0.0
+        return self._cancelled_count / self._pre_resolved_count
+
+    def reset_stats(self) -> None:
+        self._pre_resolved_count = 0
+        self._cancelled_count = 0
+```
+
+---
+
+### AMPDLazySegmentFetchScheduler (Activity A)
+
+스케줄링 결정 단위: **요청(request) 단위**.
+캐시 상태 접근: `SegmentMetadataRegistry`를 통해 세그먼트 메타데이터 조회 (KV 데이터 접근 없음).
+
+```python
+# src/scheduler/ampd_lazy_segment_fetch.py
+
+import asyncio
 import time
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Dict, List, Optional
 import torch
 
-from src.cache.base import CacheStore
+from src.cache.segmented import SegmentedHashCache
 from src.engine.runner import InferenceRequest
 
 
 @dataclass
-class HMAMultiConnectorConfig:
-    # 커넥터 선택 정책 파라미터 (YAML 외부화)
-    long_ctx_threshold: int = 4096         # 이 이상이면 GlobalRetentionGate 선택
-    memory_pressure_threshold: float = 0.8 # HBM 사용률 이 이상이면 고압축 커넥터 선택
-    default_connector: str = "global_retention"  # 기본 커넥터 이름
-    pipeline_mode: bool = False            # True: 선택 커넥터 + global_retention 체이닝
-    max_wait_ratio: float = 2.0            # 공정성: 최대 대기 시간 배수
+class KVSegment:
+    segment_id: str
+    kv_tensor: torch.Tensor   # 실제 KV 데이터
+    source_tier: str          # "HBM" | "DDR" | "REMOTE"
+    load_latency_ms: float    # 로드 소요 시간
+
+
+@dataclass
+class AMPDLazySchedulerConfig:
+    # 단일 노드 기본값 (멀티 노드 확장 시 remote_fetch_latency_ms 조정)
+    hbm_fetch_latency_ms: float = 0.01
+    ddr_fetch_latency_ms: float = 0.5
+    remote_fetch_latency_ms: float = 5.0
+    metadata_overhead_max_ms: float = 0.1   # 메타데이터 전달 오버헤드 상한
+    max_concurrent_fetches: int = 8
     seed: int = 42
 
-    # 커넥터 선택 규칙 (YAML connector_dispatch_policy 섹션과 매핑)
-    # is_rl_mode=True or num_completions>1 → "rl_adaptive"
-    # context_length > long_ctx_threshold → "global_retention"
-    # context_length <= long_ctx_threshold and memory_pressure > threshold → "ratequant"
-    # 기본값 → default_connector
 
-
-class HMAMultiConnectorCompressionPluginScheduler:
-    """HMA 멀티-커넥터 압축 정책 플러그인 메타-스케줄러.
+class AMPDLazySegmentFetchScheduler:
+    """AMPD pull-on-demand 원칙 기반 비연속 세그먼트 지연 페치 스케줄러.
 
     Activity A: KV Cache-aware Scheduling
-    스케줄링 결정 단위: 요청 단위 — 각 요청의 프로파일을 평가해 커넥터 선택.
-    캐시 상태 접근: _connector_registry Dict (O(1) 룩업).
+    스케줄링 결정 단위: 요청 단위 — 세그먼트 집합 확정 후에만 KV pull.
+    캐시 상태 접근: SegmentMetadataRegistry (메타데이터 전용, KV 접근 없음).
 
-    커넥터 레지스트리:
-      - "rl_adaptive"       : RLAdaptivePrecisionQuantizer (C-1, RL 워크로드)
-      - "global_retention"  : GlobalRetentionGateEvictionCodec (기구현, 긴 컨텍스트)
-      - "ratequant"         : RateQuantReverseWaterfillingCodec (기구현, 짧은 고처리량)
-      - "lookahead"         : LookaheadKVEvictionCodec (기구현, 미래-인식 퇴거)
-
-    vLLM v0.21.0 HMA 멀티-커넥터 연동:
-      register_connector() → HMA OffloadingConnector 레지스트리에 등록
-      select_connector()   → 요청 특성 기반 O(1) 선택
-      pipeline_mode=True   → 선택 커넥터 + global_retention 순차 체이닝
+    처리 흐름:
+      1. pre_resolve_segments(): 요청에서 후보 세그먼트 메타데이터를 등록.
+         KV 데이터 전송 없음.
+      2. confirm_segments(): Louver 탐색 결과로 재사용 집합 S_reuse 확정.
+         확정되지 않은 후보를 cancel() 처리.
+      3. fetch_segments_lazy(): 확정된 세그먼트만 비동기 pull.
 
     평가 기준 (evaluation_criteria.md §2):
-      - 스케줄링 오버헤드: TTFT p50 +5% 이내 (커넥터 선택 < 0.1ms/요청)
-      - 캐시 히트율 향상: +10%p
-      - 요청 공정성: 최대 대기 시간 max_wait_ratio 이내
+      - 스케줄링 오버헤드: TTFT p50 +5% 이내
+      - 메타데이터 선행 전달 오버헤드: < 0.1ms/요청
+      - unnecessary_transfer_ratio 지표: results/<exp-name>/metrics.json에 기록
     """
 
     def __init__(
         self,
-        config: HMAMultiConnectorConfig,
-        cache: Optional[CacheStore] = None,
+        config: AMPDLazySchedulerConfig,
+        registry: Optional[SegmentMetadataRegistry] = None,
+        cache: Optional[SegmentedHashCache] = None,
     ) -> None:
         self.config = config
+        self.registry = registry or SegmentMetadataRegistry()
         self._cache = cache
-        # 커넥터 레지스트리: {name: HMAConnectorInterface}
-        self._connector_registry: Dict[str, "HMAConnectorInterface"] = {}
-        # 스케줄링 오버헤드 측정
         self._scheduling_times: List[float] = []
-        # 요청별 커넥터 선택 이력: {request_id: connector_name}
-        self._request_connector_map: Dict[str, str] = {}
-        # 커넥터별 선택 횟수 통계
-        self._connector_selection_counts: Dict[str, int] = {}
-        # 요청 대기 시간 추적 (공정성)
-        self._arrival_times: Dict[str, float] = {}
 
-    def register_connector(
+    def pre_resolve_segments(
         self,
-        name: str,
-        connector: "HMAConnectorInterface",
+        request: InferenceRequest,
+        candidate_segment_ids: List[str],
+        metas: List[SegmentMeta],
     ) -> None:
-        """HMA 커넥터를 레지스트리에 등록.
+        """Stage 0: 요청 수신 시 후보 세그먼트 메타데이터 등록.
 
         Algorithm:
-          1. connector를 _connector_registry[name]에 저장
-          2. _connector_selection_counts[name] = 0 초기화
-        """
-        self._connector_registry[name] = connector
-        self._connector_selection_counts[name] = 0
-
-    def select_connector(
-        self,
-        request: InferenceRequest,
-        request_meta: Optional[Dict] = None,
-    ) -> str:
-        """요청 특성 기반 최적 커넥터 선택 (O(1) 딕셔너리 룩업).
-
-        Algorithm (connector_dispatch_policy):
-          1. is_rl_mode=True or num_completions>1 → "rl_adaptive"
-          2. context_length > long_ctx_threshold → "global_retention"
-          3. context_length <= long_ctx_threshold
-             and memory_pressure > memory_pressure_threshold → "ratequant"
-          4. 그 외 → config.default_connector
-          5. 선택된 커넥터가 레지스트리에 없으면 config.default_connector 폴백
-
-        Args:
-            request: InferenceRequest
-            request_meta: 추가 메타데이터 {"is_rl_mode": bool, "num_completions": int,
-                          "memory_pressure": float}
-
-        Returns:
-            connector_name: str
-        """
-        meta = request_meta or {}
-        context_length = len(request.token_ids)
-        is_rl = meta.get("is_rl_mode", False)
-        num_completions = meta.get("num_completions", 1)
-        memory_pressure = meta.get("memory_pressure", 0.0)
-
-        if (is_rl or num_completions > 1) and "rl_adaptive" in self._connector_registry:
-            selected = "rl_adaptive"
-        elif context_length > self.config.long_ctx_threshold and "global_retention" in self._connector_registry:
-            selected = "global_retention"
-        elif context_length <= self.config.long_ctx_threshold and memory_pressure > self.config.memory_pressure_threshold and "ratequant" in self._connector_registry:
-            selected = "ratequant"
-        else:
-            selected = self.config.default_connector
-
-        # 레지스트리에 없으면 폴백
-        if selected not in self._connector_registry:
-            available = list(self._connector_registry.keys())
-            selected = available[0] if available else self.config.default_connector
-
-        return selected
-
-    def apply_connector(
-        self,
-        request: InferenceRequest,
-        kv: torch.Tensor,
-        request_meta: Optional[Dict] = None,
-    ) -> Tuple[torch.Tensor, str]:
-        """선택된 커넥터(또는 체인)로 KV 압축 수행.
-
-        pipeline_mode=True 시:
-          1. select_connector()로 주 커넥터 선택
-          2. 주 커넥터로 압축
-          3. "global_retention" 커넥터가 레지스트리에 있으면 추가 체이닝
-
-        Returns:
-            (compressed_kv, selected_connector_name)
+          - 각 (segment_id, SegmentMeta) 쌍을 registry.register() 호출.
+          - KV 데이터 전송 없음.
+          - 오버헤드 측정: < metadata_overhead_max_ms/요청 (필수).
         """
         t0 = time.monotonic()
-        meta = request_meta or {}
-        connector_name = self.select_connector(request, meta)
-        connector = self._connector_registry.get(connector_name)
-
-        request_profile = {"context_length": len(request.token_ids), **meta}
-        compressed = connector.compress(kv, request_profile) if connector else kv
-
-        # pipeline_mode: global_retention을 후처리로 추가 적용
-        if self.config.pipeline_mode and connector_name != "global_retention":
-            global_conn = self._connector_registry.get("global_retention")
-            if global_conn is not None:
-                compressed = global_conn.compress(compressed, request_profile)
-
-        self._request_connector_map[request.request_id] = connector_name
-        self._connector_selection_counts[connector_name] = (
-            self._connector_selection_counts.get(connector_name, 0) + 1
-        )
-
+        for meta in metas:
+            self.registry.register(meta)
         overhead_ms = (time.monotonic() - t0) * 1000.0
         self._scheduling_times.append(overhead_ms)
-        return compressed, connector_name
+
+    def confirm_segments(
+        self,
+        candidate_ids: List[str],
+        confirmed_ids: List[str],
+    ) -> None:
+        """Stage 1 완료 후: 확정 세그먼트 결정, 나머지 cancel 처리.
+
+        Algorithm:
+          - confirmed_set = set(confirmed_ids)
+          - candidate_ids 중 confirmed_set에 없는 항목 → registry.cancel()
+          - 이 시점에서 불필요 전송이 차단됨.
+        """
+        confirmed_set = set(confirmed_ids)
+        for seg_id in candidate_ids:
+            if seg_id not in confirmed_set:
+                self.registry.cancel(seg_id)
+
+    async def fetch_segments_lazy(
+        self,
+        confirmed_segment_ids: List[str],
+    ) -> AsyncIterator[KVSegment]:
+        """Stage 2: 확정 세그먼트 비동기 pull.
+
+        Algorithm:
+          1. confirmed_segment_ids 각각에 대해 registry.get() → SegmentMeta 조회.
+          2. tier별 fetch 시뮬레이션:
+             - HBM: 즉시 반환 (hbm_fetch_latency_ms)
+             - DDR: asyncio.sleep 기반 지연 후 반환 (ddr_fetch_latency_ms)
+             - REMOTE: asyncio.sleep 기반 원격 지연 후 반환 (remote_fetch_latency_ms)
+          3. 각 세그먼트 fetch 완료 시 KVSegment yield.
+          4. cache가 있으면 cache.get(segment_id)로 실제 KV 로드 시도.
+
+        Args:
+            confirmed_segment_ids: 확정된 세그먼트 ID 목록
+
+        Yields:
+            KVSegment — 개별 세그먼트 KV 로드 완료 이벤트
+        """
+        for seg_id in confirmed_segment_ids:
+            meta = self.registry.get(seg_id)
+            latency = self.config.hbm_fetch_latency_ms
+            if meta is not None:
+                if meta.tier == "DDR":
+                    latency = self.config.ddr_fetch_latency_ms
+                elif meta.tier == "REMOTE":
+                    latency = self.config.remote_fetch_latency_ms
+
+            await asyncio.sleep(latency / 1000.0)
+
+            # 실제 KV 텐서: 캐시에서 로드 또는 합성 텐서
+            kv_tensor: Optional[torch.Tensor] = None
+            if self._cache is not None:
+                kv_tensor = self._cache.get(seg_id)
+            if kv_tensor is None:
+                kv_tensor = torch.zeros(1, 64)  # fallback: 합성 텐서
+
+            yield KVSegment(
+                segment_id=seg_id,
+                kv_tensor=kv_tensor,
+                source_tier=meta.tier if meta else "HBM",
+                load_latency_ms=latency,
+            )
 
     def schedule(
         self,
         requests: List[InferenceRequest],
     ) -> List[InferenceRequest]:
-        """요청 목록을 캐시 히트율 예측 기반으로 정렬 후 반환.
+        """InferenceRunner.run_batch() 호환 schedule() 인터페이스.
 
-        CacheAwareScheduler와 동일한 schedule() 인터페이스 유지.
-        정렬 후 각 요청에 선택된 커넥터 이름을 메타데이터로 주입.
+        Algorithm:
+          - 기본 FIFO 순서 유지 (히트율 예측 정렬 확장 가능).
+          - 각 요청의 메타데이터 선행 전달 오버헤드 측정.
 
         Returns:
-            List[InferenceRequest] — 정렬된 요청 목록
+            List[InferenceRequest] — 정렬된 요청 목록 (이번 구현: 입력 순서 유지)
         """
         t0 = time.monotonic()
-        for req in requests:
-            self._arrival_times.setdefault(req.request_id, t0)
+        result = list(requests)
         overhead_ms = (time.monotonic() - t0) * 1000.0
         self._scheduling_times.append(overhead_ms)
-        return requests  # 기본 FIFO; 확장 시 hit-rate 예측 정렬 추가
-
-    # ------------------------------------------------------------------ #
-    # 메트릭                                                                #
-    # ------------------------------------------------------------------ #
+        return result
 
     def scheduling_overhead_ms_p50(self) -> float:
         """스케줄링 오버헤드 중앙값 (ms)."""
@@ -410,472 +393,709 @@ class HMAMultiConnectorCompressionPluginScheduler:
         sorted_t = sorted(self._scheduling_times)
         return sorted_t[len(sorted_t) // 2]
 
-    def connector_selection_stats(self) -> Dict[str, int]:
-        """커넥터별 선택 횟수 통계."""
-        return dict(self._connector_selection_counts)
+    def unnecessary_transfer_ratio(self) -> float:
+        """불필요 전송 비율 (results/<exp>/metrics.json에 기록)."""
+        return self.registry.unnecessary_transfer_ratio()
 
     def reset_stats(self) -> None:
         self._scheduling_times.clear()
-        self._request_connector_map.clear()
-        self._connector_selection_counts.clear()
-        self._arrival_times.clear()
+        self.registry.reset_stats()
 ```
 
 ---
 
-### RLAdaptivePrecisionQuantizer (Activity C)
+### AMPDAdapShotLazyLoadPipeline (Activity B)
 
-CacheStore 인터페이스를 완전 구현하며 `compression_hook()`을 오버라이드한다.
-내부 양자화 로직은 encode()/decode() 형태로도 제공해 vLLM 이식 경로를 지원한다.
+CacheStore 인터페이스를 완전 구현하며 3단계 비동기 파이프라인을 제공한다.
 
 ```python
-# src/cache/rl_adaptive_precision_quantizer.py
+# src/cache/ampd_adapshot_lazy_pipeline.py
 
-from __future__ import annotations
-
+import asyncio
+import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import torch
 
 from src.cache.base import CacheStore
-
-
-PrecisionLevel = Literal["fp16", "int8", "int4"]
+from src.cache.segmented import SegmentedHashCache
 
 
 @dataclass
-class RLAdaptivePrecisionConfig:
-    # 정밀도 비율 (순서: FP16, INT8, INT4 — 합계 1.0)
-    precision_ratio_fp16: float = 0.20      # 상위 20%: FP16 (저엔트로피, 고중요도)
-    precision_ratio_int8: float = 0.60      # 중간 60%: INT8
-    precision_ratio_int4: float = 0.20      # 하위 20%: INT4 (고엔트로피, 저중요도)
-
-    # RL 감지 파라미터
-    warmup_steps: int = 10                  # 초기 N 스텝: FP16 전체 정밀도 유지
-    cot_length_threshold: int = 512         # CoT 길이 임계값
-
-    # 리워드 피드백 파라미터
-    high_reward_threshold: float = 0.8     # 이 이상이면 다음 생성에서 더 공격적 압축 허용
-    reward_aggression_step: float = 0.05   # 리워드 높을 때 precision_ratio_int4 증가분
-    reward_recovery_step: float = 0.05     # 리워드 낮을 때 precision_ratio_int4 감소분
-
+class LazyPipelineConfig:
+    chunk_size: int = 128
     max_entries: int = 1000
+    rope_theta: float = 10000.0      # RoPE 기본 주파수 (AdapShot 재인코딩용)
+    n_heads: int = 8
+    d_head: int = 64
+    # 예측 프리페치: 동반 세그먼트 히트 임계값
+    companion_hit_threshold: int = 2
     seed: int = 42
 
 
-class RLAdaptivePrecisionQuantizer(CacheStore):
-    """RL 워크로드용 온라인 적응 정밀도 KV 양자화기.
+class AMPDAdapShotLazyLoadPipeline(CacheStore):
+    """AMPD 지연 로드 + AdapShot RoPE 재인코딩 비동기 오버랩 파이프라인.
 
-    Activity C: KV Cache Compression
-    정밀도 레벨: {FP16, INT8, INT4}
-    할당 기준: 어텐션 엔트로피 기반 채널별 정밀도 + RL 리워드 피드백 루프
+    Activity B: Non-Contiguous KV Cache Reuse
+    CacheStore 인터페이스 완전 구현.
 
-    알고리즘:
-      1. RL 워크로드 감지: is_rl_mode 플래그 또는 num_completions > 1
-      2. warmup_steps 기간: FP16 전체 정밀도 유지 (RL 탐색 초기 보호)
-      3. 어텐션 엔트로피 계산:
-           H_i = -Σ_h Σ_t attn_{h,t,i} log(attn_{h,t,i} + 1e-8)
-         엔트로피가 낮은 상위 precision_ratio_fp16 비율: FP16 보존
-         중간 precision_ratio_int8 비율: INT8 양자화
-         엔트로피가 높은 하위 precision_ratio_int4 비율: INT4 시뮬레이션
-      4. 리워드 피드백: update_reward_signal(reward) 호출 시
-           reward >= high_reward_threshold → precision_ratio_int4 += reward_aggression_step (공격적)
-           reward < high_reward_threshold → precision_ratio_int4 -= reward_recovery_step (보수적)
-           조정 후 precision_ratio_fp16 + int8 + int4 == 1.0 재정규화
+    3단계 비동기 파이프라인:
+      Stage 1 (Segment Resolution): resolve_segments()로 히트 보장 세그먼트 집합 확정.
+        KV 데이터를 메모리로 읽지 않고 세그먼트 ID + source_tier만 결정.
+      Stage 2 (Lazy Load): 확정 후 비동기 로드.
+        asyncio.Event 기반 세그먼트별 완료 신호.
+      Stage 3 (RoPE Reencoding Overlap): 세그먼트 로드 완료 이벤트 즉시 재인코딩 시작.
+        Stage 2와 오버랩: 전체 지연 = max(로드 지연, 재인코딩 지연).
 
-    정확도 보존 근거:
-      - 저엔트로피(집중 어텐션) 상위 20% 토큰: 항상 FP16 보존 → 핵심 정보 손실 없음
-      - 리워드 피드백 루프: 압축으로 인한 정확도 저하를 직접 측정·보정하는 자동 안전장치
-      - warmup_steps 기간 FP16 완전 정밀도로 RL 탐색 초기 패턴 보호
+    AdapShot RoPE 재인코딩:
+      원본 위치 [pos_start, pos_end] → 타겟 위치 [target_start, target_end]
+      Δθ = target_position - source_position
+      torch.einsum 기반 배치 회전 연산 (FP32 내부 계산 후 FP16 반환).
 
-    CacheStore 인터페이스: put/get/evict/hit_rate/memory_bytes/reset_stats 완전 구현
-    compression_hook() 오버라이드: put() 전 적응 정밀도 양자화 수행
+    평가 기준 (evaluation_criteria.md §3):
+      - 비연속 세그먼트 히트율: 전체 히트의 30% 이상
+      - KV Memory Footprint: 베이스라인 대비 +20% 이내
     """
 
-    def __init__(self, config: RLAdaptivePrecisionConfig) -> None:
+    def __init__(self, config: LazyPipelineConfig) -> None:
         self.config = config
         torch.manual_seed(config.seed)
-        self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
-        # 양자화 스케일 저장: {key: (scale_int8, scale_int4)}
-        self._scales: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-        # 정밀도 마스크 저장: {key: {"fp16": idx, "int8": idx, "int4": idx}}
-        self._precision_masks: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._store: SegmentedHashCache = SegmentedHashCache(
+            chunk_size=config.chunk_size,
+            max_entries=config.max_entries,
+        )
         self._hits = 0
         self._misses = 0
-        self._current_step = 0
-        self._is_rl_mode = False
-        self._last_reward: Optional[float] = None
-        # 동적 정밀도 비율 (리워드 피드백으로 변경됨)
-        self._ratio_fp16 = config.precision_ratio_fp16
-        self._ratio_int8 = config.precision_ratio_int8
-        self._ratio_int4 = config.precision_ratio_int4
-        # 메모리 절감 추적
-        self._total_bytes_original = 0
-        self._total_bytes_stored = 0
+        self._noncontiguous_hits = 0
+        # 동반 세그먼트 통계: {(seg_a, seg_b): co_hit_count}
+        self._companion_stats: Dict[Tuple[str, str], int] = {}
+        # 로드 완료 이벤트: {segment_id: asyncio.Event}
+        self._load_events: Dict[str, asyncio.Event] = {}
 
     # ------------------------------------------------------------------ #
     # CacheStore 추상 메서드                                               #
     # ------------------------------------------------------------------ #
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        """압축 후 저장. compression_hook()을 통해 적응 정밀도 양자화 적용."""
-        compressed = self.compression_hook(key, value)
-        if len(self._store) >= self.config.max_entries:
-            self.evict()
-        if key in self._store:
-            self._store.move_to_end(key)
-        self._store[key] = compressed
+        """표준 put — compression_hook 없이 저장 (Stage 2 lazy load 이후 호출됨)."""
+        self._store.put(key, value)
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        if key not in self._store:
+        """표준 get — HBM 직접 조회."""
+        result = self._store.get(key)
+        if result is not None:
+            self._hits += 1
+        else:
             self._misses += 1
-            return None
-        self._store.move_to_end(key)
-        self._hits += 1
-        return self._store[key]
+        return result
 
     def evict(self) -> int:
-        if not self._store:
-            return 0
-        _, kv = self._store.popitem(last=False)
-        return kv.nbytes
+        return self._store.evict()
 
     def hit_rate(self) -> float:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
     def memory_bytes(self) -> int:
-        return sum(kv.nbytes for kv in self._store.values())
+        return self._store.memory_bytes()
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
-        self._current_step = 0
+        self._noncontiguous_hits = 0
+        self._store.reset_stats()
+        self._load_events.clear()
+
+    # ------------------------------------------------------------------ #
+    # Stage 1: Segment Resolution                                          #
+    # ------------------------------------------------------------------ #
+
+    def resolve_segments(
+        self,
+        token_ids: List[int],
+        layer_idx: int = 0,
+    ) -> Tuple[List["SegmentMeta"], List[int]]:
+        """Stage 1: 히트 보장 세그먼트 메타데이터 수집 (KV 미로드).
+
+        Algorithm:
+          1. SegmentedHashCache.get_segments()로 모든 청크 히트/미스 판정.
+          2. 히트 청크: SegmentMeta(segment_id, tier="HBM", ...) 반환.
+          3. 미스 청크: miss_indices 반환.
+          4. 이 단계에서 KV 텐서를 반환하지 않음 — 메타데이터만.
+
+        Returns:
+            (hit_metas, miss_chunk_indices)
+        """
+        # SegmentedHashCache는 get_segments에서 hit/miss 판정만 수행
+        hits, misses = self._store.get_segments(token_ids, layer_idx)
+
+        from src.scheduler.ampd_lazy_segment_fetch import SegmentMeta
+        hit_metas = []
+        chunk_size = self.config.chunk_size
+        for chunk_idx, _kv in hits:
+            seg_id = self._store.chunk_key(token_ids, chunk_idx, layer_idx)
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, len(token_ids))
+            hit_metas.append(SegmentMeta(
+                segment_id=seg_id,
+                source_node_id="local",
+                tier="HBM",
+                approx_size_bytes=chunk_size * self.config.d_head * 2 * 2,  # FP16 2bytes
+                position_range=(start, end),
+            ))
+
+        return hit_metas, misses
+
+    # ------------------------------------------------------------------ #
+    # Stage 2 + 3: Lazy Load + RoPE Reencoding Overlap                    #
+    # ------------------------------------------------------------------ #
+
+    async def load_and_reencode_segment(
+        self,
+        segment_id: str,
+        source_position: int,
+        target_position: int,
+    ) -> Optional[torch.Tensor]:
+        """Stage 2+3 오버랩: 세그먼트 로드 완료 즉시 AdapShot RoPE 재인코딩.
+
+        Algorithm:
+          1. self._store에서 segment_id KV 로드.
+          2. 로드 완료 시 asyncio.Event 설정.
+          3. AdapShot RoPE 재인코딩: Δθ = target_position - source_position.
+          4. 재인코딩 완료 KV 반환.
+
+        Args:
+            segment_id: 캐시 키
+            source_position: KV가 저장될 때의 시작 토큰 위치
+            target_position: 현재 컨텍스트에서의 타겟 시작 위치
+
+        Returns:
+            RoPE 재인코딩된 KV 텐서 (FP16) 또는 None
+        """
+        kv = self._store.get(segment_id)
+        if kv is None:
+            return None
+
+        # asyncio.Event 완료 신호
+        event = self._load_events.setdefault(segment_id, asyncio.Event())
+        event.set()
+
+        # AdapShot RoPE 재인코딩 (Stage 3, Stage 2와 오버랩)
+        if source_position != target_position:
+            kv = self._adapshot_rope_reencode(kv, source_position, target_position)
+
+        return kv
+
+    def _adapshot_rope_reencode(
+        self,
+        kv: torch.Tensor,
+        source_pos: int,
+        target_pos: int,
+    ) -> torch.Tensor:
+        """AdapShot RoPE 위상 오프셋 재인코딩.
+
+        Algorithm:
+          1. delta = target_pos - source_pos
+          2. d_head 차원에서 짝수/홀수 쌍으로 회전 행렬 구성.
+          3. kv의 마지막 차원에 회전 적용.
+          4. torch.einsum 기반 배치 회전 연산 (O(S × n_heads × d_head)).
+
+        kv shape: [n_tokens, ...] — 마지막 dim = d_head (또는 d_head의 배수).
+        반환: 동일 shape, dtype=float16.
+        """
+        d = kv.shape[-1]
+        delta = float(target_pos - source_pos)
+        # RoPE 주파수 계산
+        half_d = d // 2
+        inv_freq = 1.0 / (
+            self.config.rope_theta ** (
+                torch.arange(0, half_d, dtype=torch.float32) * 2.0 / d
+            )
+        )  # [half_d]
+        angle = delta * inv_freq  # [half_d]
+        cos_a = torch.cos(angle)  # [half_d]
+        sin_a = torch.sin(angle)  # [half_d]
+
+        kv_f = kv.detach().float()
+        # 마지막 차원 분리 (짝수/홀수 쌍)
+        flat = kv_f.reshape(-1, d)  # [N, d]
+        x1 = flat[..., :half_d]    # [N, half_d]
+        x2 = flat[..., half_d:]    # [N, half_d]
+
+        # 회전: x1' = x1*cos - x2*sin, x2' = x1*sin + x2*cos
+        rotated = torch.cat([
+            x1 * cos_a - x2 * sin_a,
+            x1 * sin_a + x2 * cos_a,
+        ], dim=-1)  # [N, d]
+
+        return rotated.reshape(kv.shape).half()
+
+    # ------------------------------------------------------------------ #
+    # 세그먼트-레벨 API (SegmentedHashCache 위임)                          #
+    # ------------------------------------------------------------------ #
+
+    def put_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        kv: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> None:
+        """세그먼트 저장 (SegmentedHashCache 위임)."""
+        self._store.put_segment(token_ids, chunk_idx, kv, layer_idx)
+
+    def get_segments(
+        self,
+        token_ids: List[int],
+        layer_idx: int = 0,
+    ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
+        """비연속 세그먼트 히트 조회 (SegmentedHashCache 위임 + 비연속 히트 추적)."""
+        hits, misses = self._store.get_segments(token_ids, layer_idx)
+        miss_set = set(misses)
+        for chunk_idx, _ in hits:
+            if any(m < chunk_idx for m in miss_set):
+                self._noncontiguous_hits += 1
+            self._hits += 1
+        self._misses += len(misses)
+        return hits, misses
+
+    def noncontiguous_hit_rate(self) -> float:
+        """비연속 히트율 (전체 히트 대비)."""
+        total_hits = self._store._hits + self._hits
+        nc = self._store._noncontiguous_hits + self._noncontiguous_hits
+        if total_hits == 0:
+            return 0.0
+        return nc / total_hits
+```
+
+---
+
+### DPAttentionAwareCompressionSelector (Activity C)
+
+기구현 코덱 3종(GlobalRetentionGateEvictionCodec, FibQuantVQCodec, SPKVWriteTimeCodec)을
+환경 인식 래퍼로 재활용한다. CacheStore 인터페이스를 완전 구현한다.
+
+```python
+# src/cache/dp_attention_aware_compression.py
+
+from __future__ import annotations
+
+import os
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
+import torch
+
+from src.cache.base import CacheStore
+
+
+@dataclass
+class DPAttentionCompressionConfig:
+    # DP Attention 환경 설정
+    dp_attn_enabled: bool = False        # DP Attention 활성화 여부 (환경 변수로도 주입 가능)
+    n_gpus: int = 1                       # GPU 수 (torch.cuda.device_count() 자동 감지로 덮어씀)
+    auto_detect_gpus: bool = True         # True: 초기화 시 torch.cuda.device_count() 호출
+
+    # 코덱 선택 정책
+    single_gpu_codec: str = "global_retention"   # 단일 GPU / DP Attention 비활성 시
+    dp_attn_codec: str = "global_retention"      # DP Attention 활성 시 (선택적 압축)
+    dp_attn_compression_skip_threshold: float = 0.5  # 한계 효용 < 이 값이면 압축 스킵
+
+    max_entries: int = 1000
+    seed: int = 42
+
+
+class DPAttentionAwareCompressionSelector(CacheStore):
+    """DP Attention 상태 인식 환경별 압축 정책 선택기.
+
+    Activity C: KV Cache Compression
+    CacheStore 인터페이스 완전 구현.
+
+    환경 감지:
+      - n_gpus: auto_detect_gpus=True 시 torch.cuda.device_count() 자동 감지.
+      - dp_attn_enabled: 환경 변수 DP_ATTN_ENABLED="1" 또는 config.dp_attn_enabled.
+      - effective_kv_replicas = n_gpus (DP Attention 비활성) or 1 (DP Attention 활성).
+
+    압축 정책 선택:
+      - effective_kv_replicas > 1 (단일 GPU 또는 DP Attention 비활성):
+          고압축 코덱 우선. 개별 KV 압축이 전체 메모리에 직접 기여.
+      - effective_kv_replicas == 1 (DP Attention 활성):
+          한계 효용 기반 선택적 압축. 한계 효용 < threshold → 압축 스킵.
+
+    이중 절감 정량화:
+      실효 메모리 절감율 = 1 - 1/(effective_kv_replicas * compression_ratio)
+      결과를 results/<exp>/dp_attn_compression_matrix.json에 기록.
+
+    정확도 보존:
+      - DP Attention 활성 시 낮은 압축 강도 → accuracy delta 자동 감소.
+      - 각 코덱의 accuracy-preserving 보장(±0.5%)을 상속.
+      - 환경별 WikiText-2 perplexity ±1% 독립 검증 (필수).
+
+    평가 기준 (evaluation_criteria.md §4):
+      - Accuracy 보존: perplexity 변화 ±1% 이내 (필수)
+      - KV Memory Reduction: −30% 이상
+      - Effective Context Length: 2× 이상
+    """
+
+    def __init__(
+        self,
+        config: DPAttentionCompressionConfig,
+        codec_registry: Optional[Dict[str, CacheStore]] = None,
+        env_change_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.config = config
+        torch.manual_seed(config.seed)
+
+        # DP Attention 환경 감지
+        self._n_gpus = config.n_gpus
+        if config.auto_detect_gpus:
+            try:
+                detected = torch.cuda.device_count()
+                self._n_gpus = max(1, detected)
+            except Exception:
+                self._n_gpus = 1
+
+        env_flag = os.environ.get("DP_ATTN_ENABLED", "")
+        self._dp_attn_enabled = config.dp_attn_enabled or env_flag in ("1", "true", "True")
+
+        # effective_kv_replicas 계산
+        self._effective_kv_replicas = 1 if self._dp_attn_enabled else self._n_gpus
+
+        # 코덱 레지스트리: 외부 주입 또는 기본값 (지연 초기화)
+        self._codec_registry: Dict[str, CacheStore] = codec_registry or {}
+        self._env_change_callback = env_change_callback
+
+        # 내부 스토어 (코덱 없는 경우 fallback)
+        self._fallback_store: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
         self._total_bytes_original = 0
         self._total_bytes_stored = 0
+        # 압축 기법별 compression_ratio 추적
+        self._codec_compression_ratios: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
-    # Activity C 핵심: compression_hook 오버라이드                         #
+    # 환경 인식 코덱 선택                                                  #
     # ------------------------------------------------------------------ #
 
-    def compression_hook(
-        self,
-        key: str,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        """적응 정밀도 양자화: 어텐션 엔트로피 기반 채널별 FP16/INT8/INT4 할당.
+    def effective_kv_replicas(self) -> int:
+        """현재 effective_kv_replicas 반환."""
+        return self._effective_kv_replicas
+
+    def select_codec(self) -> Optional[CacheStore]:
+        """환경에 따라 압축 코덱 선택.
 
         Algorithm:
-          1. warmup 단계 (step < warmup_steps): value.half() 반환 (FP16 그대로)
-          2. 어텐션 엔트로피 계산: _compute_attention_entropy(value) → H [n_tokens]
-             - value shape: [n_tokens, ...] 임의 shape 지원
-             - 엔트로피가 낮은 상위 ratio_fp16: FP16
-             - 중간 ratio_int8: INT8 (per-token symmetric quantization)
-             - 엔트로피가 높은 하위 ratio_int4: INT4 시뮬레이션
-               (FP16에서 4-bit float 범위로 클램핑 후 역변환)
-          3. 정밀도별 마스크를 _precision_masks[key]에 저장 (decode 시 사용)
-          4. 압축된 텐서를 pack_mixed_precision()으로 합산해 반환
-             - 반환 형식: FP16 텐서로 통일 (INT8/INT4 디코딩 후 FP16으로 복원)
-
-        Returns:
-            압축 후 FP16 텐서 [n_tokens, ...] — 원본 shape 유지
-            (INT8/INT4 구간은 디코딩 후 FP16으로 복원된 상태로 저장)
+          1. effective_kv_replicas > 1 (단일/DP Attention 비활성):
+               → config.single_gpu_codec 코덱 선택 (고압축 우선).
+          2. effective_kv_replicas == 1 (DP Attention 활성):
+               → 한계 효용 계산: marginal_utility = 1 - 1/compression_ratio.
+               → marginal_utility < dp_attn_compression_skip_threshold
+                   → None 반환 (압축 스킵).
+               → 그 외 → config.dp_attn_codec 선택.
         """
-        self._current_step += 1
-        n_bytes_original = value.nbytes
-        self._total_bytes_original += n_bytes_original
+        codec_name: str
+        if self._effective_kv_replicas > 1:
+            codec_name = self.config.single_gpu_codec
+        else:
+            # DP Attention 활성: 한계 효용 확인
+            ratio = self._codec_compression_ratios.get(
+                self.config.dp_attn_codec, 2.0
+            )
+            marginal_utility = 1.0 - 1.0 / max(ratio, 1.0)
+            if marginal_utility < self.config.dp_attn_compression_skip_threshold:
+                return None
+            codec_name = self.config.dp_attn_codec
 
-        # warmup 단계: FP16 보존
-        if self._current_step <= self.config.warmup_steps:
-            result = value.detach().half()
-            self._total_bytes_stored += result.nbytes
-            return result
+        return self._codec_registry.get(codec_name)
 
-        if value.dim() < 1 or value.shape[0] == 0:
-            return value.detach().half()
+    def register_codec(self, name: str, codec: CacheStore, compression_ratio: float = 2.0) -> None:
+        """코덱을 레지스트리에 등록."""
+        self._codec_registry[name] = codec
+        self._codec_compression_ratios[name] = compression_ratio
 
-        n_tokens = value.shape[0]
-        entropy = self._compute_attention_entropy(value)  # [n_tokens]
+    def register_env_change_callback(self, callback: Callable[[], None]) -> None:
+        """DP Attention 상태 변화 시 호출할 콜백 등록."""
+        self._env_change_callback = callback
 
-        # 정밀도 마스크 계산: 엔트로피 낮은 순서로 정렬 후 비율로 분할
-        n_fp16 = max(1, int(n_tokens * self._ratio_fp16))
-        n_int8 = max(0, int(n_tokens * self._ratio_int8))
-        n_int4 = max(0, n_tokens - n_fp16 - n_int8)
+    def update_dp_attn_state(self, dp_attn_enabled: bool, n_gpus: Optional[int] = None) -> None:
+        """런타임 DP Attention 상태 변화 시 정책 자동 전환.
 
-        # 엔트로피 낮은(집중) 토큰이 fp16 → sorted ascending by entropy
-        sorted_idx = entropy.argsort()  # ascending: 낮은 엔트로피 먼저
-        fp16_idx = sorted_idx[:n_fp16]
-        int8_idx = sorted_idx[n_fp16:n_fp16 + n_int8]
-        int4_idx = sorted_idx[n_fp16 + n_int8:]
+        Algorithm:
+          1. _dp_attn_enabled 및 _n_gpus 업데이트.
+          2. _effective_kv_replicas 재계산.
+          3. env_change_callback 호출 (있으면).
+        """
+        self._dp_attn_enabled = dp_attn_enabled
+        if n_gpus is not None:
+            self._n_gpus = n_gpus
+        self._effective_kv_replicas = 1 if self._dp_attn_enabled else self._n_gpus
+        if self._env_change_callback is not None:
+            self._env_change_callback()
 
-        self._precision_masks[key] = {
-            "fp16": fp16_idx,
-            "int8": int8_idx,
-            "int4": int4_idx,
-        }
+    def effective_memory_reduction_ratio(self, compression_ratio: float) -> float:
+        """이중 절감 실효 메모리 절감율 계산.
 
-        # 각 구간 압축 후 동일 FP16 버퍼로 복원해 저장
-        result = torch.zeros_like(value, dtype=torch.float16)
-        v_f = value.detach().float()
+        실효 절감 = 1 - 1 / (effective_kv_replicas * compression_ratio)
+        DP Attention(N-GPU) + 압축(C×) → 1 - 1/(N*C).
+        """
+        return 1.0 - 1.0 / max(
+            self._effective_kv_replicas * compression_ratio, 1.0
+        )
 
-        # FP16 구간: 그대로 보존
-        if len(fp16_idx) > 0:
-            result[fp16_idx] = v_f[fp16_idx].half()
+    # ------------------------------------------------------------------ #
+    # CacheStore 추상 메서드                                               #
+    # ------------------------------------------------------------------ #
 
-        # INT8 구간: symmetric per-token quantization → dequantize → FP16
-        if len(int8_idx) > 0:
-            chunk = v_f[int8_idx]
-            scale = chunk.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / 127.0
-            q8 = (chunk / scale).round().clamp(-127, 127)
-            result[int8_idx] = (q8 * scale).half()
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """환경 인식 압축 후 저장."""
+        self._total_bytes_original += value.nbytes
+        compressed = self.compression_hook(key, value)
+        self._total_bytes_stored += compressed.nbytes
 
-        # INT4 구간: 4-bit float 시뮬레이션 (범위 클램핑 + 반올림)
-        if len(int4_idx) > 0:
-            chunk = v_f[int4_idx]
-            scale = chunk.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / 7.0
-            q4 = (chunk / scale).round().clamp(-8, 7)
-            result[int4_idx] = (q4 * scale).half()
+        codec = self.select_codec()
+        if codec is not None:
+            codec.put(key, compressed)
+        else:
+            # 압축 스킵: fallback store에 직접 저장
+            if len(self._fallback_store) >= self.config.max_entries:
+                self.evict()
+            self._fallback_store[key] = compressed.detach().clone()
 
-        self._total_bytes_stored += result.nbytes
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        codec = self.select_codec()
+        result: Optional[torch.Tensor] = None
+        if codec is not None:
+            result = codec.get(key)
+        if result is None:
+            result = self._fallback_store.get(key)
+        if result is not None:
+            self._hits += 1
+        else:
+            self._misses += 1
         return result
 
-    def _compute_attention_entropy(
-        self,
-        value: torch.Tensor,  # [n_tokens, ...]
-    ) -> torch.Tensor:
-        """토큰별 어텐션 엔트로피 계산.
+    def evict(self) -> int:
+        codec = self.select_codec()
+        if codec is not None:
+            return codec.evict()
+        if self._fallback_store:
+            _, v = self._fallback_store.popitem(last=False)
+            return v.nbytes
+        return 0
 
-        Algorithm:
-          - value를 [n_tokens, -1]로 reshape
-          - softmax 후 Shannon 엔트로피: H_i = -Σ_j p_j * log(p_j + 1e-8)
-          - 엔트로피가 낮을수록 집중적 어텐션 (고중요도)
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
 
-        Returns:
-            H: Tensor[n_tokens] — 토큰별 엔트로피
-        """
-        n_tokens = value.shape[0]
-        flat = value.detach().float().reshape(n_tokens, -1)  # [n_tokens, D]
-        # softmax로 확률 분포 근사
-        p = torch.softmax(flat, dim=-1)  # [n_tokens, D]
-        H = -(p * torch.log(p + 1e-8)).sum(dim=-1)  # [n_tokens]
-        return H
+    def memory_bytes(self) -> int:
+        codec = self.select_codec()
+        if codec is not None:
+            return codec.memory_bytes()
+        return sum(v.nbytes for v in self._fallback_store.values())
 
-    # ------------------------------------------------------------------ #
-    # RL 인터페이스                                                         #
-    # ------------------------------------------------------------------ #
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
+        self._total_bytes_original = 0
+        self._total_bytes_stored = 0
+        for codec in self._codec_registry.values():
+            codec.reset_stats()
+        self._fallback_store.clear()
 
-    def set_rl_mode(self, is_rl: bool, num_completions: int = 1) -> None:
-        """RL 워크로드 감지 플래그 설정."""
-        self._is_rl_mode = is_rl or num_completions > 1
-
-    def update_reward_signal(self, reward: float) -> None:
-        """RL 리워드 피드백으로 정밀도 비율 동적 조정.
-
-        Algorithm:
-          - reward >= high_reward_threshold:
-              precision_ratio_int4 += reward_aggression_step (더 공격적 압축 허용)
-          - reward < high_reward_threshold:
-              precision_ratio_int4 -= reward_recovery_step (정밀도 회복)
-          - 조정 후 int4를 [0, 1-ratio_fp16] 범위로 클램핑
-          - 남은 비율을 int8에 할당하여 합계 1.0 유지
-
-        Args:
-            reward: 최근 RL 생성의 리워드 스코어 (0.0~1.0)
-        """
-        self._last_reward = reward
-        cfg = self.config
-
-        if reward >= cfg.high_reward_threshold:
-            self._ratio_int4 = min(
-                1.0 - self._ratio_fp16,
-                self._ratio_int4 + cfg.reward_aggression_step
-            )
-        else:
-            self._ratio_int4 = max(0.0, self._ratio_int4 - cfg.reward_recovery_step)
-
-        # 재정규화: fp16은 고정, int8 = 나머지
-        self._ratio_int8 = max(0.0, 1.0 - self._ratio_fp16 - self._ratio_int4)
-
-    def apply_online_quantization(
-        self,
-        kv_tensor: torch.Tensor,
-        step_id: int,
-        reward_signal: Optional[float] = None,
-    ) -> torch.Tensor:
-        """vLLM Q2 2026 온라인 양자화 플러그인 인터페이스.
-
-        Args:
-            kv_tensor: [n_tokens, ...] KV 텐서
-            step_id: 현재 디코딩 스텝
-            reward_signal: 선택적 리워드 신호 (있으면 update_reward_signal() 호출)
-
-        Returns:
-            quantized_kv: 압축된 FP16 텐서
-        """
-        if reward_signal is not None:
-            self.update_reward_signal(reward_signal)
-        self._current_step = step_id
-        return self.compression_hook("__online__", kv_tensor)
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        """선택된 코덱의 compression_hook 위임 또는 identity."""
+        codec = self.select_codec()
+        if codec is not None and hasattr(codec, "compression_hook"):
+            return codec.compression_hook(key, value)
+        return value
 
     # ------------------------------------------------------------------ #
-    # 메트릭                                                                #
+    # 메트릭                                                               #
     # ------------------------------------------------------------------ #
 
     def memory_reduction_ratio(self) -> float:
-        """실제 메모리 절감률 (bytes 기준)."""
+        """실제 메모리 절감율 (bytes 기준)."""
         if self._total_bytes_original == 0:
             return 0.0
         return 1.0 - self._total_bytes_stored / self._total_bytes_original
 
-    def current_precision_ratios(self) -> Dict[str, float]:
-        """현재 동적 정밀도 비율."""
+    def dp_attn_compression_matrix_entry(
+        self,
+        codec_name: str,
+        compression_ratio: float,
+    ) -> Dict:
+        """실험 행렬 단일 항목 반환 (results/<exp>/dp_attn_compression_matrix.json에 기록)."""
         return {
-            "fp16": self._ratio_fp16,
-            "int8": self._ratio_int8,
-            "int4": self._ratio_int4,
+            "dp_attn_enabled": self._dp_attn_enabled,
+            "n_gpus": self._n_gpus,
+            "effective_kv_replicas": self._effective_kv_replicas,
+            "codec_name": codec_name,
+            "compression_ratio": compression_ratio,
+            "effective_memory_reduction": self.effective_memory_reduction_ratio(compression_ratio),
+            "actual_memory_reduction": self.memory_reduction_ratio(),
         }
 ```
 
 ---
 
-### HMAChainedACPipeline (Cross A+C)
+### AMPDPrefillShareNonContiguousStack (Cross A+B+C)
 
-A-1 스케줄러 + C-1 코덱 + 기구현 코덱 3종을 통합하는 중앙 파이프라인.
-InferenceRunner에 직접 주입 가능하도록 schedule() 인터페이스를 구현한다.
+5단계 처리 흐름을 통합하는 중앙 스택 모듈.
 
 ```python
-# src/engine/hma_chained_ac_pipeline.py
+# src/engine/ampd_prefill_share_stack.py
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import torch
 
 from src.engine.runner import InferenceRequest, InferenceRunner
 from src.cache.base import CacheStore
-from src.scheduler.hma_multi_connector_scheduler import (
-    HMAMultiConnectorCompressionPluginScheduler,
-    HMAMultiConnectorConfig,
-    HMAConnectorAdapter,
+from src.scheduler.ampd_lazy_segment_fetch import (
+    AMPDLazySegmentFetchScheduler,
+    AMPDLazySchedulerConfig,
+    SegmentMetadataRegistry,
 )
-from src.cache.rl_adaptive_precision_quantizer import (
-    RLAdaptivePrecisionQuantizer,
-    RLAdaptivePrecisionConfig,
+from src.cache.ampd_adapshot_lazy_pipeline import (
+    AMPDAdapShotLazyLoadPipeline,
+    LazyPipelineConfig,
 )
-from src.cache.global_retention_gate_eviction import (
-    GlobalRetentionGateEvictionCodec,
-    GlobalRetentionGateConfig,
+from src.cache.dp_attention_aware_compression import (
+    DPAttentionAwareCompressionSelector,
+    DPAttentionCompressionConfig,
 )
 
 
 @dataclass
-class HMAChainedACPipelineConfig:
-    # 커넥터 선택 규칙 (YAML 외부화)
-    chain_mode: bool = False               # True: 주 커넥터 + global_retention 순차 체이닝
-    default_connector: str = "global_retention"
-    long_ctx_threshold: int = 4096
-    memory_pressure_threshold: float = 0.8
-
-    # 내장 코덱 설정 (외부에서 코덱 인스턴스를 주입하지 않을 경우 기본값 사용)
-    rl_quantizer_config: Optional[RLAdaptivePrecisionConfig] = None
-    global_retention_config: Optional[GlobalRetentionGateConfig] = None
-
+class AMPDStackConfig:
+    scheduler_config: Optional[AMPDLazySchedulerConfig] = None
+    pipeline_config: Optional[LazyPipelineConfig] = None
+    compression_config: Optional[DPAttentionCompressionConfig] = None
     seed: int = 42
 
 
-class HMAChainedACPipeline:
-    """HMA 멀티-커넥터 플러그인 체이닝 A+C 통합 파이프라인.
+class AMPDPrefillShareNonContiguousStack:
+    """AMPD + AdapShot + DP Attention 인식 압축 A+B+C 완전 통합 스택.
 
-    Cross Activity A+C:
-      - A-1 HMAMultiConnectorCompressionPluginScheduler 커넥터 레지스트리
-      - C-1 RLAdaptivePrecisionQuantizer (RL 워크로드)
-      - 기구현 GlobalRetentionGateEvictionCodec (긴 컨텍스트)
-      - 기구현 RateQuantReverseWaterfillingCodec (짧은 고처리량, 선택적)
+    Cross Activity A+B+C:
+      - A-1 AMPDLazySegmentFetchScheduler: 지연 페치 스케줄러
+      - B-1 AMPDAdapShotLazyLoadPipeline: 지연 로드·재인코딩 파이프라인
+      - C-1 DPAttentionAwareCompressionSelector: 환경 인식 압축 선택기
 
-    요청 프로파일 기반 커넥터 선택 규칙 (YAML connector_dispatch_policy):
-      is_rl_mode=True or num_completions>1  → "rl_adaptive"
-      context_length > long_ctx_threshold   → "global_retention"
-      memory_pressure > threshold           → "ratequant" (선택적)
-      기본값                                → default_connector
-
-    chain_mode=True:
-      선택된 커넥터 → global_retention 순차 적용 (write-time → post-write 이중 필터)
+    5단계 처리 흐름:
+      Step 1: 세그먼트 메타데이터 선행 전달 (KV 전송 없음).
+      Step 2: 팬아웃 배포 시뮬레이션 (단일 노드: 로컬 put).
+      Step 3: 스케줄 확정 후 지연 로드 + AdapShot 재인코딩 오버랩.
+      Step 4: DP Attention 인식 압축 적용.
+      Step 5: 비연속 어텐션 계산 투입 (InferenceRunner 호환).
 
     InferenceRunner 통합:
-      runner = InferenceRunner(cache=pipeline.cache, scheduler=pipeline)
-      runner.run_batch(requests) → pipeline.schedule(requests) 호출
+      runner = InferenceRunner(cache=stack.cache, scheduler=stack)
+      runner.run_batch(requests) → stack.schedule(requests) 호출
+
+    평가 기준 (evaluation_criteria.md §5):
+      - 복합 처리량: 단일 Activity 대비 +5% 이상
+      - 복합 메모리: 단일 Activity 대비 −10% 이상
+      - Accuracy 보존 (C 포함): 복합 후 cosine >= 0.99 (필수)
     """
 
     def __init__(
         self,
-        config: HMAChainedACPipelineConfig,
-        rl_quantizer: Optional[RLAdaptivePrecisionQuantizer] = None,
-        global_retention_codec: Optional[GlobalRetentionGateEvictionCodec] = None,
-        extra_connectors: Optional[Dict[str, "HMAConnectorInterface"]] = None,
+        config: AMPDStackConfig,
+        extra_codecs: Optional[Dict[str, CacheStore]] = None,
     ) -> None:
         self.config = config
 
-        # C-1: RLAdaptivePrecisionQuantizer
-        rl_cfg = config.rl_quantizer_config or RLAdaptivePrecisionConfig(seed=config.seed)
-        self._rl_quantizer = rl_quantizer or RLAdaptivePrecisionQuantizer(rl_cfg)
+        sched_cfg = config.scheduler_config or AMPDLazySchedulerConfig(seed=config.seed)
+        pipeline_cfg = config.pipeline_config or LazyPipelineConfig(seed=config.seed)
+        comp_cfg = config.compression_config or DPAttentionCompressionConfig(seed=config.seed)
 
-        # 기구현 GlobalRetentionGateEvictionCodec
-        gr_cfg = config.global_retention_config or GlobalRetentionGateConfig(seed=config.seed)
-        self._global_retention = global_retention_codec or GlobalRetentionGateEvictionCodec(gr_cfg)
+        self.registry = SegmentMetadataRegistry()
+        self.scheduler = AMPDLazySegmentFetchScheduler(sched_cfg, self.registry)
+        self.pipeline = AMPDAdapShotLazyLoadPipeline(pipeline_cfg)
+        self.compressor = DPAttentionAwareCompressionSelector(comp_cfg)
 
-        # A-1: HMAMultiConnectorScheduler 초기화
-        sched_cfg = HMAMultiConnectorConfig(
-            long_ctx_threshold=config.long_ctx_threshold,
-            memory_pressure_threshold=config.memory_pressure_threshold,
-            default_connector=config.default_connector,
-            pipeline_mode=config.chain_mode,
-            seed=config.seed,
-        )
-        self._scheduler = HMAMultiConnectorCompressionPluginScheduler(sched_cfg)
+        # 추가 코덱 등록
+        for name, codec in (extra_codecs or {}).items():
+            self.compressor.register_codec(name, codec)
 
-        # 커넥터 등록
-        self._scheduler.register_connector(
-            "rl_adaptive",
-            HMAConnectorAdapter("rl_adaptive", self._rl_quantizer),
-        )
-        self._scheduler.register_connector(
-            "global_retention",
-            HMAConnectorAdapter("global_retention", self._global_retention),
-        )
-
-        # 추가 커넥터 (선택적)
-        for name, conn in (extra_connectors or {}).items():
-            self._scheduler.register_connector(name, conn)
-
-        # 기본 캐시: global_retention codec을 CacheStore로 사용
-        self.cache: CacheStore = self._global_retention
+        # InferenceRunner가 사용하는 기본 캐시
+        self.cache: CacheStore = self.pipeline
 
     def schedule(
         self,
         requests: List[InferenceRequest],
     ) -> List[InferenceRequest]:
-        """InferenceRunner.run_batch()에서 호출되는 스케줄링 진입점."""
-        return self._scheduler.schedule(requests)
+        """InferenceRunner.run_batch() 호환 schedule() 진입점."""
+        return self.scheduler.schedule(requests)
 
-    def compress_kv(
+    def process_request_step1_metadata(
         self,
         request: InferenceRequest,
+        candidate_segment_ids: List[str],
+    ) -> None:
+        """Step 1: 세그먼트 메타데이터 선행 전달 (KV 전송 없음)."""
+        from src.scheduler.ampd_lazy_segment_fetch import SegmentMeta
+        metas = [
+            SegmentMeta(
+                segment_id=seg_id,
+                source_node_id="local",
+                tier="HBM",
+                approx_size_bytes=128 * 64 * 2,
+                position_range=(0, 128),
+            )
+            for seg_id in candidate_segment_ids
+        ]
+        self.scheduler.pre_resolve_segments(request, candidate_segment_ids, metas)
+
+    def process_step3_lazy_load(
+        self,
+        confirmed_ids: List[str],
+        source_positions: Optional[List[int]] = None,
+        target_positions: Optional[List[int]] = None,
+    ) -> List[Optional[torch.Tensor]]:
+        """Step 3: 지연 로드 + AdapShot 재인코딩 (동기 래퍼).
+
+        AsyncIterator를 동기 호출로 래핑해 기존 InferenceRunner와 호환.
+        """
+        import asyncio
+        src_pos = source_positions or [0] * len(confirmed_ids)
+        tgt_pos = target_positions or [0] * len(confirmed_ids)
+
+        async def _run():
+            results = []
+            for seg_id, sp, tp in zip(confirmed_ids, src_pos, tgt_pos):
+                kv = await self.pipeline.load_and_reencode_segment(seg_id, sp, tp)
+                results.append(kv)
+            return results
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+    def process_step4_compression(
+        self,
+        key: str,
         kv: torch.Tensor,
-        request_meta: Optional[Dict] = None,
     ) -> torch.Tensor:
-        """요청 프로파일에 따라 적절한 커넥터로 KV 압축."""
-        compressed, _ = self._scheduler.apply_connector(request, kv, request_meta)
-        return compressed
+        """Step 4: DP Attention 인식 압축 적용."""
+        return self.compressor.compression_hook(key, kv)
 
     def metrics_summary(self) -> Dict:
-        """처리량·메모리·정확도 복합 효과 측정용 통합 메트릭."""
+        """복합 효과 측정용 통합 메트릭."""
         return {
-            "connector_selection_stats": self._scheduler.connector_selection_stats(),
-            "scheduling_overhead_ms_p50": self._scheduler.scheduling_overhead_ms_p50(),
-            "rl_quantizer_memory_reduction": self._rl_quantizer.memory_reduction_ratio(),
-            "rl_quantizer_precision_ratios": self._rl_quantizer.current_precision_ratios(),
-            "global_retention_hit_rate": self._global_retention.hit_rate(),
-            "global_retention_memory_bytes": self._global_retention.memory_bytes(),
+            "scheduler_overhead_ms_p50": self.scheduler.scheduling_overhead_ms_p50(),
+            "unnecessary_transfer_ratio": self.scheduler.unnecessary_transfer_ratio(),
+            "pipeline_hit_rate": self.pipeline.hit_rate(),
+            "pipeline_noncontiguous_hit_rate": self.pipeline.noncontiguous_hit_rate(),
+            "pipeline_memory_bytes": self.pipeline.memory_bytes(),
+            "compressor_hit_rate": self.compressor.hit_rate(),
+            "compressor_memory_reduction": self.compressor.memory_reduction_ratio(),
+            "compressor_effective_replicas": self.compressor.effective_kv_replicas(),
         }
 ```
 
@@ -883,104 +1103,111 @@ class HMAChainedACPipeline:
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-Activity C(RLAdaptivePrecisionQuantizer)를 포함하므로 반드시 작성한다.
+Activity C(DPAttentionAwareCompressionSelector)를 포함하므로 반드시 작성한다.
 
 ### perplexity 측정
 
-- **데이터셋**: WikiText-2 proxy (실 데이터셋 없을 경우 synthetic 토큰 시퀀스로 대체)
+- **데이터셋**: WikiText-2 proxy (실 데이터셋 없을 경우 synthetic 토큰 시퀀스)
 - **측정 방법**: `src/metrics/perplexity.py`의 함수 사용
   - `attention_output_relative_error(q, k_orig, v_orig, k_comp, v_comp)` < 0.01 (1%)
-  - `k_comp`, `v_comp`: `compression_hook()` 적용 후 FP16 복원된 K, V
-- **허용 오차**: ±1% 이내 (evaluation_criteria.md §4 필수)
-- **정밀도 레벨별 측정**:
-  - FP16 전체 (warmup_steps 기간 또는 ratio_fp16=1.0): error < 0.001
-  - Mixed [0.2, 0.6, 0.2]: error < 0.01 (기준값)
-  - 공격적 [0.2, 0.2, 0.6]: error < 0.02 (허용 오차 경고)
-
-### 태스크 정확도 측정
-
-- **벤치마크**: GSM8K / MATH-500 RL 워크로드 proxy
-- **측정 방법**:
-  - `attention_kl_divergence(q, k_orig, k_comp)` < 0.015 (MANDATORY)
-  - `cosine_similarity_output(q, k_orig, v_orig, k_comp, v_comp)` >= 0.99 (MANDATORY)
+  - 단일 GPU 환경(DP Attention 비활성): error < 0.01 (MANDATORY)
+  - 멀티 GPU + DP Attention 활성 환경: error < 0.01 (MANDATORY)
+  - 두 환경 간 error 차이: < 0.005 (DP Attention 상태가 정확도에 미치는 영향 정량화)
 - **허용 오차**: ±1% 이내 (evaluation_criteria.md §4 필수)
 
-### RL 워크로드 시뮬레이션
+### 태스크 정확도 측정 (LongBench proxy)
 
-- **시나리오**: 동일 프롬프트 10회 반복 생성 시뮬레이션
-  1. 동일 token_ids로 10회 `compression_hook()` 호출
-  2. 각 생성 후 `update_reward_signal(reward)` 호출 (reward 0.0~1.0 순차 변화)
-  3. precision_ratio_int4 변화 곡선 측정 (리워드 피드백 수렴 확인)
-  4. 각 회차 attention error 측정 → 최종 10회 평균 error < 0.01 (MANDATORY)
-- **수렴 기준**: reward가 [0.9, 0.9, 0.9, 0.3, 0.3, 0.9, 0.9, 0.9, 0.9, 0.9] 패턴 주입 시
-  precision_ratio_int4가 reward 하락 후 반드시 recovery_step만큼 감소하는지 확인
+- **벤치마크**: LongBench 8개 서브태스크 proxy
+  - 측정 방법: `attention_kl_divergence` < 0.015 (MANDATORY)
+  - `cosine_similarity_output` >= 0.99 (MANDATORY)
+- **실험 행렬**: {DP Attention ON/OFF} × {압축 기법: None/GlobalRetention/FibQuant/SPKVWriteTime} × {n_gpus: 1/2/4}
+- **허용 오차**: ±1% 이내 (evaluation_criteria.md §4 필수)
 
-### GlobalRetentionGateEvictionCodec과 동일 설정 비교
+### 이중 절감 이론 검증
 
-- budget_ratio=0.3 (GlobalRetentionGate) vs precision_ratio [0.2, 0.6, 0.2] (RL Adaptive)
-  동일 n_tokens=64, seed=42 설정에서:
-  - attention error, KL divergence, cosine similarity, memory_reduction_ratio 비교
-  - `test_rl_vs_global_retention_comparison` 테스트 케이스에 포함
-  - RLAdaptivePrecisionQuantizer cosine >= GlobalRetentionGate cosine - 0.01 조건 명시
+- **검증 수식**: effective_reduction = 1 - 1/(N × C)
+  - N=1, C=2: 50% (단일 GPU, GlobalRetention 2×)
+  - N=4, C=3: 91.7% (4-GPU DP Attention + 3× 압축)
+  - N=4, C=10: 97.5% (이론 최솟값, FibQuant 10×)
+- **검증 테스트**: `test_effective_reduction_formula` — 수치가 이론값과 일치하는지 확인
+
+### DP Attention ON/OFF 간 정확도 차이 정량화
+
+- DP Attention 비활성 시 고압축(GlobalRetention) 적용 후 error
+- DP Attention 활성 시 저압축(identity 또는 낮은 ratio) 적용 후 error
+- 두 설정의 error 비교: DP Attention 활성 환경이 더 낮은 error를 가져야 함
+- 이 비교가 "환경 인식 정책의 정확도 안전성"을 증명
+
+### 환경 변화 내구성 검증
+
+- DP Attention ON → OFF 런타임 전환 시 `update_dp_attn_state()` 호출
+- 전환 후 코덱 선택이 정책에 맞게 자동 변경됨 확인
+- 전환 후 첫 번째 put/get 사이클의 accuracy delta: < 0.01 (MANDATORY)
 
 ### 검증 테스트 파일
 
-`tests/unit/test_rl_adaptive_precision_quantizer.py`
+`tests/unit/test_dp_attention_aware_compression.py`
 
 **테스트 케이스 목록**:
 
 ```
-test_warmup_fp16_preserved:
-    warmup_steps=5, step≤5 → 모든 토큰이 FP16 원본과 동일 (error=0)
+test_single_gpu_selects_high_compression:
+    n_gpus=1, dp_attn_enabled=False → single_gpu_codec 선택 확인
 
-test_entropy_based_precision_assignment:
-    n_tokens=100, 엔트로피 낮은 상위 20개 토큰이 fp16_idx에 포함됨
+test_dp_attn_enabled_selects_low_compression:
+    dp_attn_enabled=True → dp_attn_codec 선택 또는 스킵 확인
 
-test_int8_quantization_error_within_1pct:
-    INT8 구간 토큰: attention error < 0.01 (±1% MANDATORY)
+test_dp_attn_skip_when_marginal_utility_low:
+    marginal_utility < threshold → select_codec() == None 반환
 
-test_int4_simulation_error_within_2pct:
-    INT4 구간 토큰: attention error < 0.02
+test_effective_replicas_single_gpu:
+    n_gpus=1, dp_attn=False → effective_kv_replicas == 1
 
-test_mixed_precision_attention_error:
-    전체 mixed [0.2, 0.6, 0.2] 설정: attention error < 0.01 (MANDATORY)
+test_effective_replicas_multi_gpu_no_dp:
+    n_gpus=4, dp_attn=False → effective_kv_replicas == 4
 
-test_kl_divergence_mixed_precision:
-    KL < 0.015 at precision_ratio [0.2, 0.6, 0.2] (MANDATORY)
+test_effective_replicas_multi_gpu_with_dp:
+    n_gpus=4, dp_attn=True → effective_kv_replicas == 1
 
-test_cosine_similarity_mixed_precision:
-    cosine >= 0.99 at precision_ratio [0.2, 0.6, 0.2] (MANDATORY)
+test_effective_reduction_formula:
+    N=4, C=10 → effective_memory_reduction_ratio == 0.975 (±0.001)
 
-test_reward_feedback_increases_int4_on_high_reward:
-    reward=0.9 → precision_ratio_int4 증가 확인
+test_accuracy_single_gpu_within_1pct:
+    단일 GPU 고압축 코덱 적용 후 attention error < 0.01 (MANDATORY)
 
-test_reward_feedback_decreases_int4_on_low_reward:
-    reward=0.2 → precision_ratio_int4 감소 확인
+test_accuracy_dp_attn_within_1pct:
+    DP Attention 활성 환경 압축 후 attention error < 0.01 (MANDATORY)
 
-test_reward_feedback_ratios_sum_to_one:
-    update_reward_signal() 후 fp16 + int8 + int4 == 1.0 (±1e-6)
+test_kl_divergence_within_threshold:
+    KL < 0.015 at global_retention codec (MANDATORY)
 
-test_rl_simulation_10rounds_convergence:
-    10회 반복 생성 시뮬레이션: 최종 average error < 0.01 (MANDATORY)
+test_cosine_similarity_above_threshold:
+    cosine >= 0.99 at global_retention codec (MANDATORY)
 
-test_rl_simulation_reward_curve:
-    리워드 피드백 수렴 곡선 측정: precision_ratio_int4 변화가 reward 방향과 일치
+test_dp_attn_vs_single_gpu_error_difference:
+    DP Attention 활성 error <= 단일 GPU error + 0.005
+
+test_runtime_dp_attn_toggle:
+    update_dp_attn_state(True) 후 effective_replicas == 1
+    update_dp_attn_state(False) 후 effective_replicas == n_gpus
+
+test_env_var_detection:
+    DP_ATTN_ENABLED="1" 환경 변수 설정 시 dp_attn_enabled=True 자동 감지
 
 test_cachestore_interface:
     put/get/evict/hit_rate/memory_bytes/reset_stats 동작 확인
 
-test_memory_reduction_gt_30pct:
-    mixed precision 설정에서 memory_reduction_ratio() >= 0.30
+test_memory_reduction_gt_30pct_single_gpu:
+    단일 GPU + GlobalRetention: memory_reduction_ratio() >= 0.30 (MANDATORY)
 
-test_rl_vs_global_retention_comparison:
-    동일 설정(n_tokens=64, seed=42)에서 RLAdaptive vs GlobalRetention 비교
-    RLAdaptive cosine >= GlobalRetention cosine - 0.01
+test_compression_matrix_entry_keys:
+    dp_attn_compression_matrix_entry() 반환 딕셔너리 키 구조 확인
 
-test_apply_online_quantization_interface:
-    apply_online_quantization(kv, step_id=15, reward_signal=0.85) 호출 정상 동작
+test_register_env_change_callback:
+    register_env_change_callback() 등록 후 update_dp_attn_state() 시 콜백 호출
 
-test_cachestore_compression_hook_integration:
-    put() 내부에서 compression_hook() 호출됨 + 저장 shape 확인
+test_compression_hook_identity_when_skip:
+    select_codec() == None 시 compression_hook()이 identity 반환
 ```
 
 ---
@@ -988,66 +1215,47 @@ test_cachestore_compression_hook_integration:
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-17-hma-rl-ac.yaml
+# configs/experiments/2026-05-18.yaml
 experiment:
-  date: "2026-05-17"
-  activity: "A+C"
+  date: "2026-05-18"
+  activity: "A+B+C"
   description: >
-    A-1 HMAMultiConnectorCompressionPluginScheduler (HMA 멀티-커넥터 플러그인 메타-스케줄러) +
-    C-1 RLAdaptivePrecisionQuantizer (RL 워크로드 온라인 적응 정밀도 KV 양자화기) +
-    Cross-1 HMAChainedACPipeline (A+C 통합 파이프라인)
-  cache_type: rl_adaptive_precision
-  compression_method: quantization
-  scheduler_type: hma_multi_connector
+    A-1 AMPDLazySegmentFetchScheduler (AMPD pull-on-demand 세그먼트 지연 페치 스케줄러) +
+    B-1 AMPDAdapShotLazyLoadPipeline (지연 로드 + AdapShot RoPE 재인코딩 비동기 오버랩) +
+    C-1 DPAttentionAwareCompressionSelector (DP Attention 상태 인식 환경별 압축 선택기) +
+    Cross-1 AMPDPrefillShareNonContiguousStack (A+B+C 5단계 통합 스택)
+  cache_type: ampd_adapshot_lazy_pipeline
+  compression_method: dp_attention_aware
+  scheduler_type: ampd_lazy_segment_fetch
 
-hma_multi_connector_scheduler:
-  long_ctx_threshold: 4096           # 이 이상이면 global_retention 커넥터 선택
-  memory_pressure_threshold: 0.8    # HBM 사용률 이 이상이면 ratequant 선택
-  default_connector: "global_retention"
-  pipeline_mode: false               # true: 체이닝 모드
-  max_wait_ratio: 2.0
+ampd_lazy_segment_fetch_scheduler:
+  hbm_fetch_latency_ms: 0.01
+  ddr_fetch_latency_ms: 0.5
+  remote_fetch_latency_ms: 5.0
+  metadata_overhead_max_ms: 0.1     # 메타데이터 전달 오버헤드 상한 (MANDATORY 검증 기준)
+  max_concurrent_fetches: 8
   seed: 42
 
-  # 커넥터 선택 정책 (connector_dispatch_policy)
-  connector_dispatch_policy:
-    rl_mode_connector: "rl_adaptive"         # is_rl_mode=True or num_completions>1
-    long_ctx_connector: "global_retention"   # context_length > long_ctx_threshold
-    high_pressure_connector: "ratequant"     # memory_pressure > threshold
-    default: "global_retention"
+ampd_adapshot_lazy_pipeline:
+  chunk_size: 128
+  max_entries: 1000
+  rope_theta: 10000.0               # AdapShot RoPE 기본 주파수
+  n_heads: 8
+  d_head: 64
+  companion_hit_threshold: 2        # 예측 프리페치 동반 세그먼트 히트 임계값
+  seed: 42
 
-rl_adaptive_precision_quantizer:
-  precision_ratio_fp16: 0.20        # 상위 20%: FP16 (저엔트로피, 고중요도)
-  precision_ratio_int8: 0.60        # 중간 60%: INT8
-  precision_ratio_int4: 0.20        # 하위 20%: INT4 시뮬레이션
-  warmup_steps: 10                  # 초기 N 스텝 FP16 전체 정밀도
-  cot_length_threshold: 512
-  high_reward_threshold: 0.8
-  reward_aggression_step: 0.05
-  reward_recovery_step: 0.05
+dp_attention_aware_compression:
+  dp_attn_enabled: false            # 환경 변수 DP_ATTN_ENABLED="1" 또는 이 값으로 설정
+  n_gpus: 1                         # auto_detect_gpus=True 시 자동 감지
+  auto_detect_gpus: true
+  single_gpu_codec: "global_retention"   # 단일 GPU: GlobalRetentionGateEvictionCodec
+  dp_attn_codec: "global_retention"      # DP Attention 활성: 동일 코덱 (낮은 강도)
+  dp_attn_compression_skip_threshold: 0.5
   max_entries: 1000
   seed: 42
-  # 정밀도 비율 sweep (정확도 곡선 측정)
-  precision_sweep:
-    - [0.20, 0.60, 0.20]   # 기본 설정 (MANDATORY 검증 기준)
-    - [0.30, 0.50, 0.20]   # 보수적
-    - [0.20, 0.20, 0.60]   # 공격적
-    - [1.00, 0.00, 0.00]   # FP16 전체 (베이스라인)
 
-hma_chained_ac_pipeline:
-  chain_mode: false                  # true: 선택 커넥터 + global_retention 체이닝
-  default_connector: "global_retention"
-  long_ctx_threshold: 4096
-  memory_pressure_threshold: 0.8
-  seed: 42
-
-# 기구현 GlobalRetentionGateEvictionCodec 비교용 설정
-global_retention_gate_eviction:
-  n_layers: 4
-  n_heads: 4
-  d_model: 256
-  budget_ratio: 0.3
-  recent_window: 32
-  max_entries: 1000
+ampd_prefill_share_stack:
   seed: 42
 
 benchmark:
@@ -1057,127 +1265,166 @@ benchmark:
     kl_tolerance: 0.015
     cosine_min: 0.99
     perplexity_dataset: "wikitext-2"
-    perplexity_tolerance_pct: 1.0
+    perplexity_tolerance_pct: 1.0    # ±1% 이내 (MANDATORY)
     task_accuracy_tolerance_pct: 1.0
-  rl_simulation:
-    n_rounds: 10                     # 동일 프롬프트 반복 생성 횟수
-    reward_sequence: [0.9, 0.9, 0.9, 0.3, 0.3, 0.9, 0.9, 0.9, 0.9, 0.9]
-    convergence_error_threshold: 0.01
-  memory_reduction:
-    target_ratio: 0.30               # 최소 −30%
-    target_ratio_goal: 0.50          # 목표 −50% (mixed precision)
+  dp_attn_experiment_matrix:         # 실험 행렬 설정
+    dp_attn_states: [true, false]
+    codec_names: ["none", "global_retention", "fibquant", "spkv"]
+    n_gpus_list: [1, 2, 4]
+    output_file: "results/2026-05-18/dp_attn_compression_matrix.json"
+  activity_a:
+    ttft_overhead_limit_pct: 5.0     # TTFT p50 +5% 이내 (MANDATORY)
+    metadata_overhead_max_ms: 0.1    # < 0.1ms/요청 (MANDATORY)
+    unnecessary_transfer_ratio_target: 0.40  # 40% 이상 불필요 전송 제거 목표
+  activity_b:
+    noncontiguous_hit_rate_min: 0.30  # 전체 히트의 30% 이상 (MANDATORY)
+    kv_memory_footprint_increase_max: 0.20  # +20% 이내
+  activity_c:
+    memory_reduction_min: 0.30       # −30% 이상 (MANDATORY)
+    effective_context_multiplier: 2.0
+    compression_overhead_ttft_max_pct: 10.0
   throughput:
     target_improvement_pct: 20       # +20% 이상
-  effective_context:
-    target_multiplier: 2.0           # 2× 이상
-  scheduling:
-    ttft_overhead_limit_pct: 5.0     # TTFT p50 +5% 이내
-    connector_selection_overhead_ms: 0.1  # 커넥터 선택 < 0.1ms/요청
-  comparison:
-    methods: ["rl_adaptive", "global_retention", "baseline_fp16"]
-    # rl_adaptive cosine >= global_retention cosine - 0.01
-    cosine_tolerance: 0.01
-  cross_ac_comparison:
-    methods: ["solo_a1", "solo_c1", "cross_combined", "prior_cross_nath_retention"]
-    throughput_min_improvement_vs_solo: 5.0  # +5% 이상 (§5)
-    memory_min_improvement_vs_solo: 10.0     # −10% 이상 (§5)
+  cross_abc_comparison:
+    methods: ["solo_a1", "solo_b1", "solo_c1", "cross_combined"]
+    throughput_min_improvement_vs_solo: 5.0   # +5% 이상 (§5)
+    memory_min_improvement_vs_solo: 10.0      # −10% 이상 (§5)
+    accuracy_cosine_min: 0.99                 # (§5 C 포함 필수)
 
 seed: 42
-results_dir: "results/2026-05-17"
+results_dir: "results/2026-05-18"
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_rl_adaptive_precision_quantizer.py` — Activity C 필수 accuracy 검증 (17개 테스트, 위 목록 참조)
-- [ ] `tests/unit/test_hma_multi_connector_scheduler.py` — Activity A HMA 멀티-커넥터 스케줄러 단위 테스트
-- [ ] `tests/unit/test_hma_chained_ac_pipeline.py` — Cross A+C 통합 파이프라인 단위 테스트
-- [ ] `tests/integration/test_cross_ac_hma_chained.py` — E2E 통합: 다중 요청 커넥터 선택 + RL 적응 압축 흐름
+- [ ] `tests/unit/test_dp_attention_aware_compression.py` — Activity C 필수 accuracy 검증 (19개 테스트, 위 목록 참조)
+- [ ] `tests/unit/test_ampd_lazy_segment_fetch.py` — Activity A 단위 테스트
+- [ ] `tests/unit/test_ampd_adapshot_lazy_pipeline.py` — Activity B 단위 테스트
+- [ ] `tests/unit/test_ampd_prefill_share_stack.py` — Cross A+B+C 통합 단위 테스트
+- [ ] `tests/integration/test_cross_abc_ampd_stack.py` — E2E 통합 테스트
 
-### 단위 테스트 최소 요구 사항 (test_hma_multi_connector_scheduler.py)
+### 단위 테스트 최소 요구 사항 (test_ampd_lazy_segment_fetch.py)
 
 ```
-test_register_connector:
-    register_connector() 후 레지스트리에 커넥터 등록됨 확인
+test_segment_metadata_registry_register:
+    register() 후 get()으로 메타데이터 조회 가능
 
-test_select_connector_rl_mode:
-    is_rl_mode=True → "rl_adaptive" 선택 확인
+test_segment_metadata_registry_cancel:
+    cancel() 후 unnecessary_transfer_ratio 증가 확인
 
-test_select_connector_long_context:
-    context_length > 4096, is_rl_mode=False → "global_retention" 선택 확인
+test_segment_metadata_registry_ratio:
+    cancel 2 / pre_resolved 5 → ratio == 0.4
 
-test_select_connector_high_pressure:
-    context_length ≤ 4096, memory_pressure=0.9 → "ratequant" 선택 확인 (ratequant 등록 시)
+test_pre_resolve_segments_no_kv_transfer:
+    pre_resolve_segments() 호출 후 KV 데이터 미전송 (registry에 메타데이터만 존재)
 
-test_select_connector_default_fallback:
-    레지스트리에 없는 커넥터 선택 시 default_connector로 폴백
+test_confirm_segments_cancels_non_confirmed:
+    confirm_segments([a,b,c], [a]) → b, c cancel 처리됨
 
-test_apply_connector_calls_compress:
-    apply_connector() 호출 시 선택된 커넥터의 compress() 호출됨
+test_fetch_segments_lazy_yields_kvsegment:
+    fetch_segments_lazy(["seg1"]) → KVSegment(segment_id="seg1") yield
 
-test_pipeline_mode_chains_global_retention:
-    pipeline_mode=True, connector_name != "global_retention" 시
-    global_retention.compress()가 추가로 호출됨
+test_fetch_segments_lazy_hbm_latency:
+    tier=HBM fetch latency == hbm_fetch_latency_ms (±0.01ms)
+
+test_fetch_segments_lazy_ddr_latency:
+    tier=DDR fetch latency == ddr_fetch_latency_ms (±0.05ms)
 
 test_scheduling_overhead_below_01ms:
-    select_connector() 오버헤드 < 0.1ms (딕셔너리 룩업 O(1) 검증)
-
-test_connector_selection_stats:
-    connector_selection_stats()가 커넥터별 선택 횟수를 정확히 반환
+    schedule() 단일 호출 오버헤드 < 0.1ms
 
 test_schedule_returns_all_requests:
-    schedule(requests) 반환 목록이 입력과 동일한 길이
+    schedule(requests) 반환 길이 == 입력 길이
 
-test_reset_stats_clears_all:
-    reset_stats() 후 모든 카운터 0
+test_unnecessary_transfer_ratio_zero_initial:
+    초기 unnecessary_transfer_ratio() == 0.0
+
+test_reset_stats_clears_counts:
+    reset_stats() 후 ratio == 0.0
 ```
 
-### 단위 테스트 최소 요구 사항 (test_hma_chained_ac_pipeline.py)
+### 단위 테스트 최소 요구 사항 (test_ampd_adapshot_lazy_pipeline.py)
 
 ```
-test_pipeline_init_registers_rl_adaptive:
-    초기화 시 "rl_adaptive" 커넥터가 레지스트리에 등록됨
+test_cachestore_interface:
+    put/get/evict/hit_rate/memory_bytes/reset_stats 동작 확인
 
-test_pipeline_init_registers_global_retention:
-    초기화 시 "global_retention" 커넥터가 레지스트리에 등록됨
+test_resolve_segments_returns_metas_no_kv:
+    resolve_segments() 반환값이 SegmentMeta 목록 (KV 텐서 없음)
 
-test_compress_kv_rl_request:
-    is_rl_mode=True 요청에 rl_quantizer.compression_hook()이 적용됨
+test_put_segment_and_get_segments:
+    put_segment() 후 get_segments()에서 히트 반환
 
-test_compress_kv_long_ctx_request:
-    context_length > 4096 요청에 global_retention.compression_hook()이 적용됨
+test_noncontiguous_hit_detection:
+    chunk 0 miss + chunk 2 hit → noncontiguous_hit += 1
 
-test_metrics_summary_keys:
-    metrics_summary()가 connector_selection_stats, rl_quantizer_memory_reduction 등 키 포함
+test_noncontiguous_hit_rate_above_threshold:
+    비연속 패턴 10회 입력 후 noncontiguous_hit_rate() > 0.0
 
-test_cross_ac_throughput_vs_solo_a1:
-    단독 A-1 대비 Cross-1 처리량 +5% 이상 (evaluation_criteria.md §5)
+test_adapshot_reencode_changes_kv:
+    source_pos != target_pos → 재인코딩 후 KV 값 변화 확인
 
-test_cross_ac_memory_vs_solo_c1:
-    단독 C-1 대비 Cross-1 메모리 −10% 이상 (evaluation_criteria.md §5)
+test_adapshot_reencode_identity_same_pos:
+    source_pos == target_pos → 재인코딩 후 원본과 거의 동일 (error < 1e-4)
 
-test_cross_ac_accuracy_preserved:
-    Cross-1 적용 후 cosine >= 0.99 (evaluation_criteria.md §5 C 포함 필수)
+test_adapshot_reencode_preserves_shape:
+    재인코딩 전후 KV shape 동일
+
+test_load_and_reencode_segment_async:
+    asyncio로 load_and_reencode_segment() 호출 → KVSegment 반환
+
+test_load_and_reencode_returns_none_on_miss:
+    미저장 segment_id → None 반환
+
+test_memory_bytes_increases_on_put:
+    put() 후 memory_bytes() 증가
+```
+
+### 단위 테스트 최소 요구 사항 (test_ampd_prefill_share_stack.py)
+
+```
+test_stack_init_all_components:
+    초기화 시 scheduler, pipeline, compressor 모두 존재
 
 test_schedule_delegates_to_scheduler:
-    pipeline.schedule() 호출 시 _scheduler.schedule() 위임
+    stack.schedule() 호출 시 scheduler.schedule() 위임
 
-test_chain_mode_true:
-    chain_mode=True 시 pipeline_mode=True로 HMAMultiConnectorScheduler 초기화됨
+test_process_step1_registers_metadata:
+    process_request_step1_metadata() 후 registry에 세그먼트 등록됨
+
+test_process_step3_lazy_load_returns_tensors:
+    confirmed_ids 있으면 step3 결과가 텐서 목록
+
+test_process_step4_compression_applies:
+    compression_hook 활성 코덱 있으면 step4에서 텐서 변환됨
+
+test_metrics_summary_keys:
+    metrics_summary()가 scheduler_overhead, pipeline_hit_rate 등 모든 키 포함
+
+test_cross_abc_accuracy_preserved:
+    5단계 처리 후 cosine >= 0.99 (evaluation_criteria.md §5 C 포함 필수)
+
+test_cross_abc_throughput_vs_solo_b1:
+    단독 B-1 대비 Cross-1 처리량 +5% 이상 목표 (§5 검증)
+
+test_cross_abc_memory_vs_solo_c1:
+    단독 C-1 대비 Cross-1 메모리 −10% 이상 목표 (§5 검증)
+
+test_cache_property_is_cachestore:
+    stack.cache가 CacheStore 인스턴스
 ```
 
 ---
 
 ## vLLM 이식 경로 (vllm-porter 참조용)
 
-### 대상 파일 구조
-
 ```
 vllm_integration/
-├── scheduler_patch.py          # HMAMultiConnectorSchedulerMixin 추가 (기존 파일 확장)
-├── attention_backend_patch.py  # RLAdaptivePrecisionAttentionHook 추가 (기존 파일 확장)
-└── hma_connector_adapter.py    # HMAConnectorAdapter vLLM v0.21.0 공식 API 연동 (신규)
+├── scheduler_patch.py          # LazySegmentFetchSchedulerMixin 추가
+├── attention_backend_patch.py  # LazyLoadReencodingAttentionHook 추가
+└── dp_attn_compression_hook.py # DPAttentionAwareCompressionSelector vLLM 연동 (신규)
 ```
 
 ### Activity A 통합 포인트: `vllm/core/scheduler.py`
@@ -1185,123 +1432,97 @@ vllm_integration/
 ```python
 # vllm_integration/scheduler_patch.py 추가 사항
 
-class HMAMultiConnectorSchedulerMixin:
-    """vLLM v0.21.0 Scheduler에 HMA 멀티-커넥터 플러그인 기능을 추가하는 믹스인.
+class LazySegmentFetchSchedulerMixin:
+    """vLLM Scheduler에 AMPD 지연 페치 기능을 추가하는 믹스인.
 
     vLLM 통합 포인트:
-      - vllm.v1.core.sched.scheduler.Scheduler (vLLM v0.21.0 v1 아키텍처)
-      - schedule() 메서드를 오버라이드해 _hma_pre_schedule() 훅 삽입
-      - HMA OffloadingConnector 레지스트리를 vLLM kv_cache_manager에 연결
+      - vllm.v1.core.sched.scheduler.Scheduler
+      - schedule() 메서드를 오버라이드해 _ampd_pre_resolve() 훅 삽입.
+      - 세그먼트 확정 이벤트를 KV 전송 타이밍 제어에 연결.
 
-    make_hma_multi_connector_scheduler_class() 팩토리:
-      HMAMultiConnectorSchedulerMixin + vLLM Scheduler 조합 클래스를 동적 생성.
-      pip install --upgrade vllm 최신 버전과 호환.
+    make_lazy_fetch_scheduler_class() 팩토리:
+      LazySegmentFetchSchedulerMixin + vLLM Scheduler 동적 조합.
     """
-
-    def _hma_pre_schedule(self, waiting_requests) -> None:
-        """schedule() 전 각 대기 요청의 커넥터 선택을 미리 결정."""
+    def _ampd_pre_resolve(self, waiting_requests) -> None:
+        """schedule() 전 후보 세그먼트 메타데이터 등록."""
         ...
-
-def make_hma_multi_connector_scheduler_class(
-    vllm_scheduler_cls,
-    hma_config: "HMAMultiConnectorConfig",
-) -> type:
-    """vLLM Scheduler + HMAMultiConnectorSchedulerMixin 동적 조합 팩토리."""
-    ...
 ```
 
-### Activity C 통합 포인트: attention backend write/read hooks
+### Activity B 통합 포인트: attention backend
 
 ```python
 # vllm_integration/attention_backend_patch.py 추가 사항
 
-class RLAdaptivePrecisionAttentionHook:
-    """FlashAttentionImpl.forward()에 RLAdaptivePrecisionQuantizer를 주입하는 훅.
+class LazyLoadReencodingAttentionHook:
+    """FlashAttentionImpl에 지연 로드 + AdapShot 재인코딩 훅 삽입.
 
-    vLLM 통합 포인트:
-      write_to_cache hook: reshape_and_cache_flash() 호출 전
-        - compression_hook()으로 FP16/INT8/INT4 혼합 압축 수행
-        - 압축된 FP16 텐서를 캐시에 기록
-      read_from_cache hook: 어텐션 커널 실행 전
-        - 이미 FP16으로 복원된 압축 KV 반환 (양자화 텐서 직접 노출 없음)
-
-    Accuracy contract:
-      - mixed [0.2, 0.6, 0.2]: attention error < 1% (MANDATORY §4)
-      - warmup_steps 기간: FP16 전체 정밀도 (zero error)
-      - 리워드 피드백: 외부 RL 환경에서 apply_online_quantization(reward_signal=r) 주입
-
-    apply_rl_adaptive_precision_patch(flash_attn_impl, rl_config):
-      FlashAttentionImpl를 monkey-patch해 write/read 훅 삽입.
+    write_to_cache: 세그먼트 확정 후에만 캐시 기록.
+    read_from_cache: load_and_reencode_segment()로 재인코딩된 KV 반환.
     """
+    def write_to_cache(self, key_cache, value_cache, layer_idx: int) -> None: ...
+    def read_from_cache(self, key_cache, value_cache, layer_idx: int): ...
+```
 
-    def write_to_cache(self, key_cache, value_cache, layer_idx: int) -> None:
-        ...
+### Activity C 통합 포인트: KV 압축 훅
 
-    def read_from_cache(self, key_cache, value_cache, layer_idx: int):
-        ...
+```python
+# vllm_integration/dp_attn_compression_hook.py (신규)
 
+class DPAttentionCompressionHook:
+    """vLLM의 DP Attention 상태를 DPAttentionAwareCompressionSelector에 주입.
 
-# vllm_integration/hma_connector_adapter.py (신규)
-class HMAConnectorAdapterForVLLM:
-    """vLLM v0.21.0 공식 HMA OffloadingConnector 인터페이스와 연동하는 어댑터.
-
-    vLLM v0.21.0 HMA API:
-      - OffloadingConnector.store(job_id, kv_tensor) → DCP 이벤트
-      - OffloadingConnector.prefetch(job_id) → PCP 이벤트
-      - MultiConnectorManager.register(name, connector)
-      - MultiConnectorManager.select(request_profile) → connector_name
-
-    이 어댑터는 src/scheduler/hma_multi_connector_scheduler.py의
-    HMAConnectorInterface를 vLLM의 공식 OffloadingConnector API로 래핑한다.
-    실제 vLLM v0.21.0 import가 없을 경우 독립 구현으로 폴백.
+    vLLM DP Attention 상태 읽기:
+      - vllm.config.ParallelConfig.data_parallel_size
+      - vllm.worker.WorkerBase.dp_rank 존재 여부로 DP Attention 활성 감지.
     """
-    ...
+    def __init__(self, selector: "DPAttentionAwareCompressionSelector") -> None: ...
+    def inject_dp_state(self, vllm_engine) -> None:
+        """vLLM 엔진에서 DP Attention 상태를 읽어 selector.update_dp_attn_state() 호출."""
+        ...
 ```
 
 ---
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] 단위 테스트 전부 통과 (신규 3개 파일 + 기존 회귀 없음)
+- [ ] 단위 테스트 전부 통과 (신규 4개 파일 + 기존 회귀 없음)
 - [ ] `evaluation_criteria.md` §4 Activity C 필수 항목 충족:
-      - perplexity 변화 ±1% 이내 (attention error < 0.01, mixed [0.2, 0.6, 0.2] 설정)
+      - perplexity 변화 ±1% 이내 (attention error < 0.01, 단일/멀티 GPU 양쪽)
       - downstream 태스크 정확도 ±1% 이내 (KL < 0.015, cosine >= 0.99)
-      - RL 워크로드 시뮬레이션 10회 반복 후 리워드 피드백 수렴 확인
-      - GlobalRetentionGateEvictionCodec과 동일 설정 2방향 비교 포함
+      - {DP Attention ON/OFF} × {압축 기법} 교차 행렬 검증
+      - DP Attention ON/OFF 간 정확도 차이 정량화
 - [ ] `evaluation_criteria.md` §2 Activity A 항목 충족:
       - 스케줄링 오버헤드 TTFT p50 +5% 이내
-      - 커넥터 선택 오버헤드 < 0.1ms/요청 (O(1) 딕셔너리 룩업 검증)
-      - 캐시 히트율 향상 +10%p
+      - 메타데이터 선행 전달 오버헤드 < 0.1ms/요청
+      - unnecessary_transfer_ratio 지표 수집 및 기록
+- [ ] `evaluation_criteria.md` §3 Activity B 항목 충족:
+      - 비연속 세그먼트 히트율 전체 히트의 30% 이상
+      - KV Memory Footprint +20% 이내
 - [ ] `evaluation_criteria.md` §5 크로스 조합 C 포함:
-      - 복합 적용 후 accuracy ±1% 이내
-      - 단독 A-1 / 단독 C-1 / 결합 Cross-1 / 기구현 Cross-1 4방향 비교 수치 확인
-      - 단독 Activity 대비 +5% 처리량, −10% 메모리 추가 개선
+      - 복합 적용 후 accuracy ±1% 이내 (cosine >= 0.99)
+      - 단독 A-1 / B-1 / C-1 / Cross-1 4방향 비교 수치 확인
+      - 단독 Activity 대비 +5% 처리량, −10% 메모리 개선
 - [ ] `evaluation_criteria.md` §0 공통 필수:
-      - CacheStore 인터페이스 모든 추상 메서드 구현 (RLAdaptivePrecisionQuantizer)
+      - CacheStore 인터페이스 모든 추상 메서드 구현 (AMPDAdapShotLazyLoadPipeline, DPAttentionAwareCompressionSelector)
       - 시드 42 고정 재현성
-      - `configs/experiments/2026-05-17-hma-rl-ac.yaml` 존재
+      - `configs/experiments/2026-05-18.yaml` 존재
       - 모든 공개 함수·메서드 타입 힌트
-- [ ] 목표 지표 수치 `results/2026-05-17/metrics.json`에 JSON 기록:
+- [ ] 목표 지표 수치 `results/2026-05-18/metrics.json`에 JSON 기록:
       ```json
       {
         "inference_throughput_improvement_pct": ...,
-        "kv_memory_reduction_ratio_mixed_precision": ...,
-        "compression_accuracy_delta_mixed_precision": ...,
+        "kv_memory_reduction_ratio": ...,
+        "compression_accuracy_delta_single_gpu": ...,
+        "compression_accuracy_delta_dp_attn": ...,
         "effective_context_length_multiplier": ...,
         "scheduling_overhead_ttft_p50_pct": ...,
-        "connector_selection_overhead_ms_p50": ...,
-        "rl_simulation_10round_avg_error": ...,
-        "rl_simulation_reward_convergence_step": ...,
-        "rl_adaptive_cosine_mixed": ...,
-        "global_retention_cosine_budget30": ...,
-        "cross_ac_throughput_vs_solo_a1_pct": ...,
-        "cross_ac_memory_vs_solo_c1_pct": ...,
-        "cross_ac_accuracy_cosine": ...,
-        "connector_selection_stats": {
-          "rl_adaptive": ...,
-          "global_retention": ...,
-          "ratequant": ...
-        }
+        "metadata_overhead_ms_p50": ...,
+        "unnecessary_transfer_ratio": ...,
+        "noncontiguous_hit_rate": ...,
+        "cross_abc_throughput_vs_solo_pct": ...,
+        "cross_abc_memory_vs_solo_pct": ...,
+        "cross_abc_accuracy_cosine": ...,
+        "dp_attn_compression_matrix": "results/2026-05-18/dp_attn_compression_matrix.json"
       }
       ```
 - [ ] `src/cache/base.py` CacheStore 인터페이스 깨지지 않음 (수정 없음)
