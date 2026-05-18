@@ -2008,25 +2008,34 @@ class DPAttentionAwareVllmCodec:
     ) -> "_torch_cc18.Tensor":
         """Compress KV tensor (CacheStore.put path).
 
-        Returns FP16 tensor of same shape (INT8 values packed as FP16).
+        Returns INT8 tensor (dtype=torch.int8) — actual bytes are half of FP16.
         Stores scale in _scale_store[key] for decompression.
+
+        Memory accounting:
+            original:   value.numel() * 2  bytes  (FP16)
+            compressed: value.numel() * 1  byte   (INT8)
+            scale:      8 bytes (one float64 scalar)
+            reduction:  ≈ 50% → memory_reduction_ratio ≥ 0.49
         """
         if not _TORCH_OK_CC18 or not self._should_compress():
+            self._total_bytes_original += value.nbytes
+            self._total_bytes_compressed += value.nbytes
             return value
 
-        self._total_bytes_original += value.nbytes
+        fp16_bytes = value.numel() * 2  # FP16 = 2 bytes/element
+        self._total_bytes_original += fp16_bytes
 
         v_f = value.float()
         scale = v_f.abs().max().item() / 127.0
         if scale == 0.0:
             scale = 1.0
         q = (v_f / scale).round().clamp(-128, 127).to(_torch_cc18.int8)
-        compressed = (q.float() * scale).half()
 
         self._scale_store[key] = scale
-        self._total_bytes_compressed += compressed.nbytes
+        # INT8 = 1 byte/element + 8 bytes for scale scalar
+        self._total_bytes_compressed += q.nbytes + 8
         self._encode_count += 1
-        return compressed
+        return q
 
     def decompression_hook(
         self,
@@ -2035,12 +2044,15 @@ class DPAttentionAwareVllmCodec:
     ) -> "_torch_cc18.Tensor":
         """Decompress KV tensor (CacheStore.get / attention read path).
 
-        Always returns FP16. Compressed tensor never enters attention kernel.
+        Always returns FP16. Compressed tensor (INT8) never enters attention kernel.
+        Retrieves scale from _scale_store[key] and dequantizes to FP16.
         """
         if not _TORCH_OK_CC18:
             return compressed
         self._decode_count += 1
-        # For INT8 shape-preserving FP16 storage, we simply return FP16 directly
+        if compressed.dtype == _torch_cc18.int8:
+            scale = self._scale_store.get(key, 1.0)
+            return (compressed.float() * scale).half()
         return compressed.half() if compressed.dtype != _torch_cc18.float16 else compressed
 
     # ------------------------------------------------------------------ #
