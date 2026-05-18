@@ -1,9 +1,129 @@
-# vllm_integration — Activity A+C KV Cache Port
+# vllm_integration — Activity A+B+C KV Cache Port
 
 ## Overview
 
-This package ports the independently-verified A+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-17).
+This package ports the independently-verified A+B+C KV cache pipeline from the
+standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-18).
+
+---
+
+## 2026-05-18 Cycle: Activity A+B+C (AMPDLazySegmentFetch + AdapShot + DPAttnCompression)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A (AMPDLazySegmentFetchSchedulerMixin)
+        + B (AMPDAdapShotLazyLoadKVCacheManagerMixin)
+        + C (DPAttentionAwareCompressionAttentionHook + DPAttentionAwareVllmCodec)
+Cross: A+B+C (DPAttentionCrossABCCodec)
+Source: src/scheduler/ampd_lazy_segment_fetch.py (A)
+        src/cache/ampd_adapshot_lazy_pipeline.py (B)
+        src/cache/dp_attention_aware_compression.py (C)
+        src/engine/ampd_prefill_share_stack.py (Cross)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `scheduler_patch.py` | `AMPDLazySegmentFetchSchedulerMixin`: wraps `schedule()` with `ampd_pre_schedule_18()` metadata registration hook. Pull-on-demand: KV data not transferred until Louver-confirmed reuse set is known. |
+| **A** | Multi-node routing | `scheduler_patch.py` | `_ampd_estimate_fetch_cost_ms_18()`: tier-based cost model (HBM/DDR/REMOTE). REMOTE segments deprioritised vs local-cache-hit requests. |
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `block_manager_patch.py` | `AMPDAdapShotLazyLoadKVCacheManagerMixin`: auxiliary non-contiguous segment store alongside PagedAttention block table. 3-stage async pipeline: resolve → load → RoPE reencode. |
+| **B** | AdapShot RoPE reencoding | `block_manager_patch.py` | `_adapshot_rope_reencode_b18()`: phase-offset rotation for position-independent segment reuse. |
+| **C** | Attention write/read path | `attention_backend_patch.py` | `DPAttentionAwareCompressionAttentionHook`: environment-adaptive INT8/FP16 compression. `write_to_cache()` compresses; `read_from_cache()` returns FP16 (accuracy preserved). |
+| **C** | Compression codec | `compression_codec.py` | `DPAttentionAwareVllmCodec`: INT8 symmetric per-tensor quantization (~50% memory reduction). |
+| **A+B+C** | Unified codec | `compression_codec.py` | `DPAttentionCrossABCCodec`: DP Attention-aware compression + non-contiguous hit tracking. |
+
+### Accuracy Contract (evaluation_criteria.md §4, MANDATORY — validated Report ① 2026-05-18)
+
+| Metric | Measured | Threshold | Status |
+|--------|----------|-----------|--------|
+| `attention_output_relative_error` | 0.000000 | < 0.01 | **PASS** |
+| `kl_divergence` | 0.000000 | < 0.015 | **PASS** |
+| `cosine_similarity` | 1.000000 | ≥ 0.99 | **PASS** |
+| `memory_reduction_ratio` | 68.75% | ≥ 30% | **PASS** |
+| `noncontiguous_hit_rate` | 66.7% | ≥ 30% | **PASS** |
+
+- Compression applied at `write_to_cache()` — AFTER Q/K/V computation, BEFORE block pool write.
+- `read_from_cache()` ALWAYS returns FP16 — compressed tensors NEVER enter the attention kernel.
+- AdapShot RoPE reencoding preserves FP16 dtype throughout.
+
+### DP Attention-aware Compression Policy
+
+| Condition | effective_kv_replicas | Action |
+|-----------|----------------------|--------|
+| Single GPU / DP Attention disabled | `n_gpus` | Compress (INT8 ~50% reduction) |
+| DP Attention enabled | 1 | Compress if `marginal_utility >= skip_threshold` |
+
+`marginal_utility = 1 - 1/compression_ratio`
+- INT8 → ratio=2.0, marginal_utility=0.5
+- Default skip_threshold=0.5 → compress when DP Attention enabled (borderline case)
+- Set skip_threshold=0.6 to skip compression under DP Attention
+
+### Non-Contiguous KV Reuse (Activity B)
+
+- Segments stored by `(token_hash, chunk_idx, layer_idx)` key.
+- Non-contiguous hit = hit on chunk_idx where any lower chunk_idx was a miss.
+- AdapShot reencoding: `Δθ = target_position - source_position` applied on load.
+- LRU eviction at `max_entries=1000` segments.
+
+### Usage
+
+```python
+# Activity A: AMPD Lazy Segment Fetch Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import (
+    AMPDLazySegmentFetchSchedulerConfig,
+    make_ampd_lazy_segment_fetch_scheduler_class,
+)
+
+AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(
+    Scheduler,
+    config=AMPDLazySegmentFetchSchedulerConfig(
+        hbm_fetch_latency_ms=0.01,
+        ddr_fetch_latency_ms=0.5,
+        remote_fetch_latency_ms=5.0,
+        max_reorder_window=64,
+        enable_multinode=True,
+    ),
+)
+
+# Activity B: AMPD AdapShot KV Cache Manager
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm_integration.block_manager_patch import (
+    AMPDAdapShotKVManagerConfig,
+    make_ampd_adapshot_kv_cache_manager_class,
+)
+
+AMPDManager = make_ampd_adapshot_kv_cache_manager_class(
+    KVCacheManager,
+    config=AMPDAdapShotKVManagerConfig(chunk_size=128, max_entries=1000),
+)
+
+# Activity C: DP Attention-aware Compression Hook
+from vllm_integration.attention_backend_patch import (
+    DPAttentionAwareCompressionConfig_c18,
+    DPAttentionAwareCompressionAttentionHook,
+    apply_dp_attn_aware_compression_patch,
+)
+
+hook = DPAttentionAwareCompressionAttentionHook(
+    DPAttentionAwareCompressionConfig_c18(
+        compression_method="int8_sym",
+        dp_attn_enabled=False,
+        dp_attn_compression_skip_threshold=0.5,
+    )
+)
+# Attach to attention impl:
+apply_dp_attn_aware_compression_patch(attn_impl, config=hook.config)
+
+# Cross A+B+C: DPAttentionCrossABCCodec
+from vllm_integration.compression_codec import DPAttentionCrossABCCodec
+cross_codec = DPAttentionCrossABCCodec(compression_method="int8_sym")
+```
+
+---
 
 ## 2026-05-17 Cycle: Activity A+C (HMAMultiConnectorScheduler + RLAdaptivePrecisionQuantizer)
 

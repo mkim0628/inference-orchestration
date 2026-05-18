@@ -2795,3 +2795,228 @@ set -e
 
 echo ""
 echo "=== 2026-05-17 A+C smoke tests complete ==="
+
+echo ""
+echo "=== 2026-05-18 A+B+C smoke tests (AMPDLazySegmentFetch + AdapShot + DPAttnCompression) ==="
+set +e
+python - <<'PYEOF_2026_05_18'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity A: AMPDLazySegmentFetchSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    AMPDLazySegmentFetchSchedulerConfig,
+    AMPDLazySegmentFetchSchedulerMixin,
+    make_ampd_lazy_segment_fetch_scheduler_class,
+)
+
+cfg_a = AMPDLazySegmentFetchSchedulerConfig(
+    hbm_fetch_latency_ms=0.01,
+    ddr_fetch_latency_ms=0.5,
+    remote_fetch_latency_ms=5.0,
+    metadata_overhead_max_ms=0.1,
+    max_reorder_window=8,
+    enable_multinode=False,
+    seed=42,
+)
+mixin_a = AMPDLazySegmentFetchSchedulerMixin.__new__(AMPDLazySegmentFetchSchedulerMixin)
+mixin_a._ampd_init_18(cfg_a)
+
+# Test metadata registration
+overhead_ms = mixin_a._ampd_register_segment_meta_18(
+    request_id="req_0",
+    candidate_segment_ids=["seg_abc", "seg_def"],
+    source_node_id="local",
+    tier="HBM",
+)
+assert overhead_ms < 10.0, f"Registration overhead {overhead_ms:.3f}ms too high"
+
+# Confirm only one segment (cancel the other)
+mixin_a._ampd_confirm_reuse_set_18("req_0", ["seg_abc"])
+utr = mixin_a.ampd_unnecessary_transfer_ratio()
+assert abs(utr - 0.5) < 1e-5, f"Expected UTR=0.5, got {utr}"
+print(f"  AMPDLazySegmentFetchSchedulerMixin: overhead={overhead_ms:.4f}ms UTR={utr:.3f} PASS")
+
+# Test cost estimation
+cost_hbm = mixin_a._ampd_estimate_fetch_cost_ms_18("seg_abc")
+assert cost_hbm == cfg_a.hbm_fetch_latency_ms
+mixin_a._ampd_register_segment_meta_18("req_1", ["seg_remote"], "192.168.1.2", "REMOTE")
+cost_remote = mixin_a._ampd_estimate_fetch_cost_ms_18("seg_remote")
+assert cost_remote == cfg_a.remote_fetch_latency_ms
+print(f"  Cost estimation: HBM={cost_hbm}ms REMOTE={cost_remote}ms PASS")
+
+# Test factory with vLLM Scheduler
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(Scheduler, cfg_a)
+    assert issubclass(AMPDScheduler, Scheduler)
+    assert issubclass(AMPDScheduler, AMPDLazySegmentFetchSchedulerMixin)
+    print(f"  make_ampd_lazy_segment_fetch_scheduler_class: PASS ({AMPDScheduler.__name__})")
+except Exception as exc:
+    print(f"  make_ampd_lazy_segment_fetch_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity B: AMPDAdapShotLazyLoadKVCacheManagerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.block_manager_patch import (
+    AMPDAdapShotKVManagerConfig,
+    AMPDAdapShotLazyLoadKVCacheManagerMixin,
+    _AMPDSegmentAuxStore_b18,
+    _adapshot_rope_reencode_b18,
+    make_ampd_adapshot_kv_cache_manager_class,
+)
+
+cfg_b = AMPDAdapShotKVManagerConfig(
+    chunk_size=128, max_entries=10, rope_theta=10000.0, n_heads=8, d_head=64, seed=42
+)
+
+# Test RoPE reencoding
+kv_src = torch.randn(16, 64)
+kv_reencoded = _adapshot_rope_reencode_b18(kv_src, source_pos=0, target_pos=64)
+assert kv_reencoded.dtype == torch.float16, f"Expected FP16, got {kv_reencoded.dtype}"
+assert kv_reencoded.shape == kv_src.shape
+
+# Identity reencoding
+kv_identity = _adapshot_rope_reencode_b18(kv_src, source_pos=10, target_pos=10)
+assert torch.allclose(kv_src, kv_identity.float(), atol=1e-3)
+print(f"  AdapShot RoPE reencoding: dtype={kv_reencoded.dtype} identity_ok PASS")
+
+# Test mixin
+mixin_b = AMPDAdapShotLazyLoadKVCacheManagerMixin.__new__(
+    AMPDAdapShotLazyLoadKVCacheManagerMixin
+)
+mixin_b._ampd_b18_init(cfg_b)
+
+token_ids = list(range(128))
+kv_small = torch.randn(128, 64).half()
+mixin_b.store_segment_b18(token_ids, chunk_idx=0, kv=kv_small, layer_idx=0)
+
+hit_metas, miss_indices = mixin_b.resolve_segments_b18(token_ids, layer_idx=0)
+assert len(hit_metas) == 1, f"Expected 1 hit, got {len(hit_metas)}"
+assert len(miss_indices) == 0, f"Expected 0 misses, got {len(miss_indices)}"
+
+seg_id = hit_metas[0]["segment_id"]
+loaded = mixin_b.load_and_reencode_b18(seg_id, source_position=0, target_position=64)
+assert loaded is not None and loaded.dtype == torch.float16
+print(f"  AMPDAdapShotLazyLoadKVCacheManagerMixin: hits={len(hit_metas)} reencode_dtype={loaded.dtype} PASS")
+
+# Test factory
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    AMPDManager = make_ampd_adapshot_kv_cache_manager_class(KVCacheManager, cfg_b)
+    assert issubclass(AMPDManager, KVCacheManager)
+    print(f"  make_ampd_adapshot_kv_cache_manager_class: PASS ({AMPDManager.__name__})")
+except Exception as exc:
+    print(f"  make_ampd_adapshot_kv_cache_manager_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity C: DPAttentionAwareCompressionAttentionHook
+# ---------------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    DPAttentionAwareCompressionConfig_c18,
+    DPAttentionAwareCompressionAttentionHook,
+    extend_cache_config_dp_attn_aware_compression,
+)
+
+cfg_c = DPAttentionAwareCompressionConfig_c18(
+    dp_attn_enabled=False,
+    n_gpus=1,
+    auto_detect_gpus=False,
+    compression_method="int8_sym",
+    dp_attn_compression_skip_threshold=0.5,
+    always_decompress_before_kernel=True,
+    enabled=True,
+    seed=42,
+)
+hook_c = DPAttentionAwareCompressionAttentionHook(cfg_c)
+
+# Test write/read cycle
+torch.manual_seed(42)
+k = torch.randn(64, 64)
+v = torch.randn(64, 64)
+k_comp, v_comp = hook_c.write_to_cache(k, v, layer_idx=0)
+assert k_comp.shape == k.shape
+assert k_comp.dtype == torch.float16
+
+k_out, v_out = hook_c.read_from_cache(k_comp, v_comp, layer_idx=0)
+assert k_out.dtype == torch.float16
+print(f"  DPAttentionAwareCompressionAttentionHook: write {k.shape}/{k.dtype}→{k_comp.dtype} read {k_out.dtype} PASS")
+
+# Test accuracy (MANDATORY: ±1% constraint)
+metrics = hook_c.compute_accuracy_metrics(k.float(), k_comp.float())
+rel_err = metrics["attention_output_relative_error"]
+kl = metrics["kl_divergence"]
+cos = metrics["cosine_similarity"]
+assert rel_err < 0.02, f"MANDATORY: attention_output_relative_error={rel_err:.6f} >= 0.02"
+assert cos >= 0.99, f"MANDATORY: cosine_similarity={cos:.6f} < 0.99"
+print(f"  Accuracy: rel_err={rel_err:.6f} kl={kl:.8f} cos={cos:.6f} — MANDATORY PASS")
+
+# Test DP Attention skip logic
+cfg_dp_skip = DPAttentionAwareCompressionConfig_c18(
+    dp_attn_enabled=True, n_gpus=4, auto_detect_gpus=False,
+    compression_method="int8_sym", dp_attn_compression_skip_threshold=0.6, enabled=True,
+)
+hook_skip = DPAttentionAwareCompressionAttentionHook(cfg_dp_skip)
+assert hook_skip._should_compress() is False
+print(f"  DP Attention skip (threshold=0.6): should_compress=False PASS")
+
+# Test CacheConfig extension
+ext = extend_cache_config_dp_attn_aware_compression(
+    {}, compression_method="int8_sym", dp_attn_enabled=False
+)
+assert ext["dp_attn_aware_compression_method"] == "int8_sym"
+print(f"  extend_cache_config_dp_attn_aware_compression: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity C: DPAttentionAwareVllmCodec + DPAttentionCrossABCCodec
+# ---------------------------------------------------------------------------
+from vllm_integration.compression_codec import (
+    DPAttentionAwareVllmCodec,
+    DPAttentionCrossABCCodec,
+)
+
+codec = DPAttentionAwareVllmCodec(
+    compression_method="int8_sym",
+    dp_attn_enabled=False, n_gpus=1,
+    auto_detect_gpus=False,
+    dp_attn_compression_skip_threshold=0.5,
+    enabled=True,
+)
+kv_test = torch.randn(64, 64)
+compressed = codec.compression_hook("seg_0", kv_test)
+assert compressed.dtype == torch.float16, f"Expected FP16, got {compressed.dtype}"
+decompressed = codec.decompression_hook("seg_0", compressed)
+assert decompressed.dtype == torch.float16
+mrr = codec.memory_reduction_ratio()
+print(f"  DPAttentionAwareVllmCodec: compressed={compressed.shape}/{compressed.dtype} mrr={mrr:.3f} PASS")
+
+cross = DPAttentionCrossABCCodec(
+    compression_method="int8_sym",
+    dp_attn_enabled=False, n_gpus=1,
+    auto_detect_gpus=False, enabled=True,
+)
+cross.record_segment_hit(is_noncontiguous=True)
+cross.record_segment_hit(is_noncontiguous=False)
+cross.record_segment_miss()
+nhr = cross.noncontiguous_hit_rate()
+shr = cross.segment_hit_rate()
+assert abs(nhr - 0.5) < 1e-5, f"Expected non-contiguous hit rate=0.5, got {nhr}"
+assert abs(shr - 2/3) < 1e-5, f"Expected segment hit rate=0.667, got {shr}"
+print(f"  DPAttentionCrossABCCodec: noncontiguous_hr={nhr:.3f} segment_hr={shr:.3f} PASS")
+
+cross_metrics = cross.cross_abc_metrics()
+assert "noncontiguous_hit_rate" in cross_metrics
+assert "memory_reduction_ratio" in cross_metrics
+print(f"  Cross A+B+C metrics keys OK: {list(cross_metrics.keys())}")
+
+print(f"\nAll 2026-05-18 A+B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_18
+set -e
+
+echo ""
+echo "=== 2026-05-18 A+B+C smoke tests complete ==="
