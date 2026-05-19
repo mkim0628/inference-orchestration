@@ -189,6 +189,19 @@ class ThunderAgentStaticSegmentReservationCache(CacheStore):
                 self.evict()
         self._store[key] = compressed.detach().clone()
 
+    def put_compressed(self, key: str, tensor: torch.Tensor) -> None:
+        """Store tensor directly without applying compression_hook.
+
+        Avoids double-compression when the caller (e.g. KVDriveThunderAgentIntegratedStack)
+        has already compressed the tensor with the appropriate tier codec.
+        """
+        if key in self._store:
+            self._store.move_to_end(key)
+        else:
+            if len(self._store) >= self.max_entries:
+                self.evict()
+        self._store[key] = tensor.detach().clone()
+
     def get(self, key: str) -> Optional[torch.Tensor]:
         if key in self._store:
             self._store.move_to_end(key)
