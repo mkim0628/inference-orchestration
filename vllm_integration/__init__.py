@@ -432,3 +432,91 @@ __all__ = [
     "make_kvp_vq_kv_cache_manager_class",
     "make_kvp_segment_scheduler_class",
 ]
+
+# ===========================================================================
+# 2026-05-19 imports (Activity A+B+C — KVDrive integrated stack)
+# ===========================================================================
+
+# Activity A: KVDrive attention-pipeline scheduler
+try:
+    from vllm_integration.scheduler_patch import (
+        KVDriveAttentionPipelineConfig,
+        KVDriveAttentionPipelineMixin,
+        make_kvdrive_vllm_scheduler_class,
+    )
+except Exception as _e_a19:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity A import failed: {_e_a19}",
+        RuntimeWarning,
+    )
+    KVDriveAttentionPipelineConfig = None  # type: ignore
+    KVDriveAttentionPipelineMixin = None   # type: ignore
+    make_kvdrive_vllm_scheduler_class = None  # type: ignore
+
+# Activity B: ThunderAgent static segment reservation
+try:
+    from vllm_integration.block_manager_patch import (
+        ThunderAgentKVManagerConfig,
+        ThunderAgentKVCacheManagerMixin,
+        LLMProgramDAG_19,
+        LLMProgramStep_19,
+        make_thunder_agent_kv_manager_class,
+    )
+except Exception as _e_b19:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity B import failed: {_e_b19}",
+        RuntimeWarning,
+    )
+    ThunderAgentKVManagerConfig = None      # type: ignore
+    ThunderAgentKVCacheManagerMixin = None  # type: ignore
+    LLMProgramDAG_19 = None                 # type: ignore
+    LLMProgramStep_19 = None                # type: ignore
+    make_thunder_agent_kv_manager_class = None  # type: ignore
+
+# Activity C: KVDrive tier-differentiated compression hook
+try:
+    from vllm_integration.attention_backend_patch import (
+        KVDriveTierCompressionConfig_c19,
+        KVDriveTierCompressionMixin,
+        apply_kvdrive_tier_compression_patch,
+        extend_cache_config_kvdrive,
+    )
+except Exception as _e_c19_attn:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity C attention hook import failed: {_e_c19_attn}",
+        RuntimeWarning,
+    )
+    KVDriveTierCompressionConfig_c19 = None      # type: ignore
+    KVDriveTierCompressionMixin = None           # type: ignore
+    apply_kvdrive_tier_compression_patch = None  # type: ignore
+    extend_cache_config_kvdrive = None           # type: ignore
+
+# Activity C codec
+try:
+    from vllm_integration.compression_codec import (
+        KVDriveTierDifferentiatedVllmCodec,
+        KVDriveCrossABCCodec,
+    )
+except Exception as _e_c19_codec:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity C codec import failed: {_e_c19_codec}",
+        RuntimeWarning,
+    )
+    KVDriveTierDifferentiatedVllmCodec = None  # type: ignore
+    KVDriveCrossABCCodec = None                # type: ignore
+
+# Config extension
+try:
+    from vllm_integration.cache_config_extension import (
+        KVDriveActivityABCConfig,
+        KVDriveActivityABCConfigMixin,
+        build_kvdrive_abc_config,
+    )
+except Exception as _e_cfg19:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 config extension import failed: {_e_cfg19}",
+        RuntimeWarning,
+    )
+    KVDriveActivityABCConfig = None      # type: ignore
+    KVDriveActivityABCConfigMixin = None  # type: ignore
+    build_kvdrive_abc_config = None      # type: ignore

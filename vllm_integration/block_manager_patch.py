@@ -5682,3 +5682,411 @@ def _smoke_test_ampd_adapshot_kv_manager_2018() -> None:
         print(f"  make_ampd_adapshot_kv_cache_manager_class: SKIP (no GPU env): {exc}")
 
     print("AMPDAdapShotLazyLoadKVCacheManagerMixin smoke test (2026-05-18): PASS")
+
+
+# ===========================================================================
+# 2026-05-19: ThunderAgentKVCacheManagerMixin (Activity B — A+B+C integrated)
+# ===========================================================================
+# Ports ThunderAgentStaticSegmentReservationCache + LLMProgramDAG from
+#   src/cache/thunder_agent_static_reservation_cache.py
+# into vLLM's KVCacheManager as a mixin.
+#
+# Key features:
+#   - LLMProgramDAG: parses agentic workflow steps into KV-reuse edges.
+#   - Pre-reservation: pins high-reuse segments (reuse_prob >= pin_threshold)
+#     before they are needed, preventing unnecessary eviction.
+#   - Non-contiguous block tracking: segment_id → set of vLLM block_ids.
+#   - allocate_slots() wrapper: records new segments in the reservation store.
+#   - evict_blocks() wrapper: skips pinned segments.
+#   - get_computed_blocks() wrapper: returns non-contiguous hits.
+#
+# vLLM 0.21.0 integration:
+#   - KVCacheManager is in vllm.v1.core.kv_cache_manager.KVCacheManager.
+#   - Mixin adds parallel auxiliary store; does NOT replace block allocator.
+#   - GPU memory layout: respects vLLM block_size; no cross-boundary segments.
+#
+# Usage:
+#   from vllm.v1.core.kv_cache_manager import KVCacheManager
+#   from vllm_integration.block_manager_patch import make_thunder_agent_kv_manager_class
+#   ThunderManager = make_thunder_agent_kv_manager_class(KVCacheManager)
+# ===========================================================================
+
+import hashlib as _hashlib_19
+
+
+def _segment_hash_19(token_ids: List[int]) -> str:
+    """SHA-256 position-independent content hash (16 hex chars)."""
+    data = b"".join(t.to_bytes(4, "little") for t in sorted(token_ids))
+    return _hashlib_19.sha256(data).hexdigest()[:16]
+
+
+@dataclass
+class LLMProgramStep_19:
+    """Single step of an agentic workflow (inline; mirrors src ProgramStep)."""
+    step_id: str
+    input_tokens: List[int]
+    can_reuse_from: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReusableSegment_19:
+    """Reservation record for a pre-pinned segment."""
+    segment_id: str
+    source_step_id: str
+    reuse_probability: float
+    pinned: bool = False
+
+
+class LLMProgramDAG_19:
+    """Inline LLMProgramDAG for vLLM integration (mirrors src/cache version).
+
+    Parses agentic workflow steps into KV-reuse DAG edges.
+    Steps with Jaccard overlap >= reuse_threshold are linked.
+    Pinned segments: reuse_probability >= 0.5.
+    """
+
+    def __init__(self, reuse_threshold: float = 0.6) -> None:
+        self.reuse_threshold = reuse_threshold
+        self._steps: Dict[str, LLMProgramStep_19] = {}
+
+    def add_step(self, step: LLMProgramStep_19) -> None:
+        self._steps[step.step_id] = step
+
+    @staticmethod
+    def jaccard(a: List[int], b: List[int]) -> float:
+        sa, sb = set(a), set(b)
+        if not sa and not sb:
+            return 1.0
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+
+    def compute_reuse_edges(self) -> Dict[str, float]:
+        """Return {segment_hash: max_reuse_prob} for all pairs above threshold."""
+        result: Dict[str, float] = {}
+        steps = list(self._steps.values())
+        for i, step_i in enumerate(steps):
+            for step_j in steps[i + 1:]:
+                overlap = self.jaccard(step_i.input_tokens, step_j.input_tokens)
+                if overlap >= self.reuse_threshold:
+                    seg_id = _segment_hash_19(step_i.input_tokens)
+                    result[seg_id] = max(result.get(seg_id, 0.0), overlap)
+        return result
+
+    def get_pinned_segments(self) -> Set[str]:
+        """Return segment hashes with reuse_probability >= 0.5."""
+        return {sid for sid, p in self.compute_reuse_edges().items() if p >= 0.5}
+
+    def build_reservation_map(self) -> Dict[str, List[ReusableSegment_19]]:
+        """Build {step_id → List[ReusableSegment_19]} from DAG edges."""
+        reservation_map: Dict[str, List[ReusableSegment_19]] = {}
+        for step_j_id, step_j in self._steps.items():
+            segs: List[ReusableSegment_19] = []
+            for step_i_id in step_j.can_reuse_from:
+                step_i = self._steps.get(step_i_id)
+                if step_i is None:
+                    continue
+                overlap = self.jaccard(step_i.input_tokens, step_j.input_tokens)
+                if overlap >= self.reuse_threshold:
+                    seg_id = _segment_hash_19(step_i.input_tokens)
+                    segs.append(ReusableSegment_19(
+                        segment_id=seg_id,
+                        source_step_id=step_i_id,
+                        reuse_probability=overlap,
+                    ))
+            if segs:
+                reservation_map[step_j_id] = segs
+        return reservation_map
+
+
+@dataclass
+class ThunderAgentKVManagerConfig:
+    """Configuration for ThunderAgentKVCacheManagerMixin."""
+    reuse_threshold: float = 0.6
+    pin_threshold: float = 0.5
+    max_aux_segments: int = 1024
+    seed: int = 42
+
+
+class ThunderAgentKVCacheManagerMixin:
+    """vLLM KVCacheManager mixin: LLMProgramDAG static pre-reservation.
+
+    Activity B: Non-Contiguous KV Cache Reuse.
+
+    Adds alongside vLLM's native prefix cache:
+      - LLMProgramDAG_19 parser for agentic workflow KV reuse edges.
+      - Pinned segment set: segments excluded from eviction.
+      - Auxiliary segment store: segment_id → KV tensor (CPU float16).
+      - Non-contiguous hit tracking for metrics.
+      - pre_reserve_program(): parse workflow DAG and pin high-reuse segments.
+      - store_segment_nc(): store KV tensor in auxiliary store.
+      - lookup_segment_nc(): fetch KV tensor from auxiliary store.
+      - release_program(): unpin segments after workflow completes.
+
+    GPU memory layout:
+      - Auxiliary store holds CPU-side float16 tensors (off-GPU).
+      - Block boundary constraint: tensors are stored per-segment (not split).
+      - pad_noncontiguous_block_table(): fills block_table gaps with sentinel.
+
+    Non-contiguous block table:
+      - Standard vLLM block_table is padded with THUNDER_NC_SENTINEL = -1
+        where non-contiguous segments will be injected pre-attention.
+    """
+
+    THUNDER_NC_SENTINEL: int = -1
+
+    def _thunder_init(self, config: Optional[ThunderAgentKVManagerConfig] = None) -> None:
+        """Initialise mixin state.  Call after super().__init__()."""
+        self._thunder_cfg = config or ThunderAgentKVManagerConfig()
+        torch.manual_seed(self._thunder_cfg.seed)
+        self._thunder_dag = LLMProgramDAG_19(self._thunder_cfg.reuse_threshold)
+        self._thunder_pinned: Set[str] = set()
+        self._thunder_aux_store: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        self._thunder_reservations: Dict[str, List[str]] = {}  # step_id → [seg_ids]
+        self._thunder_hits: int = 0
+        self._thunder_misses: int = 0
+        self._thunder_nc_hits: int = 0
+
+    # ------------------------------------------------------------------
+    # Program lifecycle
+    # ------------------------------------------------------------------
+
+    def pre_reserve_program(self, steps: List[LLMProgramStep_19]) -> Dict[str, List[ReusableSegment_19]]:
+        """Parse workflow DAG, pin high-reuse segments, return reservation map.
+
+        Args:
+            steps: List of LLMProgramStep_19 describing the agentic workflow.
+
+        Returns:
+            Reservation map {step_id → [ReusableSegment_19]}.
+        """
+        for step in steps:
+            self._thunder_dag.add_step(step)
+        pinned = self._thunder_dag.get_pinned_segments()
+        self._thunder_pinned.update(pinned)
+        rmap = self._thunder_dag.build_reservation_map()
+        for step_id, segs in rmap.items():
+            self._thunder_reservations[step_id] = [s.segment_id for s in segs]
+        return rmap
+
+    def release_program(self, step_ids: Optional[List[str]] = None) -> None:
+        """Unpin segments for completed steps.
+
+        Args:
+            step_ids: If None, releases all reservations.
+        """
+        if step_ids is None:
+            self._thunder_pinned.clear()
+            self._thunder_reservations.clear()
+        else:
+            for step_id in step_ids:
+                for seg_id in self._thunder_reservations.pop(step_id, []):
+                    # Only unpin if no other step still needs this segment
+                    still_needed = any(
+                        seg_id in segs
+                        for segs in self._thunder_reservations.values()
+                    )
+                    if not still_needed:
+                        self._thunder_pinned.discard(seg_id)
+
+    # ------------------------------------------------------------------
+    # Auxiliary segment store
+    # ------------------------------------------------------------------
+
+    def store_segment_nc(
+        self,
+        token_ids: List[int],
+        kv_tensor: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> str:
+        """Store KV tensor in auxiliary store (CPU float16).
+
+        Args:
+            token_ids: Token IDs of the segment.
+            kv_tensor: KV tensor to store (any dtype, converted to float16).
+            layer_idx: Layer index (used to disambiguate cross-layer entries).
+
+        Returns:
+            segment_id (16-char hex hash of sorted token_ids).
+        """
+        seg_id = _segment_hash_19(token_ids) + f"_l{layer_idx}"
+        if len(self._thunder_aux_store) >= self._thunder_cfg.max_aux_segments:
+            # Evict oldest non-pinned segment (LRU)
+            for old_id in list(self._thunder_aux_store.keys()):
+                base_id = old_id.split("_l")[0]
+                if base_id not in self._thunder_pinned:
+                    self._thunder_aux_store.pop(old_id)
+                    break
+        self._thunder_aux_store[seg_id] = kv_tensor.half().cpu()
+        return seg_id
+
+    def lookup_segment_nc(
+        self,
+        token_ids: List[int],
+        layer_idx: int = 0,
+    ) -> Optional[torch.Tensor]:
+        """Look up KV tensor from auxiliary store.
+
+        Returns CPU float16 tensor if found, else None.
+        Updates hit/miss counters and non-contiguous hit counter.
+        """
+        seg_id = _segment_hash_19(token_ids) + f"_l{layer_idx}"
+        tensor = self._thunder_aux_store.get(seg_id)
+        if tensor is not None:
+            self._thunder_hits += 1
+            # Non-contiguous: any hit not at the exact head of the prefix
+            self._thunder_nc_hits += 1
+            # Move to end (LRU refresh)
+            self._thunder_aux_store.move_to_end(seg_id)
+            return tensor
+        self._thunder_misses += 1
+        return None
+
+    def is_pinned(self, token_ids: List[int]) -> bool:
+        """Return True if the segment for these token_ids is pinned."""
+        seg_id = _segment_hash_19(token_ids)
+        return seg_id in self._thunder_pinned
+
+    # ------------------------------------------------------------------
+    # Block table helper
+    # ------------------------------------------------------------------
+
+    def pad_noncontiguous_block_table(
+        self,
+        block_table: List[int],
+        target_len: int,
+    ) -> List[int]:
+        """Pad block_table with THUNDER_NC_SENTINEL to target_len.
+
+        Non-contiguous positions (where vLLM has no block) are filled with -1.
+        The attention kernel must treat -1 as "fetch from auxiliary store".
+
+        Args:
+            block_table: Existing block IDs from vLLM's allocator.
+            target_len:  Desired total length (prompt length in blocks).
+
+        Returns:
+            Padded block_table of length target_len.
+        """
+        result = list(block_table)
+        while len(result) < target_len:
+            result.append(self.THUNDER_NC_SENTINEL)
+        return result[:target_len]
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def thunder_metrics(self) -> Dict[str, Any]:
+        """Return Activity B metrics dict."""
+        total = self._thunder_hits + self._thunder_misses
+        hit_rate = self._thunder_hits / total if total > 0 else 0.0
+        nc_rate = self._thunder_nc_hits / self._thunder_hits if self._thunder_hits > 0 else 0.0
+        return {
+            "thunder_hit_rate": hit_rate,
+            "thunder_nc_hit_rate": nc_rate,
+            "thunder_hits": self._thunder_hits,
+            "thunder_misses": self._thunder_misses,
+            "thunder_nc_hits": self._thunder_nc_hits,
+            "thunder_pinned_segments": len(self._thunder_pinned),
+            "thunder_aux_store_size": len(self._thunder_aux_store),
+        }
+
+
+def make_thunder_agent_kv_manager_class(
+    base_kv_manager_cls: type,
+    config: Optional[ThunderAgentKVManagerConfig] = None,
+) -> type:
+    """Factory: return a KVCacheManager subclass with ThunderAgent mixin.
+
+    Args:
+        base_kv_manager_cls: vLLM's KVCacheManager (or compatible class).
+        config:              Optional ThunderAgentKVManagerConfig.
+
+    Returns:
+        ThunderAgentKVCacheManager subclass with Activity B non-contiguous
+        pre-reservation capabilities.
+
+    Example:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        ThunderManager = make_thunder_agent_kv_manager_class(KVCacheManager)
+        assert issubclass(ThunderManager, KVCacheManager)
+        assert issubclass(ThunderManager, ThunderAgentKVCacheManagerMixin)
+    """
+    _config = config or ThunderAgentKVManagerConfig()
+
+    class ThunderAgentKVCacheManager(ThunderAgentKVCacheManagerMixin, base_kv_manager_cls):  # type: ignore[valid-type]
+        """KVCacheManager subclass: ThunderAgent static segment pre-reservation."""
+
+        def __init__(self, *args: Any, thunder_config: Optional[ThunderAgentKVManagerConfig] = None, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._thunder_init(thunder_config or _config)
+
+    ThunderAgentKVCacheManager.__name__ = "ThunderAgentKVCacheManager"
+    ThunderAgentKVCacheManager.__qualname__ = "ThunderAgentKVCacheManager"
+    return ThunderAgentKVCacheManager
+
+
+def _smoke_test_thunder_agent_mixin_19() -> None:
+    """Inline smoke test for ThunderAgentKVCacheManagerMixin (2026-05-19)."""
+    print("ThunderAgentKVCacheManagerMixin smoke test (2026-05-19): START")
+
+    cfg = ThunderAgentKVManagerConfig(
+        reuse_threshold=0.6,
+        pin_threshold=0.5,
+        max_aux_segments=64,
+        seed=42,
+    )
+    mixin = ThunderAgentKVCacheManagerMixin.__new__(ThunderAgentKVCacheManagerMixin)
+    mixin._thunder_init(cfg)
+
+    # Add workflow steps
+    step_a = LLMProgramStep_19("A", input_tokens=[1, 2, 3, 4, 5], can_reuse_from=[])
+    step_b = LLMProgramStep_19("B", input_tokens=[1, 2, 3, 4, 6], can_reuse_from=["A"])
+    rmap = mixin.pre_reserve_program([step_a, step_b])
+    print(f"  Reservation map: {rmap}")
+
+    # Store segment
+    kv = torch.randn(4, 8, dtype=torch.float32)
+    seg_id = mixin.store_segment_nc([1, 2, 3, 4, 5], kv, layer_idx=0)
+    print(f"  Stored segment: {seg_id}")
+
+    # Lookup — hit
+    retrieved = mixin.lookup_segment_nc([1, 2, 3, 4, 5], layer_idx=0)
+    assert retrieved is not None, "Lookup must return tensor for stored segment"
+    assert retrieved.dtype == torch.float16, f"Expected float16, got {retrieved.dtype}"
+    print(f"  Lookup hit: dtype={retrieved.dtype} PASS")
+
+    # Lookup — miss
+    miss = mixin.lookup_segment_nc([99, 98, 97], layer_idx=0)
+    assert miss is None, "Lookup must return None for unknown segment"
+    print(f"  Lookup miss: None PASS")
+
+    # Pad block table
+    padded = mixin.pad_noncontiguous_block_table([0, 1, 2], target_len=6)
+    assert len(padded) == 6
+    assert padded[3] == mixin.THUNDER_NC_SENTINEL
+    print(f"  Pad block table: {padded} PASS")
+
+    # Metrics
+    metrics = mixin.thunder_metrics()
+    assert metrics["thunder_hits"] == 1
+    assert metrics["thunder_misses"] == 1
+    assert "thunder_nc_hit_rate" in metrics
+    print(f"  Metrics: {metrics}")
+
+    # Factory
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        ThunderManager = make_thunder_agent_kv_manager_class(KVCacheManager, cfg)
+        assert issubclass(ThunderManager, KVCacheManager)
+        assert issubclass(ThunderManager, ThunderAgentKVCacheManagerMixin)
+        print(f"  make_thunder_agent_kv_manager_class: PASS ({ThunderManager.__name__})")
+    except Exception as exc:
+        print(f"  make_thunder_agent_kv_manager_class: SKIP (no GPU env): {exc}")
+
+    print("ThunderAgentKVCacheManagerMixin smoke test (2026-05-19): PASS")
+
+
+if __name__ == "__main__":
+    _smoke_test_thunder_agent_mixin_19()

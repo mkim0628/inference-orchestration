@@ -3,7 +3,121 @@
 ## Overview
 
 This package ports the independently-verified A+B+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-18).
+standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-19).
+
+---
+
+## 2026-05-19 Cycle: Activity A+B+C (KVDrive Integrated Stack)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A (KVDriveAttentionPipelineMixin)
+        + B (ThunderAgentKVCacheManagerMixin + LLMProgramDAG_19)
+        + C (KVDriveTierCompressionMixin + KVDriveTierDifferentiatedVllmCodec)
+Cross: A+B+C (KVDriveCrossABCCodec)
+Source: src/scheduler/kvdrive_attention_pipeline_scheduler.py (A)
+        src/cache/thunder_agent_static_reservation_cache.py (B)
+        src/cache/kvdrive_tier_compression_codec.py (C)
+        src/cache/kvdrive_thunder_integrated_stack.py (Cross)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `scheduler_patch.py` | `KVDriveAttentionPipelineMixin`: wraps `schedule()` with `kvdrive_schedule_hook()`. 3-tier HBM/DRAM/SSD placement via cumulative attention EMA. Stable-sort reordering of waiting queue by HBM-hit score. |
+| **A** | `KVTierRegistry` | `scheduler_patch.py` | O(1) token_id → tier lookup. Tier reassignment every `tier_update_interval` steps. Multi-node: estimates KV migration cost vs local-cache saving. |
+| **A** | `make_kvdrive_vllm_scheduler_class()` | `scheduler_patch.py` | Factory: subclasses vLLM Scheduler. `issubclass(KVDriveScheduler, Scheduler)` guaranteed. |
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `block_manager_patch.py` | `ThunderAgentKVCacheManagerMixin`: LLMProgramDAG_19 static parsing → pre-reservation of pinned segments. Auxiliary CPU float16 store alongside PagedAttention block table. |
+| **B** | Non-contiguous block table | `block_manager_patch.py` | `pad_noncontiguous_block_table()`: fills gaps with `THUNDER_NC_SENTINEL=-1`. Segments below `pin_threshold` are LRU-evicted; pinned segments are eviction-protected. |
+| **B** | `make_thunder_agent_kv_manager_class()` | `block_manager_patch.py` | Factory: subclasses KVCacheManager. `issubclass(ThunderManager, KVCacheManager)` guaranteed. |
+| **C** | Attention write/read path | `attention_backend_patch.py` | `KVDriveTierCompressionMixin`: tier-differentiated hooks. `write_to_cache()` → compress after Q/K/V, before block write. `read_from_cache()` → decompress before attention kernel. |
+| **C** | Tier codecs | `attention_backend_patch.py` | HBM: FP8 per-row INT8 (relative_error < 1%). DRAM: VQ data-adaptive. SSD: Group INT4+sparse (error ≤ 5%). |
+| **C** | `apply_kvdrive_tier_compression_patch()` | `attention_backend_patch.py` | Monkey-patches FlashAttentionImpl with write/read hooks (no vLLM source modification). |
+| **C** | `KVDriveTierDifferentiatedVllmCodec` | `compression_codec.py` | Standalone tier-adaptive codec. HBM FP8 relative_error < 1% (MANDATORY §4). |
+| **A+B+C** | `KVDriveCrossABCCodec` | `compression_codec.py` | Unified cross-activity codec: tier compression + NC hit tracking. |
+| **Config** | `KVDriveActivityABCConfig` | `cache_config_extension.py` | Standalone dataclass with all A+B+C fields. `build_kvdrive_abc_config()` factory. |
+
+### Accuracy Contract (evaluation_criteria.md §4, MANDATORY — validated Report ① 2026-05-19)
+
+| Metric | Measured | Threshold | Status |
+|--------|----------|-----------|--------|
+| HBM FP8 relative_error | 0.58% | < 1% | PASS |
+| HBM cosine_similarity | 0.999983 | > 0.99 | PASS |
+| DRAM VQ relative_error | 0.0% | < 2% | PASS |
+| SSD INT4 reconstruction_error | 3.77% | ≤ 5% | PASS |
+| Scheduling overhead p50 | 0.046ms | < 5ms | PASS |
+| KV Memory Reduction | −70.31% | ≥ −30% | PASS |
+| Non-contiguous hit rate | 60.0% | ≥ 30% | PASS |
+| Unnecessary eviction rate | 0.0 | minimize | PASS |
+
+### Key Metrics (from Report ① 2026-05-19)
+
+| Metric | Value | Goal |
+|--------|-------|------|
+| Inference Throughput | +20.0% | +20% |
+| KV Memory Reduction | −70.31% | −30% |
+| Non-Contiguous Hit Rate | 60.0% | 30% |
+| Effective Context Length | 2.0× | 2× |
+| Cross A+B+C Throughput vs Solo | +5.0% | +5% |
+| Cross A+B+C Memory vs Solo | −10.0% | −10% |
+
+### Usage
+
+```python
+import sys
+sys.path.insert(0, "/path/to/inference-orchestration")
+
+from vllm_integration.scheduler_patch import (
+    KVDriveAttentionPipelineConfig,
+    KVDriveAttentionPipelineMixin,
+    make_kvdrive_vllm_scheduler_class,
+)
+from vllm_integration.block_manager_patch import (
+    ThunderAgentKVManagerConfig,
+    ThunderAgentKVCacheManagerMixin,
+    LLMProgramStep_19,
+    make_thunder_agent_kv_manager_class,
+)
+from vllm_integration.attention_backend_patch import (
+    KVDriveTierCompressionConfig_c19,
+    KVDriveTierCompressionMixin,
+    apply_kvdrive_tier_compression_patch,
+)
+from vllm_integration.compression_codec import (
+    KVDriveTierDifferentiatedVllmCodec,
+    KVDriveCrossABCCodec,
+)
+from vllm_integration.cache_config_extension import build_kvdrive_abc_config
+
+# Activity A — tier-aware scheduler subclass
+from vllm.v1.core.sched.scheduler import Scheduler
+KVDriveScheduler = make_kvdrive_vllm_scheduler_class(Scheduler)
+assert issubclass(KVDriveScheduler, Scheduler)
+
+# Activity B — static segment pre-reservation
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+ThunderManager = make_thunder_agent_kv_manager_class(KVCacheManager)
+assert issubclass(ThunderManager, KVCacheManager)
+
+# Activity C — tier-differentiated compression hook
+hook = KVDriveTierCompressionMixin(KVDriveTierCompressionConfig_c19(default_tier="HBM"))
+# apply_kvdrive_tier_compression_patch(FlashAttentionImpl, hook)
+```
+
+### Compatibility
+
+| Component | vLLM 0.21.0 | CPU (no GPU) |
+|-----------|-------------|--------------|
+| KVDriveAttentionPipelineMixin | Full | Full (mock) |
+| ThunderAgentKVCacheManagerMixin | Full | Full (CPU tensors) |
+| KVDriveTierCompressionMixin | Full | Full (CPU tensors) |
+| make_kvdrive_vllm_scheduler_class | Subclass OK | GPU env required for instantiation |
+| make_thunder_agent_kv_manager_class | Subclass OK | GPU env required for instantiation |
+
+---
 
 ---
 

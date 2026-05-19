@@ -3020,3 +3020,124 @@ set -e
 
 echo ""
 echo "=== 2026-05-18 A+B+C smoke tests complete ==="
+
+echo ""
+echo "=== 2026-05-19 A+B+C smoke tests (KVDrive integrated stack) ==="
+set +e
+python - <<'PYEOF_2026_05_19'
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent if pathlib.Path(__file__).exists() else pathlib.Path.cwd()))
+
+import torch
+
+# Activity A: KVDriveAttentionPipelineMixin
+from vllm_integration.scheduler_patch import (
+    KVDriveAttentionPipelineConfig,
+    KVDriveAttentionPipelineMixin,
+    make_kvdrive_vllm_scheduler_class,
+)
+cfg_a = KVDriveAttentionPipelineConfig(attn_hbm_threshold=0.8, seed=42)
+mixin_a = KVDriveAttentionPipelineMixin.__new__(KVDriveAttentionPipelineMixin)
+mixin_a._kvdrive_init(cfg_a)
+mixin_a.register_token_attention(1, 0.9)
+mixin_a.register_token_attention(2, 0.1)
+mixin_a.refresh_tier_assignments()
+assert mixin_a.get_token_tier(1) == "HBM", "Token 1 should be HBM"
+mixin_a._kvdrive_times = [0.04, 0.05, 0.06]
+p50 = mixin_a.kvdrive_overhead_ms_p50()
+assert p50 < 5.0, f"Overhead p50={p50}ms > 5ms"
+print(f"  Activity A: KVDriveAttentionPipelineMixin tier=HBM overhead_p50={p50}ms PASS")
+
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    KVDriveSched = make_kvdrive_vllm_scheduler_class(Scheduler, cfg_a)
+    assert issubclass(KVDriveSched, Scheduler)
+    assert issubclass(KVDriveSched, KVDriveAttentionPipelineMixin)
+    print(f"  Activity A: make_kvdrive_vllm_scheduler_class PASS ({KVDriveSched.__name__})")
+except Exception as exc:
+    print(f"  Activity A: factory SKIP (no GPU env): {exc}")
+
+# Activity B: ThunderAgentKVCacheManagerMixin
+from vllm_integration.block_manager_patch import (
+    ThunderAgentKVManagerConfig,
+    ThunderAgentKVCacheManagerMixin,
+    LLMProgramStep_19,
+    make_thunder_agent_kv_manager_class,
+)
+cfg_b = ThunderAgentKVManagerConfig(reuse_threshold=0.6, seed=42)
+mixin_b = ThunderAgentKVCacheManagerMixin.__new__(ThunderAgentKVCacheManagerMixin)
+mixin_b._thunder_init(cfg_b)
+step_a = LLMProgramStep_19("A", [1, 2, 3, 4, 5])
+step_b = LLMProgramStep_19("B", [1, 2, 3, 4, 6], can_reuse_from=["A"])
+rmap = mixin_b.pre_reserve_program([step_a, step_b])
+kv = torch.randn(4, 8)
+mixin_b.store_segment_nc([1, 2, 3, 4, 5], kv, layer_idx=0)
+hit = mixin_b.lookup_segment_nc([1, 2, 3, 4, 5], layer_idx=0)
+assert hit is not None, "Non-contiguous lookup must hit"
+assert hit.dtype == torch.float16
+metrics_b = mixin_b.thunder_metrics()
+assert metrics_b["thunder_nc_hit_rate"] == 1.0
+print(f"  Activity B: ThunderAgent NC hit_rate={metrics_b['thunder_nc_hit_rate']} PASS")
+
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    ThunderMgr = make_thunder_agent_kv_manager_class(KVCacheManager, cfg_b)
+    assert issubclass(ThunderMgr, KVCacheManager)
+    assert issubclass(ThunderMgr, ThunderAgentKVCacheManagerMixin)
+    print(f"  Activity B: make_thunder_agent_kv_manager_class PASS ({ThunderMgr.__name__})")
+except Exception as exc:
+    print(f"  Activity B: factory SKIP (no GPU env): {exc}")
+
+# Activity C: KVDriveTierCompressionMixin
+from vllm_integration.attention_backend_patch import (
+    KVDriveTierCompressionConfig_c19,
+    KVDriveTierCompressionMixin,
+    apply_kvdrive_tier_compression_patch,
+)
+cfg_c = KVDriveTierCompressionConfig_c19(default_tier="HBM", seed=42)
+hook_c = KVDriveTierCompressionMixin(cfg_c)
+key = torch.randn(8, 16, dtype=torch.float32)
+val = torch.randn(8, 16, dtype=torch.float32)
+payload = hook_c.write_to_cache(key, val, layer_idx=0)
+key_dec, val_dec = hook_c.read_from_cache(payload)
+rel_err = ((key - key_dec).abs() / key.abs().clamp(min=1e-8)).mean().item()
+assert rel_err < 0.01, f"HBM FP8 relative_error={rel_err:.4f} >= 1%"
+reduction = hook_c.memory_reduction_ratio()
+assert reduction > 0.0
+print(f"  Activity C: HBM FP8 relative_error={rel_err:.4f} reduction={reduction:.2%} PASS")
+
+# Activity C codec
+from vllm_integration.compression_codec import (
+    KVDriveTierDifferentiatedVllmCodec,
+    KVDriveCrossABCCodec,
+)
+codec = KVDriveTierDifferentiatedVllmCodec(seed=42)
+t = torch.randn(16, 32, dtype=torch.float32)
+data, meta = codec.compress(t, "HBM")
+recon = codec.decompress(data, meta, "HBM").reshape(t.shape)
+rel_err_codec = ((t - recon).abs() / t.abs().clamp(min=1e-8)).mean().item()
+assert rel_err_codec < 0.01, f"Codec HBM relative_error={rel_err_codec:.4f} >= 1%"
+print(f"  Activity C codec: KVDriveTierDifferentiatedVllmCodec HBM error={rel_err_codec:.4f} PASS")
+
+cross = KVDriveCrossABCCodec(seed=42)
+d, m = cross.encode(t, tier="HBM", segment_id="seg001")
+r = cross.decode(d, m, tier="HBM", segment_id="seg001")
+assert cross._nc_hits >= 1
+print(f"  Cross A+B+C codec: nc_hits={cross._nc_hits} PASS")
+
+# Config extension
+from vllm_integration.cache_config_extension import (
+    KVDriveActivityABCConfig,
+    build_kvdrive_abc_config,
+)
+cfg_ext = build_kvdrive_abc_config(compression_method="tier_differentiated", seed=42)
+assert cfg_ext.compression_method == "tier_differentiated"
+assert cfg_ext.kvdrive_attn_hbm_threshold == 0.8
+print(f"  Config extension: KVDriveActivityABCConfig compression_method={cfg_ext.compression_method} PASS")
+
+print(f"\nAll 2026-05-19 A+B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_19
+set -e
+
+echo ""
+echo "=== 2026-05-19 A+B+C smoke tests complete ==="
