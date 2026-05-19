@@ -1,0 +1,24 @@
+experiment:
+  date: "2026-05-19"
+  activity: "A+B+C"
+  cache_type: "kvdrive_thunder_integrated"
+  compression_method: "tier_differentiated"
+  scheduler_type: "kvdrive_attention_pipeline"
+
+scheduler:
+  attn_hbm_threshold: 0.8
+  attn_dram_threshold: 0.3
+  local_window_size: 512
+  tier_update_interval: 32
+  enable_multinode: false
+
+compression:
+  hbm_method: "fp8_rowwise"
+  dram_method: "vq_8bit"
+  ssd_method: "int4_sparse"
+  ssd_sparsification_threshold: 0.01
+
+cache:
+  max_entries: 512
+  reuse_probability_threshold: 0.5
+  jaccard_threshold: 0.6
