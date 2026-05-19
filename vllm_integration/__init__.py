@@ -135,6 +135,71 @@ from __future__ import annotations
 import warnings
 from typing import Any, Optional
 
+# 2026-05-18 imports (Activity A+B+C)
+try:
+    from vllm_integration.scheduler_patch import (
+        AMPDLazySegmentFetchSchedulerConfig,
+        AMPDLazySegmentFetchSchedulerMixin,
+        make_ampd_lazy_segment_fetch_scheduler_class,
+    )
+except Exception as _e_a18:
+    import warnings as _warnings_18a
+    _warnings_18a.warn(
+        f"vllm_integration: 2026-05-18 Activity A import failed: {_e_a18}",
+        RuntimeWarning,
+    )
+    AMPDLazySegmentFetchSchedulerConfig = None  # type: ignore
+    AMPDLazySegmentFetchSchedulerMixin = None   # type: ignore
+    make_ampd_lazy_segment_fetch_scheduler_class = None  # type: ignore
+
+try:
+    from vllm_integration.block_manager_patch import (
+        AMPDAdapShotKVManagerConfig,
+        AMPDAdapShotLazyLoadKVCacheManagerMixin,
+        make_ampd_adapshot_kv_cache_manager_class,
+    )
+except Exception as _e_b18:
+    import warnings as _warnings_18b
+    _warnings_18b.warn(
+        f"vllm_integration: 2026-05-18 Activity B import failed: {_e_b18}",
+        RuntimeWarning,
+    )
+    AMPDAdapShotKVManagerConfig = None              # type: ignore
+    AMPDAdapShotLazyLoadKVCacheManagerMixin = None  # type: ignore
+    make_ampd_adapshot_kv_cache_manager_class = None  # type: ignore
+
+try:
+    from vllm_integration.attention_backend_patch import (
+        DPAttentionAwareCompressionConfig_c18,
+        DPAttentionAwareCompressionAttentionHook,
+        extend_cache_config_dp_attn_aware_compression,
+        apply_dp_attn_aware_compression_patch,
+    )
+except Exception as _e_c18:
+    import warnings as _warnings_18c
+    _warnings_18c.warn(
+        f"vllm_integration: 2026-05-18 Activity C attention hook import failed: {_e_c18}",
+        RuntimeWarning,
+    )
+    DPAttentionAwareCompressionConfig_c18 = None     # type: ignore
+    DPAttentionAwareCompressionAttentionHook = None  # type: ignore
+    extend_cache_config_dp_attn_aware_compression = None  # type: ignore
+    apply_dp_attn_aware_compression_patch = None     # type: ignore
+
+try:
+    from vllm_integration.compression_codec import (
+        DPAttentionAwareVllmCodec,
+        DPAttentionCrossABCCodec,
+    )
+except Exception as _e_cc18:
+    import warnings as _warnings_18cc
+    _warnings_18cc.warn(
+        f"vllm_integration: 2026-05-18 Activity C codec import failed: {_e_cc18}",
+        RuntimeWarning,
+    )
+    DPAttentionAwareVllmCodec = None   # type: ignore
+    DPAttentionCrossABCCodec = None    # type: ignore
+
 # 2026-05-16 imports (Activity A+C)
 try:
     from vllm_integration.scheduler_patch import (
@@ -307,6 +372,19 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-18
+    "AMPDLazySegmentFetchSchedulerConfig",
+    "AMPDLazySegmentFetchSchedulerMixin",
+    "make_ampd_lazy_segment_fetch_scheduler_class",
+    "AMPDAdapShotKVManagerConfig",
+    "AMPDAdapShotLazyLoadKVCacheManagerMixin",
+    "make_ampd_adapshot_kv_cache_manager_class",
+    "DPAttentionAwareCompressionConfig_c18",
+    "DPAttentionAwareCompressionAttentionHook",
+    "extend_cache_config_dp_attn_aware_compression",
+    "apply_dp_attn_aware_compression_patch",
+    "DPAttentionAwareVllmCodec",
+    "DPAttentionCrossABCCodec",
     # 2026-05-16
     "NAtHDDROffloadingSchedulerConfig",
     "NAtHDDROffloadingSchedulerMixin",
@@ -354,3 +432,91 @@ __all__ = [
     "make_kvp_vq_kv_cache_manager_class",
     "make_kvp_segment_scheduler_class",
 ]
+
+# ===========================================================================
+# 2026-05-19 imports (Activity A+B+C — KVDrive integrated stack)
+# ===========================================================================
+
+# Activity A: KVDrive attention-pipeline scheduler
+try:
+    from vllm_integration.scheduler_patch import (
+        KVDriveAttentionPipelineConfig,
+        KVDriveAttentionPipelineMixin,
+        make_kvdrive_vllm_scheduler_class,
+    )
+except Exception as _e_a19:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity A import failed: {_e_a19}",
+        RuntimeWarning,
+    )
+    KVDriveAttentionPipelineConfig = None  # type: ignore
+    KVDriveAttentionPipelineMixin = None   # type: ignore
+    make_kvdrive_vllm_scheduler_class = None  # type: ignore
+
+# Activity B: ThunderAgent static segment reservation
+try:
+    from vllm_integration.block_manager_patch import (
+        ThunderAgentKVManagerConfig,
+        ThunderAgentKVCacheManagerMixin,
+        LLMProgramDAG_19,
+        LLMProgramStep_19,
+        make_thunder_agent_kv_manager_class,
+    )
+except Exception as _e_b19:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity B import failed: {_e_b19}",
+        RuntimeWarning,
+    )
+    ThunderAgentKVManagerConfig = None      # type: ignore
+    ThunderAgentKVCacheManagerMixin = None  # type: ignore
+    LLMProgramDAG_19 = None                 # type: ignore
+    LLMProgramStep_19 = None                # type: ignore
+    make_thunder_agent_kv_manager_class = None  # type: ignore
+
+# Activity C: KVDrive tier-differentiated compression hook
+try:
+    from vllm_integration.attention_backend_patch import (
+        KVDriveTierCompressionConfig_c19,
+        KVDriveTierCompressionMixin,
+        apply_kvdrive_tier_compression_patch,
+        extend_cache_config_kvdrive,
+    )
+except Exception as _e_c19_attn:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity C attention hook import failed: {_e_c19_attn}",
+        RuntimeWarning,
+    )
+    KVDriveTierCompressionConfig_c19 = None      # type: ignore
+    KVDriveTierCompressionMixin = None           # type: ignore
+    apply_kvdrive_tier_compression_patch = None  # type: ignore
+    extend_cache_config_kvdrive = None           # type: ignore
+
+# Activity C codec
+try:
+    from vllm_integration.compression_codec import (
+        KVDriveTierDifferentiatedVllmCodec,
+        KVDriveCrossABCCodec,
+    )
+except Exception as _e_c19_codec:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 Activity C codec import failed: {_e_c19_codec}",
+        RuntimeWarning,
+    )
+    KVDriveTierDifferentiatedVllmCodec = None  # type: ignore
+    KVDriveCrossABCCodec = None                # type: ignore
+
+# Config extension
+try:
+    from vllm_integration.cache_config_extension import (
+        KVDriveActivityABCConfig,
+        KVDriveActivityABCConfigMixin,
+        build_kvdrive_abc_config,
+    )
+except Exception as _e_cfg19:
+    warnings.warn(
+        f"vllm_integration: 2026-05-19 config extension import failed: {_e_cfg19}",
+        RuntimeWarning,
+    )
+    KVDriveActivityABCConfig = None      # type: ignore
+    KVDriveActivityABCConfigMixin = None  # type: ignore
+    build_kvdrive_abc_config = None      # type: ignore

@@ -1,0 +1,77 @@
+experiment:
+  date: "2026-05-18"
+  activity: "A+B+C"
+  description: >
+    A-1 AMPDLazySegmentFetchScheduler (AMPD pull-on-demand segment lazy fetch scheduler) +
+    B-1 AMPDAdapShotLazyLoadPipeline (lazy load + AdapShot RoPE reencoding async overlap) +
+    C-1 DPAttentionAwareCompressionSelector (DP Attention-aware environment-adaptive compression) +
+    Cross-1 AMPDPrefillShareNonContiguousStack (A+B+C 5-stage unified stack)
+  cache_type: ampd_adapshot_lazy_pipeline
+  compression_method: dp_attention_aware
+  scheduler_type: ampd_lazy_segment_fetch
+
+ampd_lazy_segment_fetch_scheduler:
+  hbm_fetch_latency_ms: 0.01
+  ddr_fetch_latency_ms: 0.5
+  remote_fetch_latency_ms: 5.0
+  metadata_overhead_max_ms: 0.1     # metadata delivery overhead upper bound (MANDATORY)
+  max_concurrent_fetches: 8
+  seed: 42
+
+ampd_adapshot_lazy_pipeline:
+  chunk_size: 128
+  max_entries: 1000
+  rope_theta: 10000.0               # AdapShot RoPE base frequency
+  n_heads: 8
+  d_head: 64
+  companion_hit_threshold: 2        # companion segment prefetch threshold
+  seed: 42
+
+dp_attention_aware_compression:
+  dp_attn_enabled: false            # overridden by DP_ATTN_ENABLED="1" env var
+  n_gpus: 1                         # overridden by auto_detect_gpus=true
+  auto_detect_gpus: true
+  single_gpu_codec: "global_retention"   # single GPU: GlobalRetentionGateEvictionCodec
+  dp_attn_codec: "global_retention"      # DP Attention active: same codec, lower intensity
+  dp_attn_compression_skip_threshold: 0.5
+  max_entries: 1000
+  seed: 42
+
+ampd_prefill_share_stack:
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    proxy_tolerance: 0.01            # 1% attention output error limit (MANDATORY)
+    kl_tolerance: 0.015
+    cosine_min: 0.99
+    perplexity_dataset: "wikitext-2"
+    perplexity_tolerance_pct: 1.0    # ±1% (MANDATORY)
+    task_accuracy_tolerance_pct: 1.0
+  dp_attn_experiment_matrix:
+    dp_attn_states: [true, false]
+    codec_names: ["none", "global_retention", "fibquant", "spkv"]
+    n_gpus_list: [1, 2, 4]
+    output_file: "results/2026-05-18/dp_attn_compression_matrix.json"
+  activity_a:
+    ttft_overhead_limit_pct: 5.0     # TTFT p50 +5% (MANDATORY)
+    metadata_overhead_max_ms: 0.1    # < 0.1ms/request (MANDATORY)
+    unnecessary_transfer_ratio_target: 0.40
+  activity_b:
+    noncontiguous_hit_rate_min: 0.30  # ≥ 30% of all hits (MANDATORY)
+    kv_memory_footprint_increase_max: 0.20
+  activity_c:
+    memory_reduction_min: 0.30       # −30% (MANDATORY)
+    effective_context_multiplier: 2.0
+    compression_overhead_ttft_max_pct: 10.0
+  throughput:
+    target_improvement_pct: 20       # +20%
+  cross_abc_comparison:
+    methods: ["solo_a1", "solo_b1", "solo_c1", "cross_combined"]
+    throughput_min_improvement_vs_solo: 5.0   # +5% (§5)
+    memory_min_improvement_vs_solo: 10.0      # −10% (§5)
+    accuracy_cosine_min: 0.99                 # §5 C included, MANDATORY
+
+seed: 42
+results_dir: "results/2026-05-18"

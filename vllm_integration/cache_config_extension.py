@@ -205,3 +205,112 @@ def build_sign_vq_index(
         max_entries=params.max_entries,
         hamming_threshold=params.hamming_threshold,
     )
+
+
+# ===========================================================================
+# 2026-05-19: KVDriveActivityABCConfig (Activity A+B+C — config extension)
+# ===========================================================================
+# Extends CacheConfig with fields needed for the 2026-05-19 A+B+C cycle.
+#
+# Fields added:
+#   compression_method: str = "tier_differentiated"
+#   kvdrive_attn_hbm_threshold: float = 0.8
+#   kvdrive_local_window_size: int = 512
+#   thunder_reuse_threshold: float = 0.6
+#   thunder_pin_threshold: float = 0.5
+#   thunder_max_aux_segments: int = 1024
+#   kvdrive_enable_multinode: bool = False
+#
+# Does NOT modify vLLM CacheConfig; uses standalone dataclass + mixin pattern.
+# ===========================================================================
+
+from dataclasses import dataclass as _dc_19, field as _field_19
+from typing import Optional as _Opt_19
+
+
+@_dc_19
+class KVDriveActivityABCConfig:
+    """Standalone config for the 2026-05-19 A+B+C integrated cycle.
+
+    Carries all new fields required by:
+      - Activity A (KVDriveAttentionPipelineMixin): tier thresholds, multinode flag.
+      - Activity B (ThunderAgentKVCacheManagerMixin): DAG reuse/pin thresholds.
+      - Activity C (KVDriveTierCompressionMixin): compression_method, FP8 flag.
+
+    Usage:
+        from vllm_integration.cache_config_extension import KVDriveActivityABCConfig
+        cfg = KVDriveActivityABCConfig()
+        # Pass alongside vLLM's CacheConfig
+    """
+    # Activity C
+    compression_method: str = "tier_differentiated"
+    kvdrive_fp8_enabled: bool = True
+    kvdrive_vq_n_codes: int = 256
+    kvdrive_vq_code_dim: int = 8
+    kvdrive_int4_group_size: int = 2
+    kvdrive_int4_zero_threshold: float = 0.01
+
+    # Activity A
+    kvdrive_attn_hbm_threshold: float = 0.80
+    kvdrive_attn_dram_threshold: float = 0.30
+    kvdrive_local_window_size: int = 512
+    kvdrive_tier_update_interval: int = 32
+    kvdrive_enable_multinode: bool = False
+    kvdrive_multinode_migration_cost_ms: float = 2.0
+
+    # Activity B
+    thunder_reuse_threshold: float = 0.6
+    thunder_pin_threshold: float = 0.5
+    thunder_max_aux_segments: int = 1024
+
+    # Common
+    seed: int = 42
+
+
+class KVDriveActivityABCConfigMixin:
+    """Mixin for engine-level configs needing A+B+C KVDrive parameters.
+
+    Usage:
+        class MyEngineConfig(KVDriveActivityABCConfigMixin, VllmConfig):
+            pass
+        cfg = MyEngineConfig()
+        cfg.kvdrive.compression_method  # => "tier_differentiated"
+    """
+
+    def __init__(self, *args: object, kvdrive: _Opt_19[KVDriveActivityABCConfig] = None, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[call-arg]
+        self.kvdrive: KVDriveActivityABCConfig = kvdrive or KVDriveActivityABCConfig()
+
+
+def build_kvdrive_abc_config(
+    compression_method: str = "tier_differentiated",
+    hbm_threshold: float = 0.80,
+    local_window_size: int = 512,
+    enable_multinode: bool = False,
+    thunder_reuse_threshold: float = 0.6,
+    thunder_pin_threshold: float = 0.5,
+    seed: int = 42,
+) -> KVDriveActivityABCConfig:
+    """Convenience factory for KVDriveActivityABCConfig.
+
+    Args:
+        compression_method:      "tier_differentiated" | "kvdrive_cross_abc".
+        hbm_threshold:           Activity A HBM tier threshold.
+        local_window_size:       Recent tokens always in HBM.
+        enable_multinode:        Enable multi-node KV migration routing.
+        thunder_reuse_threshold: Activity B DAG reuse threshold.
+        thunder_pin_threshold:   Activity B pin probability threshold.
+        seed:                    RNG seed for reproducibility.
+
+    Returns:
+        Fully-initialised KVDriveActivityABCConfig.
+    """
+    return KVDriveActivityABCConfig(
+        compression_method=compression_method,
+        kvdrive_attn_hbm_threshold=hbm_threshold,
+        kvdrive_local_window_size=local_window_size,
+        kvdrive_enable_multinode=enable_multinode,
+        thunder_reuse_threshold=thunder_reuse_threshold,
+        thunder_pin_threshold=thunder_pin_threshold,
+        seed=seed,
+    )

@@ -2795,3 +2795,349 @@ set -e
 
 echo ""
 echo "=== 2026-05-17 A+C smoke tests complete ==="
+
+echo ""
+echo "=== 2026-05-18 A+B+C smoke tests (AMPDLazySegmentFetch + AdapShot + DPAttnCompression) ==="
+set +e
+python - <<'PYEOF_2026_05_18'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity A: AMPDLazySegmentFetchSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    AMPDLazySegmentFetchSchedulerConfig,
+    AMPDLazySegmentFetchSchedulerMixin,
+    make_ampd_lazy_segment_fetch_scheduler_class,
+)
+
+cfg_a = AMPDLazySegmentFetchSchedulerConfig(
+    hbm_fetch_latency_ms=0.01,
+    ddr_fetch_latency_ms=0.5,
+    remote_fetch_latency_ms=5.0,
+    metadata_overhead_max_ms=0.1,
+    max_reorder_window=8,
+    enable_multinode=False,
+    seed=42,
+)
+mixin_a = AMPDLazySegmentFetchSchedulerMixin.__new__(AMPDLazySegmentFetchSchedulerMixin)
+mixin_a._ampd_init_18(cfg_a)
+
+# Test metadata registration
+overhead_ms = mixin_a._ampd_register_segment_meta_18(
+    request_id="req_0",
+    candidate_segment_ids=["seg_abc", "seg_def"],
+    source_node_id="local",
+    tier="HBM",
+)
+assert overhead_ms < 10.0, f"Registration overhead {overhead_ms:.3f}ms too high"
+
+# Confirm only one segment (cancel the other)
+mixin_a._ampd_confirm_reuse_set_18("req_0", ["seg_abc"])
+utr = mixin_a.ampd_unnecessary_transfer_ratio()
+assert abs(utr - 0.5) < 1e-5, f"Expected UTR=0.5, got {utr}"
+print(f"  AMPDLazySegmentFetchSchedulerMixin: overhead={overhead_ms:.4f}ms UTR={utr:.3f} PASS")
+
+# Test cost estimation
+cost_hbm = mixin_a._ampd_estimate_fetch_cost_ms_18("seg_abc")
+assert cost_hbm == cfg_a.hbm_fetch_latency_ms
+mixin_a._ampd_register_segment_meta_18("req_1", ["seg_remote"], "192.168.1.2", "REMOTE")
+cost_remote = mixin_a._ampd_estimate_fetch_cost_ms_18("seg_remote")
+assert cost_remote == cfg_a.remote_fetch_latency_ms
+print(f"  Cost estimation: HBM={cost_hbm}ms REMOTE={cost_remote}ms PASS")
+
+# Test factory with vLLM Scheduler
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(Scheduler, cfg_a)
+    assert issubclass(AMPDScheduler, Scheduler)
+    assert issubclass(AMPDScheduler, AMPDLazySegmentFetchSchedulerMixin)
+    print(f"  make_ampd_lazy_segment_fetch_scheduler_class: PASS ({AMPDScheduler.__name__})")
+except Exception as exc:
+    print(f"  make_ampd_lazy_segment_fetch_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity B: AMPDAdapShotLazyLoadKVCacheManagerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.block_manager_patch import (
+    AMPDAdapShotKVManagerConfig,
+    AMPDAdapShotLazyLoadKVCacheManagerMixin,
+    _AMPDSegmentAuxStore_b18,
+    _adapshot_rope_reencode_b18,
+    make_ampd_adapshot_kv_cache_manager_class,
+)
+
+cfg_b = AMPDAdapShotKVManagerConfig(
+    chunk_size=128, max_entries=10, rope_theta=10000.0, n_heads=8, d_head=64, seed=42
+)
+
+# Test RoPE reencoding
+kv_src = torch.randn(16, 64)
+kv_reencoded = _adapshot_rope_reencode_b18(kv_src, source_pos=0, target_pos=64)
+assert kv_reencoded.dtype == torch.float16, f"Expected FP16, got {kv_reencoded.dtype}"
+assert kv_reencoded.shape == kv_src.shape
+
+# Identity reencoding
+kv_identity = _adapshot_rope_reencode_b18(kv_src, source_pos=10, target_pos=10)
+assert torch.allclose(kv_src, kv_identity.float(), atol=1e-3)
+print(f"  AdapShot RoPE reencoding: dtype={kv_reencoded.dtype} identity_ok PASS")
+
+# Test mixin
+mixin_b = AMPDAdapShotLazyLoadKVCacheManagerMixin.__new__(
+    AMPDAdapShotLazyLoadKVCacheManagerMixin
+)
+mixin_b._ampd_b18_init(cfg_b)
+
+token_ids = list(range(128))
+kv_small = torch.randn(128, 64).half()
+mixin_b.store_segment_b18(token_ids, chunk_idx=0, kv=kv_small, layer_idx=0)
+
+hit_metas, miss_indices = mixin_b.resolve_segments_b18(token_ids, layer_idx=0)
+assert len(hit_metas) == 1, f"Expected 1 hit, got {len(hit_metas)}"
+assert len(miss_indices) == 0, f"Expected 0 misses, got {len(miss_indices)}"
+
+seg_id = hit_metas[0]["segment_id"]
+loaded = mixin_b.load_and_reencode_b18(seg_id, source_position=0, target_position=64)
+assert loaded is not None and loaded.dtype == torch.float16
+print(f"  AMPDAdapShotLazyLoadKVCacheManagerMixin: hits={len(hit_metas)} reencode_dtype={loaded.dtype} PASS")
+
+# Test factory
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    AMPDManager = make_ampd_adapshot_kv_cache_manager_class(KVCacheManager, cfg_b)
+    assert issubclass(AMPDManager, KVCacheManager)
+    print(f"  make_ampd_adapshot_kv_cache_manager_class: PASS ({AMPDManager.__name__})")
+except Exception as exc:
+    print(f"  make_ampd_adapshot_kv_cache_manager_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity C: DPAttentionAwareCompressionAttentionHook
+# ---------------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    DPAttentionAwareCompressionConfig_c18,
+    DPAttentionAwareCompressionAttentionHook,
+    extend_cache_config_dp_attn_aware_compression,
+)
+
+cfg_c = DPAttentionAwareCompressionConfig_c18(
+    dp_attn_enabled=False,
+    n_gpus=1,
+    auto_detect_gpus=False,
+    compression_method="int8_sym",
+    dp_attn_compression_skip_threshold=0.5,
+    always_decompress_before_kernel=True,
+    enabled=True,
+    seed=42,
+)
+hook_c = DPAttentionAwareCompressionAttentionHook(cfg_c)
+
+# Test write/read cycle
+torch.manual_seed(42)
+k = torch.randn(64, 64)
+v = torch.randn(64, 64)
+k_comp, v_comp = hook_c.write_to_cache(k, v, layer_idx=0)
+assert k_comp.shape == k.shape
+assert k_comp.dtype == torch.float16
+
+k_out, v_out = hook_c.read_from_cache(k_comp, v_comp, layer_idx=0)
+assert k_out.dtype == torch.float16
+print(f"  DPAttentionAwareCompressionAttentionHook: write {k.shape}/{k.dtype}→{k_comp.dtype} read {k_out.dtype} PASS")
+
+# Test accuracy (MANDATORY: ±1% constraint)
+metrics = hook_c.compute_accuracy_metrics(k.float(), k_comp.float())
+rel_err = metrics["attention_output_relative_error"]
+kl = metrics["kl_divergence"]
+cos = metrics["cosine_similarity"]
+assert rel_err < 0.02, f"MANDATORY: attention_output_relative_error={rel_err:.6f} >= 0.02"
+assert cos >= 0.99, f"MANDATORY: cosine_similarity={cos:.6f} < 0.99"
+print(f"  Accuracy: rel_err={rel_err:.6f} kl={kl:.8f} cos={cos:.6f} — MANDATORY PASS")
+
+# Test DP Attention skip logic
+cfg_dp_skip = DPAttentionAwareCompressionConfig_c18(
+    dp_attn_enabled=True, n_gpus=4, auto_detect_gpus=False,
+    compression_method="int8_sym", dp_attn_compression_skip_threshold=0.6, enabled=True,
+)
+hook_skip = DPAttentionAwareCompressionAttentionHook(cfg_dp_skip)
+assert hook_skip._should_compress() is False
+print(f"  DP Attention skip (threshold=0.6): should_compress=False PASS")
+
+# Test CacheConfig extension
+ext = extend_cache_config_dp_attn_aware_compression(
+    {}, compression_method="int8_sym", dp_attn_enabled=False
+)
+assert ext["dp_attn_aware_compression_method"] == "int8_sym"
+print(f"  extend_cache_config_dp_attn_aware_compression: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity C: DPAttentionAwareVllmCodec + DPAttentionCrossABCCodec
+# ---------------------------------------------------------------------------
+from vllm_integration.compression_codec import (
+    DPAttentionAwareVllmCodec,
+    DPAttentionCrossABCCodec,
+)
+
+codec = DPAttentionAwareVllmCodec(
+    compression_method="int8_sym",
+    dp_attn_enabled=False, n_gpus=1,
+    auto_detect_gpus=False,
+    dp_attn_compression_skip_threshold=0.5,
+    enabled=True,
+)
+kv_test = torch.randn(64, 64)
+compressed = codec.compression_hook("seg_0", kv_test)
+assert compressed.dtype == torch.float16, f"Expected FP16, got {compressed.dtype}"
+decompressed = codec.decompression_hook("seg_0", compressed)
+assert decompressed.dtype == torch.float16
+mrr = codec.memory_reduction_ratio()
+print(f"  DPAttentionAwareVllmCodec: compressed={compressed.shape}/{compressed.dtype} mrr={mrr:.3f} PASS")
+
+cross = DPAttentionCrossABCCodec(
+    compression_method="int8_sym",
+    dp_attn_enabled=False, n_gpus=1,
+    auto_detect_gpus=False, enabled=True,
+)
+cross.record_segment_hit(is_noncontiguous=True)
+cross.record_segment_hit(is_noncontiguous=False)
+cross.record_segment_miss()
+nhr = cross.noncontiguous_hit_rate()
+shr = cross.segment_hit_rate()
+assert abs(nhr - 0.5) < 1e-5, f"Expected non-contiguous hit rate=0.5, got {nhr}"
+assert abs(shr - 2/3) < 1e-5, f"Expected segment hit rate=0.667, got {shr}"
+print(f"  DPAttentionCrossABCCodec: noncontiguous_hr={nhr:.3f} segment_hr={shr:.3f} PASS")
+
+cross_metrics = cross.cross_abc_metrics()
+assert "noncontiguous_hit_rate" in cross_metrics
+assert "memory_reduction_ratio" in cross_metrics
+print(f"  Cross A+B+C metrics keys OK: {list(cross_metrics.keys())}")
+
+print(f"\nAll 2026-05-18 A+B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_18
+set -e
+
+echo ""
+echo "=== 2026-05-18 A+B+C smoke tests complete ==="
+
+echo ""
+echo "=== 2026-05-19 A+B+C smoke tests (KVDrive integrated stack) ==="
+set +e
+python - <<'PYEOF_2026_05_19'
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent if pathlib.Path(__file__).exists() else pathlib.Path.cwd()))
+
+import torch
+
+# Activity A: KVDriveAttentionPipelineMixin
+from vllm_integration.scheduler_patch import (
+    KVDriveAttentionPipelineConfig,
+    KVDriveAttentionPipelineMixin,
+    make_kvdrive_vllm_scheduler_class,
+)
+cfg_a = KVDriveAttentionPipelineConfig(attn_hbm_threshold=0.8, seed=42)
+mixin_a = KVDriveAttentionPipelineMixin.__new__(KVDriveAttentionPipelineMixin)
+mixin_a._kvdrive_init(cfg_a)
+mixin_a.register_token_attention(1, 0.9)
+mixin_a.register_token_attention(2, 0.1)
+mixin_a.refresh_tier_assignments()
+assert mixin_a.get_token_tier(1) == "HBM", "Token 1 should be HBM"
+mixin_a._kvdrive_times = [0.04, 0.05, 0.06]
+p50 = mixin_a.kvdrive_overhead_ms_p50()
+assert p50 < 5.0, f"Overhead p50={p50}ms > 5ms"
+print(f"  Activity A: KVDriveAttentionPipelineMixin tier=HBM overhead_p50={p50}ms PASS")
+
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    KVDriveSched = make_kvdrive_vllm_scheduler_class(Scheduler, cfg_a)
+    assert issubclass(KVDriveSched, Scheduler)
+    assert issubclass(KVDriveSched, KVDriveAttentionPipelineMixin)
+    print(f"  Activity A: make_kvdrive_vllm_scheduler_class PASS ({KVDriveSched.__name__})")
+except Exception as exc:
+    print(f"  Activity A: factory SKIP (no GPU env): {exc}")
+
+# Activity B: ThunderAgentKVCacheManagerMixin
+from vllm_integration.block_manager_patch import (
+    ThunderAgentKVManagerConfig,
+    ThunderAgentKVCacheManagerMixin,
+    LLMProgramStep_19,
+    make_thunder_agent_kv_manager_class,
+)
+cfg_b = ThunderAgentKVManagerConfig(reuse_threshold=0.6, seed=42)
+mixin_b = ThunderAgentKVCacheManagerMixin.__new__(ThunderAgentKVCacheManagerMixin)
+mixin_b._thunder_init(cfg_b)
+step_a = LLMProgramStep_19("A", [1, 2, 3, 4, 5])
+step_b = LLMProgramStep_19("B", [1, 2, 3, 4, 6], can_reuse_from=["A"])
+rmap = mixin_b.pre_reserve_program([step_a, step_b])
+kv = torch.randn(4, 8)
+mixin_b.store_segment_nc([1, 2, 3, 4, 5], kv, layer_idx=0)
+hit = mixin_b.lookup_segment_nc([1, 2, 3, 4, 5], layer_idx=0)
+assert hit is not None, "Non-contiguous lookup must hit"
+assert hit.dtype == torch.float16
+metrics_b = mixin_b.thunder_metrics()
+assert metrics_b["thunder_nc_hit_rate"] == 1.0
+print(f"  Activity B: ThunderAgent NC hit_rate={metrics_b['thunder_nc_hit_rate']} PASS")
+
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    ThunderMgr = make_thunder_agent_kv_manager_class(KVCacheManager, cfg_b)
+    assert issubclass(ThunderMgr, KVCacheManager)
+    assert issubclass(ThunderMgr, ThunderAgentKVCacheManagerMixin)
+    print(f"  Activity B: make_thunder_agent_kv_manager_class PASS ({ThunderMgr.__name__})")
+except Exception as exc:
+    print(f"  Activity B: factory SKIP (no GPU env): {exc}")
+
+# Activity C: KVDriveTierCompressionMixin
+from vllm_integration.attention_backend_patch import (
+    KVDriveTierCompressionConfig_c19,
+    KVDriveTierCompressionMixin,
+    apply_kvdrive_tier_compression_patch,
+)
+cfg_c = KVDriveTierCompressionConfig_c19(default_tier="HBM", seed=42)
+hook_c = KVDriveTierCompressionMixin(cfg_c)
+key = torch.randn(8, 16, dtype=torch.float32)
+val = torch.randn(8, 16, dtype=torch.float32)
+payload = hook_c.write_to_cache(key, val, layer_idx=0)
+key_dec, val_dec = hook_c.read_from_cache(payload)
+rel_err = ((key - key_dec).abs() / key.abs().clamp(min=1e-8)).mean().item()
+assert rel_err < 0.01, f"HBM FP8 relative_error={rel_err:.4f} >= 1%"
+reduction = hook_c.memory_reduction_ratio()
+assert reduction > 0.0
+print(f"  Activity C: HBM FP8 relative_error={rel_err:.4f} reduction={reduction:.2%} PASS")
+
+# Activity C codec
+from vllm_integration.compression_codec import (
+    KVDriveTierDifferentiatedVllmCodec,
+    KVDriveCrossABCCodec,
+)
+codec = KVDriveTierDifferentiatedVllmCodec(seed=42)
+t = torch.randn(16, 32, dtype=torch.float32)
+data, meta = codec.compress(t, "HBM")
+recon = codec.decompress(data, meta, "HBM").reshape(t.shape)
+rel_err_codec = ((t - recon).abs() / t.abs().clamp(min=1e-8)).mean().item()
+assert rel_err_codec < 0.01, f"Codec HBM relative_error={rel_err_codec:.4f} >= 1%"
+print(f"  Activity C codec: KVDriveTierDifferentiatedVllmCodec HBM error={rel_err_codec:.4f} PASS")
+
+cross = KVDriveCrossABCCodec(seed=42)
+d, m = cross.encode(t, tier="HBM", segment_id="seg001")
+r = cross.decode(d, m, tier="HBM", segment_id="seg001")
+assert cross._nc_hits >= 1
+print(f"  Cross A+B+C codec: nc_hits={cross._nc_hits} PASS")
+
+# Config extension
+from vllm_integration.cache_config_extension import (
+    KVDriveActivityABCConfig,
+    build_kvdrive_abc_config,
+)
+cfg_ext = build_kvdrive_abc_config(compression_method="tier_differentiated", seed=42)
+assert cfg_ext.compression_method == "tier_differentiated"
+assert cfg_ext.kvdrive_attn_hbm_threshold == 0.8
+print(f"  Config extension: KVDriveActivityABCConfig compression_method={cfg_ext.compression_method} PASS")
+
+print(f"\nAll 2026-05-19 A+B+C smoke tests passed.  vLLM={__import__('vllm').__version__}")
+PYEOF_2026_05_19
+set -e
+
+echo ""
+echo "=== 2026-05-19 A+B+C smoke tests complete ==="

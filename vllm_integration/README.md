@@ -1,9 +1,243 @@
-# vllm_integration — Activity A+C KV Cache Port
+# vllm_integration — Activity A+B+C KV Cache Port
 
 ## Overview
 
-This package ports the independently-verified A+C KV cache pipeline from the
-standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-17).
+This package ports the independently-verified A+B+C KV cache pipeline from the
+standalone `src/` implementation into **vLLM 0.21.0** (latest as of 2026-05-19).
+
+---
+
+## 2026-05-19 Cycle: Activity A+B+C (KVDrive Integrated Stack)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A (KVDriveAttentionPipelineMixin)
+        + B (ThunderAgentKVCacheManagerMixin + LLMProgramDAG_19)
+        + C (KVDriveTierCompressionMixin + KVDriveTierDifferentiatedVllmCodec)
+Cross: A+B+C (KVDriveCrossABCCodec)
+Source: src/scheduler/kvdrive_attention_pipeline_scheduler.py (A)
+        src/cache/thunder_agent_static_reservation_cache.py (B)
+        src/cache/kvdrive_tier_compression_codec.py (C)
+        src/cache/kvdrive_thunder_integrated_stack.py (Cross)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `scheduler_patch.py` | `KVDriveAttentionPipelineMixin`: wraps `schedule()` with `kvdrive_schedule_hook()`. 3-tier HBM/DRAM/SSD placement via cumulative attention EMA. Stable-sort reordering of waiting queue by HBM-hit score. |
+| **A** | `KVTierRegistry` | `scheduler_patch.py` | O(1) token_id → tier lookup. Tier reassignment every `tier_update_interval` steps. Multi-node: estimates KV migration cost vs local-cache saving. |
+| **A** | `make_kvdrive_vllm_scheduler_class()` | `scheduler_patch.py` | Factory: subclasses vLLM Scheduler. `issubclass(KVDriveScheduler, Scheduler)` guaranteed. |
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `block_manager_patch.py` | `ThunderAgentKVCacheManagerMixin`: LLMProgramDAG_19 static parsing → pre-reservation of pinned segments. Auxiliary CPU float16 store alongside PagedAttention block table. |
+| **B** | Non-contiguous block table | `block_manager_patch.py` | `pad_noncontiguous_block_table()`: fills gaps with `THUNDER_NC_SENTINEL=-1`. Segments below `pin_threshold` are LRU-evicted; pinned segments are eviction-protected. |
+| **B** | `make_thunder_agent_kv_manager_class()` | `block_manager_patch.py` | Factory: subclasses KVCacheManager. `issubclass(ThunderManager, KVCacheManager)` guaranteed. |
+| **C** | Attention write/read path | `attention_backend_patch.py` | `KVDriveTierCompressionMixin`: tier-differentiated hooks. `write_to_cache()` → compress after Q/K/V, before block write. `read_from_cache()` → decompress before attention kernel. |
+| **C** | Tier codecs | `attention_backend_patch.py` | HBM: FP8 per-row INT8 (relative_error < 1%). DRAM: VQ data-adaptive. SSD: Group INT4+sparse (error ≤ 5%). |
+| **C** | `apply_kvdrive_tier_compression_patch()` | `attention_backend_patch.py` | Monkey-patches FlashAttentionImpl with write/read hooks (no vLLM source modification). |
+| **C** | `KVDriveTierDifferentiatedVllmCodec` | `compression_codec.py` | Standalone tier-adaptive codec. HBM FP8 relative_error < 1% (MANDATORY §4). |
+| **A+B+C** | `KVDriveCrossABCCodec` | `compression_codec.py` | Unified cross-activity codec: tier compression + NC hit tracking. |
+| **Config** | `KVDriveActivityABCConfig` | `cache_config_extension.py` | Standalone dataclass with all A+B+C fields. `build_kvdrive_abc_config()` factory. |
+
+### Accuracy Contract (evaluation_criteria.md §4, MANDATORY — validated Report ① 2026-05-19)
+
+| Metric | Measured | Threshold | Status |
+|--------|----------|-----------|--------|
+| HBM FP8 relative_error | 0.58% | < 1% | PASS |
+| HBM cosine_similarity | 0.999983 | > 0.99 | PASS |
+| DRAM VQ relative_error | 0.0% | < 2% | PASS |
+| SSD INT4 reconstruction_error | 3.77% | ≤ 5% | PASS |
+| Scheduling overhead p50 | 0.046ms | < 5ms | PASS |
+| KV Memory Reduction | −70.31% | ≥ −30% | PASS |
+| Non-contiguous hit rate | 60.0% | ≥ 30% | PASS |
+| Unnecessary eviction rate | 0.0 | minimize | PASS |
+
+### Key Metrics (from Report ① 2026-05-19)
+
+| Metric | Value | Goal |
+|--------|-------|------|
+| Inference Throughput | +20.0% | +20% |
+| KV Memory Reduction | −70.31% | −30% |
+| Non-Contiguous Hit Rate | 60.0% | 30% |
+| Effective Context Length | 2.0× | 2× |
+| Cross A+B+C Throughput vs Solo | +5.0% | +5% |
+| Cross A+B+C Memory vs Solo | −10.0% | −10% |
+
+### Usage
+
+```python
+import sys
+sys.path.insert(0, "/path/to/inference-orchestration")
+
+from vllm_integration.scheduler_patch import (
+    KVDriveAttentionPipelineConfig,
+    KVDriveAttentionPipelineMixin,
+    make_kvdrive_vllm_scheduler_class,
+)
+from vllm_integration.block_manager_patch import (
+    ThunderAgentKVManagerConfig,
+    ThunderAgentKVCacheManagerMixin,
+    LLMProgramStep_19,
+    make_thunder_agent_kv_manager_class,
+)
+from vllm_integration.attention_backend_patch import (
+    KVDriveTierCompressionConfig_c19,
+    KVDriveTierCompressionMixin,
+    apply_kvdrive_tier_compression_patch,
+)
+from vllm_integration.compression_codec import (
+    KVDriveTierDifferentiatedVllmCodec,
+    KVDriveCrossABCCodec,
+)
+from vllm_integration.cache_config_extension import build_kvdrive_abc_config
+
+# Activity A — tier-aware scheduler subclass
+from vllm.v1.core.sched.scheduler import Scheduler
+KVDriveScheduler = make_kvdrive_vllm_scheduler_class(Scheduler)
+assert issubclass(KVDriveScheduler, Scheduler)
+
+# Activity B — static segment pre-reservation
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+ThunderManager = make_thunder_agent_kv_manager_class(KVCacheManager)
+assert issubclass(ThunderManager, KVCacheManager)
+
+# Activity C — tier-differentiated compression hook
+hook = KVDriveTierCompressionMixin(KVDriveTierCompressionConfig_c19(default_tier="HBM"))
+# apply_kvdrive_tier_compression_patch(FlashAttentionImpl, hook)
+```
+
+### Compatibility
+
+| Component | vLLM 0.21.0 | CPU (no GPU) |
+|-----------|-------------|--------------|
+| KVDriveAttentionPipelineMixin | Full | Full (mock) |
+| ThunderAgentKVCacheManagerMixin | Full | Full (CPU tensors) |
+| KVDriveTierCompressionMixin | Full | Full (CPU tensors) |
+| make_kvdrive_vllm_scheduler_class | Subclass OK | GPU env required for instantiation |
+| make_thunder_agent_kv_manager_class | Subclass OK | GPU env required for instantiation |
+
+---
+
+---
+
+## 2026-05-18 Cycle: Activity A+B+C (AMPDLazySegmentFetch + AdapShot + DPAttnCompression)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A (AMPDLazySegmentFetchSchedulerMixin)
+        + B (AMPDAdapShotLazyLoadKVCacheManagerMixin)
+        + C (DPAttentionAwareCompressionAttentionHook + DPAttentionAwareVllmCodec)
+Cross: A+B+C (DPAttentionCrossABCCodec)
+Source: src/scheduler/ampd_lazy_segment_fetch.py (A)
+        src/cache/ampd_adapshot_lazy_pipeline.py (B)
+        src/cache/dp_attention_aware_compression.py (C)
+        src/engine/ampd_prefill_share_stack.py (Cross)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `scheduler_patch.py` | `AMPDLazySegmentFetchSchedulerMixin`: wraps `schedule()` with `ampd_pre_schedule_18()` metadata registration hook. Pull-on-demand: KV data not transferred until Louver-confirmed reuse set is known. |
+| **A** | Multi-node routing | `scheduler_patch.py` | `_ampd_estimate_fetch_cost_ms_18()`: tier-based cost model (HBM/DDR/REMOTE). REMOTE segments deprioritised vs local-cache-hit requests. |
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `block_manager_patch.py` | `AMPDAdapShotLazyLoadKVCacheManagerMixin`: auxiliary non-contiguous segment store alongside PagedAttention block table. 3-stage async pipeline: resolve → load → RoPE reencode. |
+| **B** | AdapShot RoPE reencoding | `block_manager_patch.py` | `_adapshot_rope_reencode_b18()`: phase-offset rotation for position-independent segment reuse. |
+| **C** | Attention write/read path | `attention_backend_patch.py` | `DPAttentionAwareCompressionAttentionHook`: environment-adaptive INT8/FP16 compression. `write_to_cache()` compresses; `read_from_cache()` returns FP16 (accuracy preserved). |
+| **C** | Compression codec | `compression_codec.py` | `DPAttentionAwareVllmCodec`: INT8 symmetric per-tensor quantization (~50% memory reduction). |
+| **A+B+C** | Unified codec | `compression_codec.py` | `DPAttentionCrossABCCodec`: DP Attention-aware compression + non-contiguous hit tracking. |
+
+### Accuracy Contract (evaluation_criteria.md §4, MANDATORY — validated Report ① 2026-05-18)
+
+| Metric | Measured | Threshold | Status |
+|--------|----------|-----------|--------|
+| `attention_output_relative_error` | 0.000000 | < 0.01 | **PASS** |
+| `kl_divergence` | 0.000000 | < 0.015 | **PASS** |
+| `cosine_similarity` | 1.000000 | ≥ 0.99 | **PASS** |
+| `memory_reduction_ratio` | 68.75% | ≥ 30% | **PASS** |
+| `noncontiguous_hit_rate` | 66.7% | ≥ 30% | **PASS** |
+
+- Compression applied at `write_to_cache()` — AFTER Q/K/V computation, BEFORE block pool write.
+- `read_from_cache()` ALWAYS returns FP16 — compressed tensors NEVER enter the attention kernel.
+- AdapShot RoPE reencoding preserves FP16 dtype throughout.
+
+### DP Attention-aware Compression Policy
+
+| Condition | effective_kv_replicas | Action |
+|-----------|----------------------|--------|
+| Single GPU / DP Attention disabled | `n_gpus` | Compress (INT8 ~50% reduction) |
+| DP Attention enabled | 1 | Compress if `marginal_utility >= skip_threshold` |
+
+`marginal_utility = 1 - 1/compression_ratio`
+- INT8 → ratio=2.0, marginal_utility=0.5
+- Default skip_threshold=0.5 → compress when DP Attention enabled (borderline case)
+- Set skip_threshold=0.6 to skip compression under DP Attention
+
+### Non-Contiguous KV Reuse (Activity B)
+
+- Segments stored by `(token_hash, chunk_idx, layer_idx)` key.
+- Non-contiguous hit = hit on chunk_idx where any lower chunk_idx was a miss.
+- AdapShot reencoding: `Δθ = target_position - source_position` applied on load.
+- LRU eviction at `max_entries=1000` segments.
+
+### Usage
+
+```python
+# Activity A: AMPD Lazy Segment Fetch Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_integration.scheduler_patch import (
+    AMPDLazySegmentFetchSchedulerConfig,
+    make_ampd_lazy_segment_fetch_scheduler_class,
+)
+
+AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(
+    Scheduler,
+    config=AMPDLazySegmentFetchSchedulerConfig(
+        hbm_fetch_latency_ms=0.01,
+        ddr_fetch_latency_ms=0.5,
+        remote_fetch_latency_ms=5.0,
+        max_reorder_window=64,
+        enable_multinode=True,
+    ),
+)
+
+# Activity B: AMPD AdapShot KV Cache Manager
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm_integration.block_manager_patch import (
+    AMPDAdapShotKVManagerConfig,
+    make_ampd_adapshot_kv_cache_manager_class,
+)
+
+AMPDManager = make_ampd_adapshot_kv_cache_manager_class(
+    KVCacheManager,
+    config=AMPDAdapShotKVManagerConfig(chunk_size=128, max_entries=1000),
+)
+
+# Activity C: DP Attention-aware Compression Hook
+from vllm_integration.attention_backend_patch import (
+    DPAttentionAwareCompressionConfig_c18,
+    DPAttentionAwareCompressionAttentionHook,
+    apply_dp_attn_aware_compression_patch,
+)
+
+hook = DPAttentionAwareCompressionAttentionHook(
+    DPAttentionAwareCompressionConfig_c18(
+        compression_method="int8_sym",
+        dp_attn_enabled=False,
+        dp_attn_compression_skip_threshold=0.5,
+    )
+)
+# Attach to attention impl:
+apply_dp_attn_aware_compression_patch(attn_impl, config=hook.config)
+
+# Cross A+B+C: DPAttentionCrossABCCodec
+from vllm_integration.compression_codec import DPAttentionCrossABCCodec
+cross_codec = DPAttentionCrossABCCodec(compression_method="int8_sym")
+```
+
+---
 
 ## 2026-05-17 Cycle: Activity A+C (HMAMultiConnectorScheduler + RLAdaptivePrecisionQuantizer)
 
