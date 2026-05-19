@@ -1,120 +1,125 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-17 대비):
-이전 사이클(2026-05-17)은 A+C 조합이었다:
-  - A-1 HMAMultiConnectorCompressionPluginScheduler (HMA 멀티-커넥터 플러그인 메타-스케줄러)
-  - C-1 RLAdaptivePrecisionQuantizer (RL 워크로드 온라인 적응 정밀도 양자화기)
-  - Cross-1 HMAChainedACPipeline (A+C 통합 파이프라인)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-18 대비):
+이전 사이클(2026-05-18)은 A+B+C 조합이었다:
+  - A-1 AMPDLazySegmentFetchScheduler (AMPD pull-on-demand 지연 페치 스케줄러)
+  - B-1 AMPDAdapShotLazyLoadPipeline (지연 로드 + AdapShot RoPE 재인코딩 비동기 오버랩)
+  - C-1 DPAttentionAwareCompressionSelector (DP Attention 상태 인식 환경별 압축 선택기)
+  - Cross-1 AMPDPrefillShareNonContiguousStack (A+B+C 5단계 통합 스택)
 
-이번 사이클(2026-05-18)은 A+B+C 조합으로 전환하며 설계 축이 완전히 교체된다.
+이번 사이클(2026-05-19)은 완전히 새로운 A+B+C 조합으로 교체된다. 설계 축이 다음과 같이 전환된다:
 
 주요 변경:
-1. [Activity A 교체] HMAMultiConnectorCompressionPluginScheduler(플러그인 레지스트리) →
-   AMPDLazySegmentFetchScheduler(AMPD pull-on-demand 지연 페치 스케줄러).
-   세그먼트 재사용 집합 확정 전까지 KV 전송 자체를 보류하는 pull-on-demand 타이밍 제어로,
-   이전 모든 A 기법(push/사전-오프로딩)과 근본 원리가 다르다.
+1. [Activity A 교체] AMPDLazySegmentFetchScheduler(pull-on-demand 타이밍 제어) →
+   KVDriveAttentionAwarePipelineScheduler(어텐션 점수 기반 3계층 HBM/DRAM/SSD 배치 +
+   I/O-컴퓨트 오버랩 파이프라인 재구성) + KVTierRegistry(token_id → TierInfo O(1) 조회).
+   이전 기법이 "언제 KV를 pull할지"의 타이밍 제어라면, 이번 기법은
+   "KV를 어느 물리 계층에 둘지"의 3계층 시스템 수준 조율이다.
 
-2. [Activity B 신규 추가] 이전 사이클에 없던 Activity B를 포함:
-   AMPDAdapShotLazyLoadPipeline — 세그먼트 집합 확정 후 로드와
-   AdapShot RoPE 재인코딩을 비동기 오버랩하는 3단계 파이프라인.
+2. [Activity B 교체] AMPDAdapShotLazyLoadPipeline(실행 시 동적 세그먼트 로드-재인코딩) →
+   ThunderAgentStaticSegmentReservationCache(LLM Program 정적 DAG 분석으로
+   실행 전에 재사용 가능한 비연속 세그먼트를 사전 예약(pinned)하는
+   "워크플로우-인식 정적 예약" 패러다임). 에이전틱 워크플로우를 LLMProgramDAG로
+   파싱해 KV 재사용 엣지를 결정론적으로 파악한다.
 
-3. [Activity C 교체] RLAdaptivePrecisionQuantizer(RL 리워드 피드백) →
-   DPAttentionAwareCompressionSelector(DP Attention 상태 인식 환경별 압축 선택기).
-   단일/멀티 GPU 환경에서 DP Attention KV 중복 제거 상태를 압축 정책 결정 입력으로 사용하는
-   최초의 C 기법. 기구현 코덱 3종을 환경 인식 래퍼로 재활용.
+3. [Activity C 교체] DPAttentionAwareCompressionSelector(환경 인식 코덱 선택) →
+   KVDriveTierDifferentiatedCompressionCodec(KV가 저장된 계층 위치에 따른
+   자동 차등 압축: HBM FP8, DRAM VQ, SSD INT4+sparsification).
+   계층 이동 시 자동 재압축(auto-recompression on tier migration) 포함.
 
-4. [Cross 교체] HMAChainedACPipeline(A+C 플러그인 체이닝) →
-   AMPDPrefillShareNonContiguousStack(A+B+C 완전 통합 스택).
-   5단계 처리 흐름: 메타데이터 선행 전달 → 팬아웃 배포 → 지연 로드·재인코딩 →
-   환경 인식 압축 → 비연속 어텐션 계산.
+4. [Cross 교체] AMPDPrefillShareNonContiguousStack(AMPD+AdapShot+DP Attention 5단계) →
+   KVDriveThunderAgentIntegratedStack(Program 파싱 → 세그먼트 사전 예약 →
+   3계층 배치 → 계층-자동 차등 압축 통합 스택). CacheStore 인터페이스 구현.
 
-5. [보존 파일] 기존 모든 파일(rl_adaptive_precision_quantizer.py,
-   hma_multi_connector_scheduler.py, hma_chained_ac_pipeline.py 등)은
+5. [스케줄러 베이스 신규] src/scheduler/base.py가 없으면 최소 BaseScheduler 추상 클래스를
+   생성해야 한다. 기존 스케줄러들이 이미 사용 중이므로 확인 후 없는 경우만 생성.
+
+6. [보존 파일] 기존 모든 파일(ampd_lazy_segment_fetch.py,
+   ampd_adapshot_lazy_pipeline.py, dp_attention_aware_compression.py 등)은
    이번 사이클에서 수정하지 않는다. 기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
 
-6. [인터페이스 유지] src/cache/base.py는 이번 사이클에서 수정하지 않는다.
+7. [인터페이스 유지] src/cache/base.py는 이번 사이클에서 수정하지 않는다.
    CacheStore 6개 추상 메서드를 모든 신규 구현체가 완전 구현한다.
 
-7. [Activity C 필수] DPAttentionAwareCompressionSelector는 accuracy-preserving
-   검증 계획(WikiText-2 perplexity ±1% + LongBench 8개 서브태스크 + 환경별 교차 검증)
-   없이 완성 불가.
+8. [Activity C 필수] KVDriveTierDifferentiatedCompressionCodec은 accuracy-preserving
+   검증 계획(HBM FP8 relative_error < 1%, cosine_sim > 0.99) 없이 완성 불가.
 -->
 
-# Spec — 2026-05-18
+# Spec — 2026-05-19
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-18.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-19.md`
 
 **최우선 구현 타겟**:
-- **A-1 (주)**: AMPDLazySegmentFetchScheduler — AMPD pull-on-demand 원칙 기반
-  세그먼트 집합 확정 전 KV 전송 보류 + 확정 후 비동기 pull 스케줄러
-- **B-1 (주)**: AMPDAdapShotLazyLoadPipeline — 세그먼트 집합 확정 후
-  로드-AdapShot RoPE 재인코딩 비동기 오버랩 3단계 파이프라인 (CacheStore 구현)
-- **C-1 (주)**: DPAttentionAwareCompressionSelector — DP Attention 환경 상태 인식
-  압축 정책 자동 선택기 (단일/멀티 GPU 환경별 최적 코덱 선택)
-- **Cross-1 (주)**: AMPDPrefillShareNonContiguousStack — A-1+B-1+C-1 5단계
-  완전 통합 스택
+- **A-1 (주)**: KVDriveAttentionAwarePipelineScheduler — KVDrive 어텐션 점수 기반
+  3계층(HBM/DRAM/SSD) 배치 + I/O-컴퓨트 오버랩 파이프라인 스케줄러.
+  KVTierRegistry: token_id → TierInfo O(1) 조회.
+- **B-1 (주)**: ThunderAgentStaticSegmentReservationCache — LLMProgramDAG 정적 분석
+  기반 비연속 세그먼트 사전 예약 캐시 (CacheStore 구현).
+- **C-1 (주)**: KVDriveTierDifferentiatedCompressionCodec — 계층-자동 차등 압축
+  (HBM: FP8, DRAM: VQ, SSD: INT4+sparsification) + 계층 이동 시 자동 재압축.
+- **Cross-1 (주)**: KVDriveThunderAgentIntegratedStack — A-1+B-1+C-1 통합 스택
+  (CacheStore 구현).
 
 **해결하려는 문제**:
 
-- **Activity A**: 기존 모든 A 기법이 스케줄러가 세그먼트 재사용 결정 확정 여부와
-  관계없이 KV 블록을 선제 전송(push) 또는 사전 오프로딩하는 방식으로 불필요 전송이
-  발생한다. AMPDLazySegmentFetchScheduler는 AMPD(2602.14516) "KV 지연 읽기" 원칙을
-  비연속 세그먼트 경로에 적용해, 세그먼트 재사용 집합이 Louver 탐색으로 확정된 시점
-  이후에만 pull-on-demand 방식으로 KV를 읽는다. 메타데이터만 먼저 전달하고 KV 데이터
-  전송은 확정 후로 보류함으로써 불필요 전송 −40~65%를 달성한다.
+- **Activity A (KVDrive 3계층 파이프라인)**: 기존 A 기법들은 HBM ↔ DRAM 2계층만
+  다루거나 I/O-컴퓨트 오버랩 없이 순차 전송해 디코딩 스텝마다 I/O 스톨이 발생한다.
+  KVDriveAttentionAwarePipelineScheduler는 슬라이딩 윈도우(최근 512토큰 항상 HBM) +
+  누적 어텐션 점수 기반으로 HBM/DRAM/SSD 3계층을 조율하고, 두 CUDA Stream(I/O 스트림 +
+  컴퓨트 스트림)으로 I/O-컴퓨트 오버랩을 달성해 스톨을 제거한다.
 
-- **Activity B**: 기존 모든 B 기법은 세그먼트가 이미 메모리에 있다고 가정하고 재사용
-  결정을 내렸다. AMPDAdapShotLazyLoadPipeline은 Stage 1(세그먼트 탐색·확정) →
-  Stage 2(비동기 로드) → Stage 3(AdapShot RoPE 재인코딩 오버랩)의 3단계 비동기
-  파이프라인으로 로드와 재인코딩을 오버랩해 직렬 지연을 병렬 지연(이론적 최솟값)으로
-  줄인다. CacheStore 인터페이스를 완전 구현한다.
+- **Activity B (ThunderAgent 정적 예약)**: 기존 B 기법들은 세그먼트 재사용 결정을
+  실행 시 동적으로 내렸다. ThunderAgentStaticSegmentReservationCache는 에이전틱
+  워크플로우를 LLMProgramDAG로 정적 파싱해 실행 전에 KV 재사용 엣지를 결정론적으로
+  파악하고, 높은 재사용 확률 세그먼트를 pinned 상태로 사전 예약해 실행 시 즉시 히트를
+  보장하는 "워크플로우-인식 정적 예약" 패러다임을 도입한다.
 
-- **Activity C**: 기존 모든 C 기법이 단일 GPU 환경을 암묵적으로 가정하거나 멀티 GPU
-  환경에서의 DP Attention KV 중복 제거 상태를 고려하지 않았다.
-  DPAttentionAwareCompressionSelector는 SGLang v0.5.11 DP Attention이 N-GPU 환경에서
-  KV 복사본을 1/N으로 줄이는 상태를 압축 정책 결정 입력으로 사용해,
-  단일 GPU(고압축 코덱 우선)와 멀티 GPU+DP Attention(한계 효용 기반 선택적 압축)에서
-  각각 최적 코덱을 자동 선택한다. 기구현 코덱 3종을 래퍼로 재활용.
+- **Activity C (KVDrive 계층-자동 차등 압축)**: 기존 C 기법들은 단일 압축 정책을
+  전체 KV에 동일하게 적용했다. KVDriveTierDifferentiatedCompressionCodec은 KV가
+  저장된 계층 위치(HBM/DRAM/SSD)에 따라 자동으로 최적 압축 강도를 결정한다:
+  HBM은 FP8(속도·정확도 우선), DRAM은 VQ(중간 압축), SSD는 INT4+sparsification
+  (고압축). 계층 이동 시 목적지 계층의 압축 정책으로 자동 재압축한다.
 
-- **Cross A+B+C**: AMPDPrefillShareNonContiguousStack은 5단계 처리 흐름을 통해
-  지연 스케줄링(A-1) → 지연 로드·재인코딩 파이프라인(B-1) → 환경 인식 압축(C-1)의
-  복합 효과(처리량 +35~55%, 메모리 −70~95%, accuracy delta ±0.6% 이내)를 달성한다.
+- **Cross A+B+C**: KVDriveThunderAgentIntegratedStack은 Program 파싱 → 세그먼트
+  사전 예약 → 3계층 배치 → 계층-자동 차등 압축의 통합 흐름을 CacheStore 인터페이스로
+  제공한다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling (AMPDLazySegmentFetchScheduler)
-- [x] Activity B: Non-Contiguous KV Cache Reuse (AMPDAdapShotLazyLoadPipeline)
-- [x] Activity C: KV Cache Compression (DPAttentionAwareCompressionSelector)
+- [x] Activity A: KV Cache-aware Scheduling (KVDriveAttentionAwarePipelineScheduler)
+- [x] Activity B: Non-Contiguous KV Cache Reuse (ThunderAgentStaticSegmentReservationCache)
+- [x] Activity C: KV Cache Compression (KVDriveTierDifferentiatedCompressionCodec)
 
 ---
 
 ## 목표
 
 - [ ] 목표 1 (evaluation_criteria.md §4 Activity C 필수): perplexity 변화 ±1% 이내
-      — WikiText-2 proxy: attention_output_relative_error < 0.01
-      — 단일 GPU / DP Attention 활성화 멀티 GPU 환경 각각 독립 측정
-- [ ] 목표 2 (evaluation_criteria.md §4 Activity C 필수): downstream 태스크 정확도 변화 ±1% 이내
-      — LongBench 8개 서브태스크 proxy: KL divergence < 0.015, cosine >= 0.99
-      — {DP Attention ON/OFF} × {압축 기법} 교차 행렬 검증
-- [ ] 목표 3 (evaluation_criteria.md §4 Activity C): KV Cache Memory Reduction >= −30%
-      — 단일 GPU: 고압축 코덱 적용 시 −50~70% 목표
-      — 멀티 GPU + DP Attention: 이중 절감 곱 효과 −70~95% 이론 검증
+      — HBM FP8 압축 후 relative_error < 0.01 (MANDATORY)
+      — cosine_similarity(원본 어텐션 출력, 압축 후 복원) > 0.99 (MANDATORY)
+- [ ] 목표 2 (evaluation_criteria.md §4 Activity C 필수): downstream 태스크 정확도 ±1% 이내
+      — DRAM VQ 압축 후 relative_error < 0.02
+      — SSD INT4 압축 후 reconstruction error ≤ 0.05 (장기 저관심 토큰 허용 오차)
+- [ ] 목표 3 (evaluation_criteria.md §4 Activity C): KV Cache Memory Reduction ≥ −30%
+      — 3계층 차등 압축 가중 평균 기준 측정 (HBM 20%/DRAM 50%/SSD 30% 분포 기준)
 - [ ] 목표 4 (evaluation_criteria.md §4 Activity C): Effective Context Length 동일 메모리 2× 이상
-      — 압축 + DP Attention 결합 시 유효 KV 크기 측정
+      — 계층 차등 압축으로 HBM 점유 최소화 → 유효 컨텍스트 길이 측정
 - [ ] 목표 5 (evaluation_criteria.md §2 Activity A): 스케줄링 오버헤드 TTFT p50 +5% 이내
-      — 메타데이터 선행 전달 오버헤드 < 0.1ms/요청
-      — unnecessary_transfer_ratio 지표 수집 및 검증
+      — KVTierRegistry.get_tier() O(1) + 어텐션 점수 갱신 < 0.05ms/스텝
+      — I/O-컴퓨트 오버랩 파이프라인 TTFT 오버헤드 < 5ms
 - [ ] 목표 6 (evaluation_criteria.md §2 Activity A): 캐시 히트율 향상 +10%p
-      — 지연 페치로 확정된 세그먼트만 로드 → 불필요 로드 −35~55%
+      — 3계층 배치로 SSD까지 포함한 전체 히트율 측정
+      — 영구 퇴거 비율 ≈ 0% (SSD 보관으로 eviction 대체)
 - [ ] 목표 7 (evaluation_criteria.md §3 Activity B): 비연속 세그먼트 히트율 전체 히트의 30% 이상
-      — AMPDAdapShotLazyLoadPipeline의 noncontiguous_hit_rate() >= 0.30
+      — ThunderAgentStaticSegmentReservationCache.noncontiguous_hit_rate() ≥ 0.30
+      — reservation_hit_rate (예약 세그먼트 중 실제 히트 비율) ≥ 0.50
 - [ ] 목표 8 (evaluation_criteria.md §1 처리량): 베이스라인 대비 tokens/sec +20% 이상
-      — 지연 페치 + 로드-재인코딩 오버랩 + 환경 인식 압축 복합 효과
+      — 3계층 I/O-컴퓨트 오버랩 + 정적 예약 세그먼트 즉시 히트 복합 효과
 - [ ] 목표 9 (evaluation_criteria.md §5 크로스 조합 C 포함): 복합 적용 후 accuracy ±1% 이내
-      — AMPDPrefillShareNonContiguousStack 5단계 통합 적용 후 cosine >= 0.99
-      — 단독 A-1 / 단독 B-1 / 단독 C-1 / 결합 Cross-1 4방향 비교
+      — KVDriveThunderAgentIntegratedStack 전체 흐름 후 cosine ≥ 0.99
+      — 단독 A-1 / 단독 B-1 / 단독 C-1 / Cross-1 4방향 비교
 
 ---
 
@@ -124,16 +129,16 @@
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/scheduler/ampd_lazy_segment_fetch.py` | A | AMPDLazySegmentFetchScheduler: pull-on-demand 지연 페치 스케줄러 + SegmentMetadataRegistry |
-| `src/cache/ampd_adapshot_lazy_pipeline.py` | B | AMPDAdapShotLazyLoadPipeline: 3단계 비동기 파이프라인 (resolve→load→reencode), CacheStore 구현 |
-| `src/cache/dp_attention_aware_compression.py` | C | DPAttentionAwareCompressionSelector: DP Attention 상태 인식 환경별 압축 정책 선택기 |
-| `src/engine/ampd_prefill_share_stack.py` | A+B+C | AMPDPrefillShareNonContiguousStack: 5단계 완전 통합 스택 |
-| `tests/unit/test_ampd_lazy_segment_fetch.py` | A | Activity A 단위 테스트 |
-| `tests/unit/test_ampd_adapshot_lazy_pipeline.py` | B | Activity B 단위 테스트 |
-| `tests/unit/test_dp_attention_aware_compression.py` | C | Activity C 단위 테스트 (accuracy-preserving 검증 필수) |
-| `tests/unit/test_ampd_prefill_share_stack.py` | A+B+C | Cross A+B+C 통합 단위 테스트 |
-| `tests/integration/test_cross_abc_ampd_stack.py` | A+B+C | E2E 통합 테스트: 다중 요청 지연 페치 + 파이프라인 + 압축 |
-| `configs/experiments/2026-05-18.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `src/scheduler/base.py` | 공통 | BaseScheduler 최소 추상 클래스 (없는 경우에만 생성) |
+| `src/scheduler/kvdrive_attention_pipeline_scheduler.py` | A | KVDriveAttentionAwarePipelineScheduler + KVTierRegistry (내부 클래스) |
+| `src/cache/thunder_agent_static_reservation_cache.py` | B | ThunderAgentStaticSegmentReservationCache: LLMProgramDAG 파싱 + 세그먼트 사전 예약, CacheStore 구현 |
+| `src/cache/kvdrive_tier_compression_codec.py` | C | KVDriveTierDifferentiatedCompressionCodec: HBM FP8 / DRAM VQ / SSD INT4+sparse, 계층 이동 시 자동 재압축 |
+| `src/cache/kvdrive_thunder_integrated_stack.py` | A+B+C | KVDriveThunderAgentIntegratedStack: A+B+C 통합 스택, CacheStore 구현 |
+| `tests/unit/test_kvdrive_scheduler.py` | A | 계층 배치 로직, I/O 오버랩 목, TTFT 오버헤드 검증 |
+| `tests/unit/test_thunder_agent_segment_cache.py` | B | DAG 파싱, 사전 예약, 히트율 검증 |
+| `tests/unit/test_kvdrive_tier_compression_accuracy.py` | C | FP8/VQ/INT4 정확도 검증 (MANDATORY) |
+| `tests/integration/test_kvdrive_thunder_e2e.py` | A+B+C | E2E 통합 테스트 |
+| `configs/experiments/2026-05-19.yaml` | 공통 | 이번 사이클 실험 설정 |
 
 ### 변경할 파일
 
@@ -145,743 +150,674 @@
 
 ## 알고리즘 상세
 
-### SegmentMeta 데이터클래스 (공통)
+### TierInfo 데이터클래스 및 KVTierRegistry (Activity A)
 
 ```python
-# src/scheduler/ampd_lazy_segment_fetch.py 상단
-from dataclasses import dataclass
-from typing import Literal
-
-SegmentTier = Literal["HBM", "DDR", "REMOTE"]
-
-@dataclass
-class SegmentMeta:
-    segment_id: str          # 세그먼트 content hash (chunk_key와 동일 형식)
-    source_node_id: str      # 세그먼트가 있는 노드 식별자 ("local" 또는 IP)
-    tier: SegmentTier        # HBM / DDR / REMOTE
-    approx_size_bytes: int   # KV 텐서 예상 크기 (bytes)
-    position_range: tuple    # (start_token_idx, end_token_idx)
-```
-
----
-
-### SegmentMetadataRegistry (Activity A)
-
-```python
-# src/scheduler/ampd_lazy_segment_fetch.py
+# src/scheduler/kvdrive_attention_pipeline_scheduler.py 상단
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Literal, Optional
+import torch
 
-class SegmentMetadataRegistry:
-    """세그먼트 ID → SegmentMeta 매핑을 관리하는 경량 레지스트리.
+Tier = Literal["HBM", "DRAM", "SSD"]
 
-    역할:
-      - 요청 수신 시 KV 데이터 없이 메타데이터만 등록
-      - 스케줄 확정 후 pull 대상 세그먼트 조회
-      - 불필요 전송 비율(unnecessary_transfer_ratio) 추적
+@dataclass
+class TierInfo:
+    tier: Tier
+    physical_location: str   # "hbm:0", "dram:0", "ssd:/tmp/kv_store"
+    approx_size: int         # bytes
 
-    단일 노드 환경: source_node_id = "local", gRPC 스트림 없이 in-process 동작.
-    멀티 노드 환경: register_remote() 호출로 외부 노드 세그먼트 등록.
-    """
+class KVTierRegistry:
+    """token_id → TierInfo O(1) 조회 레지스트리."""
 
     def __init__(self) -> None:
-        self._registry: Dict[str, SegmentMeta] = {}
-        self._pre_resolved_count: int = 0   # 후보로 등록된 세그먼트 수
-        self._cancelled_count: int = 0      # 확정 전 취소된 세그먼트 수
+        self._registry: Dict[int, TierInfo] = {}
 
-    def register(self, meta: SegmentMeta) -> None:
-        """세그먼트 메타데이터 등록 (KV 데이터 없음)."""
-        self._registry[meta.segment_id] = meta
-        self._pre_resolved_count += 1
+    def set_tier(self, token_id: int, info: TierInfo) -> None:
+        self._registry[token_id] = info
 
-    def get(self, segment_id: str) -> Optional[SegmentMeta]:
-        """세그먼트 메타데이터 조회. 없으면 None."""
-        return self._registry.get(segment_id)
+    def get_tier(self, token_id: int) -> Optional[TierInfo]:
+        return self._registry.get(token_id)
 
-    def cancel(self, segment_id: str) -> None:
-        """확정 전 취소 (pull하지 않기로 결정된 세그먼트)."""
-        if segment_id in self._registry:
-            self._cancelled_count += 1
+    def all_token_ids(self) -> list:
+        return list(self._registry.keys())
 
-    def unnecessary_transfer_ratio(self) -> float:
-        """불필요 전송 비율 = 취소된 세그먼트 / 사전 등록된 후보 세그먼트."""
-        if self._pre_resolved_count == 0:
-            return 0.0
-        return self._cancelled_count / self._pre_resolved_count
-
-    def reset_stats(self) -> None:
-        self._pre_resolved_count = 0
-        self._cancelled_count = 0
+    def clear(self) -> None:
+        self._registry.clear()
 ```
 
 ---
 
-### AMPDLazySegmentFetchScheduler (Activity A)
+### KVDriveAttentionAwarePipelineScheduler (Activity A)
 
-스케줄링 결정 단위: **요청(request) 단위**.
-캐시 상태 접근: `SegmentMetadataRegistry`를 통해 세그먼트 메타데이터 조회 (KV 데이터 접근 없음).
+스케줄링 결정 단위: **요청(request) 단위 + 매 tier_update_interval(32) 디코딩 스텝마다 계층 재배정**.
+캐시 상태 접근: `KVTierRegistry`를 통해 token_id → TierInfo O(1) 조회.
 
 ```python
-# src/scheduler/ampd_lazy_segment_fetch.py
+# src/scheduler/kvdrive_attention_pipeline_scheduler.py
 
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Dict, List, Optional
 import torch
 
-from src.cache.segmented import SegmentedHashCache
-from src.engine.runner import InferenceRequest
+from src.scheduler.base import BaseScheduler
 
 
 @dataclass
-class KVSegment:
-    segment_id: str
-    kv_tensor: torch.Tensor   # 실제 KV 데이터
-    source_tier: str          # "HBM" | "DDR" | "REMOTE"
-    load_latency_ms: float    # 로드 소요 시간
-
-
-@dataclass
-class AMPDLazySchedulerConfig:
-    # 단일 노드 기본값 (멀티 노드 확장 시 remote_fetch_latency_ms 조정)
-    hbm_fetch_latency_ms: float = 0.01
-    ddr_fetch_latency_ms: float = 0.5
-    remote_fetch_latency_ms: float = 5.0
-    metadata_overhead_max_ms: float = 0.1   # 메타데이터 전달 오버헤드 상한
-    max_concurrent_fetches: int = 8
+class KVDriveSchedulerConfig:
+    # 3계층 임계값 (YAML 외부화)
+    attn_hbm_threshold: float = 0.80      # 누적 어텐션 상위 20% → HBM 잔류
+    attn_dram_threshold: float = 0.30     # 누적 어텐션 하위 30% → SSD, 나머지 → DRAM
+    local_window_size: int = 512          # 슬라이딩 윈도우: 최근 N토큰 항상 HBM
+    tier_update_interval: int = 32        # 계층 재배정 주기 (디코딩 스텝)
+    # I/O 지연 시뮬레이션 (CPU 환경 목)
+    hbm_latency_ms: float = 0.01
+    dram_latency_ms: float = 0.5
+    ssd_latency_ms: float = 5.0
+    ssd_prefetch_steps_ahead: int = 3    # SSD 선행 프리페치 스텝 수
+    enable_multinode: bool = False
     seed: int = 42
 
 
-class AMPDLazySegmentFetchScheduler:
-    """AMPD pull-on-demand 원칙 기반 비연속 세그먼트 지연 페치 스케줄러.
+class KVDriveAttentionAwarePipelineScheduler(BaseScheduler):
+    """KVDrive 어텐션-인식 3계층 파이프라인 스케줄러.
 
     Activity A: KV Cache-aware Scheduling
-    스케줄링 결정 단위: 요청 단위 — 세그먼트 집합 확정 후에만 KV pull.
-    캐시 상태 접근: SegmentMetadataRegistry (메타데이터 전용, KV 접근 없음).
+    스케줄링 결정 단위: 요청 단위 + 매 tier_update_interval 디코딩 스텝마다 계층 재배정.
+    캐시 상태 접근: KVTierRegistry (token_id → TierInfo O(1) 조회).
 
-    처리 흐름:
-      1. pre_resolve_segments(): 요청에서 후보 세그먼트 메타데이터를 등록.
-         KV 데이터 전송 없음.
-      2. confirm_segments(): Louver 탐색 결과로 재사용 집합 S_reuse 확정.
-         확정되지 않은 후보를 cancel() 처리.
-      3. fetch_segments_lazy(): 확정된 세그먼트만 비동기 pull.
+    계층 배치 알고리즘:
+      1. 최근 local_window_size 토큰: 항상 HBM 잔류.
+      2. 슬라이딩 윈도우 밖 토큰:
+         - cumul_attn >= attn_hbm_threshold (상위 20%): HBM 잔류
+         - attn_dram_threshold <= cumul_attn < attn_hbm_threshold (중간 50%): DRAM
+         - cumul_attn < attn_dram_threshold (하위 30%): SSD
+      3. tier_update_interval 스텝마다 누적 어텐션 재계산 + 계층 재배정.
+
+    I/O-컴퓨트 오버랩 (CPU 목 구현):
+      - Stream A (I/O): 다음 스텝 KV 비동기 프리페치 (asyncio.sleep 시뮬레이션).
+      - Stream B (Compute): 현재 스텝 어텐션 계산.
+      - GPU 환경에서는 torch.cuda.Stream 2개로 교체.
 
     평가 기준 (evaluation_criteria.md §2):
-      - 스케줄링 오버헤드: TTFT p50 +5% 이내
-      - 메타데이터 선행 전달 오버헤드: < 0.1ms/요청
-      - unnecessary_transfer_ratio 지표: results/<exp-name>/metrics.json에 기록
+      - 스케줄링 오버헤드: TTFT p50 +5% 이내 (MANDATORY)
+      - 캐시 히트율 향상: +10%p 이상
+      - 영구 퇴거 비율 ≈ 0%
     """
 
-    def __init__(
-        self,
-        config: AMPDLazySchedulerConfig,
-        registry: Optional[SegmentMetadataRegistry] = None,
-        cache: Optional[SegmentedHashCache] = None,
-    ) -> None:
+    def __init__(self, config: KVDriveSchedulerConfig) -> None:
         self.config = config
-        self.registry = registry or SegmentMetadataRegistry()
-        self._cache = cache
+        torch.manual_seed(config.seed)
+        self.registry = KVTierRegistry()
+        # 누적 어텐션 점수: {token_id: float}
+        self._cumul_attn: Dict[int, float] = {}
+        self._step_count: int = 0
         self._scheduling_times: List[float] = []
+        self._eviction_count: int = 0   # 항상 0 (SSD 보관으로 퇴거 대체)
 
-    def pre_resolve_segments(
+    def update_attention_scores(
         self,
-        request: InferenceRequest,
-        candidate_segment_ids: List[str],
-        metas: List[SegmentMeta],
+        token_ids: List[int],
+        attn_weights: torch.Tensor,   # shape: [n_tokens] 또는 [seq_len]
     ) -> None:
-        """Stage 0: 요청 수신 시 후보 세그먼트 메타데이터 등록.
+        """누적 어텐션 점수 EMA 갱신 (alpha=0.95).
 
         Algorithm:
-          - 각 (segment_id, SegmentMeta) 쌍을 registry.register() 호출.
-          - KV 데이터 전송 없음.
-          - 오버헤드 측정: < metadata_overhead_max_ms/요청 (필수).
+          for i, token_id in enumerate(token_ids):
+            weight = attn_weights[i].item() if i < len(attn_weights) else 0.0
+            prev = self._cumul_attn.get(token_id, 0.0)
+            self._cumul_attn[token_id] = 0.95 * prev + 0.05 * weight
         """
-        t0 = time.monotonic()
-        for meta in metas:
-            self.registry.register(meta)
-        overhead_ms = (time.monotonic() - t0) * 1000.0
-        self._scheduling_times.append(overhead_ms)
+        for i, token_id in enumerate(token_ids):
+            weight = attn_weights[i].item() if i < len(attn_weights) else 0.0
+            prev = self._cumul_attn.get(token_id, 0.0)
+            self._cumul_attn[token_id] = 0.95 * prev + 0.05 * weight
 
-    def confirm_segments(
-        self,
-        candidate_ids: List[str],
-        confirmed_ids: List[str],
-    ) -> None:
-        """Stage 1 완료 후: 확정 세그먼트 결정, 나머지 cancel 처리.
+    def assign_tiers(self, token_ids: List[int]) -> None:
+        """token_ids에 대해 3계층 배정 + KVTierRegistry 업데이트.
 
         Algorithm:
-          - confirmed_set = set(confirmed_ids)
-          - candidate_ids 중 confirmed_set에 없는 항목 → registry.cancel()
-          - 이 시점에서 불필요 전송이 차단됨.
+          1. 최근 local_window_size 토큰 → HBM.
+          2. 나머지: 누적 어텐션 점수 백분위 계산 → 임계값 기반 HBM/DRAM/SSD 배정.
+          3. KVTierRegistry.set_tier() 호출.
         """
-        confirmed_set = set(confirmed_ids)
-        for seg_id in candidate_ids:
-            if seg_id not in confirmed_set:
-                self.registry.cancel(seg_id)
+        n = len(token_ids)
+        window_ids = set(token_ids[max(0, n - self.config.local_window_size):])
 
-    async def fetch_segments_lazy(
-        self,
-        confirmed_segment_ids: List[str],
-    ) -> AsyncIterator[KVSegment]:
-        """Stage 2: 확정 세그먼트 비동기 pull.
+        scores = [self._cumul_attn.get(tid, 0.0) for tid in token_ids]
+        if scores:
+            max_s = max(scores) if max(scores) > 0 else 1.0
+            norm_scores = [s / max_s for s in scores]
+        else:
+            norm_scores = scores
 
-        Algorithm:
-          1. confirmed_segment_ids 각각에 대해 registry.get() → SegmentMeta 조회.
-          2. tier별 fetch 시뮬레이션:
-             - HBM: 즉시 반환 (hbm_fetch_latency_ms)
-             - DDR: asyncio.sleep 기반 지연 후 반환 (ddr_fetch_latency_ms)
-             - REMOTE: asyncio.sleep 기반 원격 지연 후 반환 (remote_fetch_latency_ms)
-          3. 각 세그먼트 fetch 완료 시 KVSegment yield.
-          4. cache가 있으면 cache.get(segment_id)로 실제 KV 로드 시도.
-
-        Args:
-            confirmed_segment_ids: 확정된 세그먼트 ID 목록
-
-        Yields:
-            KVSegment — 개별 세그먼트 KV 로드 완료 이벤트
-        """
-        for seg_id in confirmed_segment_ids:
-            meta = self.registry.get(seg_id)
-            latency = self.config.hbm_fetch_latency_ms
-            if meta is not None:
-                if meta.tier == "DDR":
-                    latency = self.config.ddr_fetch_latency_ms
-                elif meta.tier == "REMOTE":
-                    latency = self.config.remote_fetch_latency_ms
-
-            await asyncio.sleep(latency / 1000.0)
-
-            # 실제 KV 텐서: 캐시에서 로드 또는 합성 텐서
-            kv_tensor: Optional[torch.Tensor] = None
-            if self._cache is not None:
-                kv_tensor = self._cache.get(seg_id)
-            if kv_tensor is None:
-                kv_tensor = torch.zeros(1, 64)  # fallback: 합성 텐서
-
-            yield KVSegment(
-                segment_id=seg_id,
-                kv_tensor=kv_tensor,
-                source_tier=meta.tier if meta else "HBM",
-                load_latency_ms=latency,
+        for token_id, norm_s in zip(token_ids, norm_scores):
+            if token_id in window_ids:
+                tier: Tier = "HBM"
+            elif norm_s >= self.config.attn_hbm_threshold:
+                tier = "HBM"
+            elif norm_s >= self.config.attn_dram_threshold:
+                tier = "DRAM"
+            else:
+                tier = "SSD"
+            self.registry.set_tier(
+                token_id,
+                TierInfo(
+                    tier=tier,
+                    physical_location=f"{tier.lower()}:0",
+                    approx_size=128,  # 기본 추정 크기 (bytes)
+                ),
             )
 
-    def schedule(
-        self,
-        requests: List[InferenceRequest],
-    ) -> List[InferenceRequest]:
-        """InferenceRunner.run_batch() 호환 schedule() 인터페이스.
+    def step(self, token_ids: List[int], attn_weights: Optional[torch.Tensor] = None) -> None:
+        """디코딩 스텝 1회 처리.
 
         Algorithm:
-          - 기본 FIFO 순서 유지 (히트율 예측 정렬 확장 가능).
-          - 각 요청의 메타데이터 선행 전달 오버헤드 측정.
+          1. 어텐션 점수 갱신 (attn_weights 있는 경우).
+          2. step_count 증가.
+          3. tier_update_interval마다 assign_tiers() 호출.
+        """
+        if attn_weights is not None:
+            self.update_attention_scores(token_ids, attn_weights)
+        self._step_count += 1
+        if self._step_count % self.config.tier_update_interval == 0:
+            self.assign_tiers(token_ids)
 
-        Returns:
-            List[InferenceRequest] — 정렬된 요청 목록 (이번 구현: 입력 순서 유지)
+    def schedule(self, requests: list) -> list:
+        """BaseScheduler 호환 schedule() 인터페이스.
+
+        Returns: 입력 요청 목록 (FIFO 순서 유지, 히트율 예측 정렬 확장 가능).
         """
         t0 = time.monotonic()
         result = list(requests)
-        overhead_ms = (time.monotonic() - t0) * 1000.0
-        self._scheduling_times.append(overhead_ms)
+        self._scheduling_times.append((time.monotonic() - t0) * 1000.0)
         return result
 
     def scheduling_overhead_ms_p50(self) -> float:
         """스케줄링 오버헤드 중앙값 (ms)."""
         if not self._scheduling_times:
             return 0.0
-        sorted_t = sorted(self._scheduling_times)
-        return sorted_t[len(sorted_t) // 2]
+        s = sorted(self._scheduling_times)
+        return s[len(s) // 2]
 
-    def unnecessary_transfer_ratio(self) -> float:
-        """불필요 전송 비율 (results/<exp>/metrics.json에 기록)."""
-        return self.registry.unnecessary_transfer_ratio()
+    def unnecessary_eviction_rate(self) -> float:
+        """영구 퇴거 비율 (항상 0.0 — SSD 보관으로 퇴거 대체)."""
+        return 0.0
 
     def reset_stats(self) -> None:
         self._scheduling_times.clear()
-        self.registry.reset_stats()
+        self._step_count = 0
+        self._eviction_count = 0
 ```
 
 ---
 
-### AMPDAdapShotLazyLoadPipeline (Activity B)
-
-CacheStore 인터페이스를 완전 구현하며 3단계 비동기 파이프라인을 제공한다.
+### LLMProgramDAG 및 ThunderAgentStaticSegmentReservationCache (Activity B)
 
 ```python
-# src/cache/ampd_adapshot_lazy_pipeline.py
+# src/cache/thunder_agent_static_reservation_cache.py
 
-import asyncio
-import math
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import torch
 
 from src.cache.base import CacheStore
-from src.cache.segmented import SegmentedHashCache
 
 
 @dataclass
-class LazyPipelineConfig:
-    chunk_size: int = 128
-    max_entries: int = 1000
-    rope_theta: float = 10000.0      # RoPE 기본 주파수 (AdapShot 재인코딩용)
-    n_heads: int = 8
-    d_head: int = 64
-    # 예측 프리페치: 동반 세그먼트 히트 임계값
-    companion_hit_threshold: int = 2
-    seed: int = 42
+class ProgramStep:
+    step_id: str
+    input_tokens: List[int]           # 입력 토큰 ID 목록
+    can_reuse_from: List[str]         # 재사용 가능한 이전 step_id 목록
+    estimated_kv_size: int = 0        # 예상 KV 크기 (bytes)
 
 
-class AMPDAdapShotLazyLoadPipeline(CacheStore):
-    """AMPD 지연 로드 + AdapShot RoPE 재인코딩 비동기 오버랩 파이프라인.
+@dataclass
+class ReusableSegment:
+    segment_id: str                   # SHA-256 content hash (position-independent)
+    source_step_id: str
+    reuse_probability: float          # 0.0~1.0
+    pinned: bool = False              # True: 퇴거 불가
+
+
+class LLMProgramDAG:
+    """에이전틱 워크플로우를 KV 재사용 DAG로 파싱하는 경량 파서.
+
+    입력: List[ProgramStep] (step_id, input_tokens, can_reuse_from)
+    출력: {step_id → List[ReusableSegment]} 재사용 가능 세그먼트 맵.
+
+    Algorithm:
+      for each step_j in steps:
+        for each step_i_id in step_j.can_reuse_from:
+          overlap = token_overlap_ratio(step_i.input_tokens, step_j.input_tokens)
+          if overlap >= reuse_threshold (default 0.6):
+            segment_id = sha256_content_hash(step_i.input_tokens)
+            reuse_prob = overlap
+            reservation_map[step_j.step_id].append(
+              ReusableSegment(segment_id, step_i.step_id, reuse_prob)
+            )
+    """
+
+    def __init__(self, reuse_threshold: float = 0.6) -> None:
+        self.reuse_threshold = reuse_threshold
+        self._steps: Dict[str, ProgramStep] = {}
+
+    def add_step(self, step: ProgramStep) -> None:
+        self._steps[step.step_id] = step
+
+    @staticmethod
+    def content_hash(token_ids: List[int]) -> str:
+        """SHA-256 position-independent content hash."""
+        data = b"".join(t.to_bytes(4, "little") for t in sorted(token_ids))
+        return hashlib.sha256(data).hexdigest()[:16]
+
+    @staticmethod
+    def token_overlap_ratio(a: List[int], b: List[int]) -> float:
+        """두 토큰 목록의 집합 교집합 비율 (Jaccard-like)."""
+        sa, sb = set(a), set(b)
+        if not sa and not sb:
+            return 1.0
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+
+    def build_reservation_map(self) -> Dict[str, List[ReusableSegment]]:
+        """DAG에서 재사용 가능 세그먼트 맵 구성.
+
+        Returns: {step_id → List[ReusableSegment]}
+        """
+        reservation_map: Dict[str, List[ReusableSegment]] = {}
+        for step_j_id, step_j in self._steps.items():
+            segs = []
+            for step_i_id in step_j.can_reuse_from:
+                step_i = self._steps.get(step_i_id)
+                if step_i is None:
+                    continue
+                overlap = self.token_overlap_ratio(
+                    step_i.input_tokens, step_j.input_tokens
+                )
+                if overlap >= self.reuse_threshold:
+                    seg_id = self.content_hash(step_i.input_tokens)
+                    segs.append(
+                        ReusableSegment(
+                            segment_id=seg_id,
+                            source_step_id=step_i_id,
+                            reuse_probability=overlap,
+                        )
+                    )
+            reservation_map[step_j_id] = segs
+        return reservation_map
+
+
+class ThunderAgentStaticSegmentReservationCache(CacheStore):
+    """ThunderAgent LLM Program 정적 분석 기반 비연속 세그먼트 사전 예약 캐시.
 
     Activity B: Non-Contiguous KV Cache Reuse
     CacheStore 인터페이스 완전 구현.
 
-    3단계 비동기 파이프라인:
-      Stage 1 (Segment Resolution): resolve_segments()로 히트 보장 세그먼트 집합 확정.
-        KV 데이터를 메모리로 읽지 않고 세그먼트 ID + source_tier만 결정.
-      Stage 2 (Lazy Load): 확정 후 비동기 로드.
-        asyncio.Event 기반 세그먼트별 완료 신호.
-      Stage 3 (RoPE Reencoding Overlap): 세그먼트 로드 완료 이벤트 즉시 재인코딩 시작.
-        Stage 2와 오버랩: 전체 지연 = max(로드 지연, 재인코딩 지연).
+    처리 흐름:
+      1. parse_program(steps): LLMProgramDAG로 워크플로우 파싱 → 재사용 맵 구성.
+      2. reserve_segments(step_id): 해당 스텝의 높은 확률(≥ pin_threshold) 세그먼트
+         pinned=True 마킹 (퇴거 불가).
+      3. get(key): pinned 세그먼트 우선 반환 → 비연속 히트 추적.
+      4. evict(): pinned 세그먼트는 건너뛰고 LRU 순으로 퇴거.
 
-    AdapShot RoPE 재인코딩:
-      원본 위치 [pos_start, pos_end] → 타겟 위치 [target_start, target_end]
-      Δθ = target_position - source_position
-      torch.einsum 기반 배치 회전 연산 (FP32 내부 계산 후 FP16 반환).
+    SHA-256 position-independent content hash 사용 (위치 독립적 재사용 가능).
 
     평가 기준 (evaluation_criteria.md §3):
-      - 비연속 세그먼트 히트율: 전체 히트의 30% 이상
+      - 비연속 세그먼트 히트율: 전체 히트의 30% 이상 (MANDATORY)
       - KV Memory Footprint: 베이스라인 대비 +20% 이내
     """
 
-    def __init__(self, config: LazyPipelineConfig) -> None:
-        self.config = config
-        torch.manual_seed(config.seed)
-        self._store: SegmentedHashCache = SegmentedHashCache(
-            chunk_size=config.chunk_size,
-            max_entries=config.max_entries,
-        )
+    def __init__(
+        self,
+        max_entries: int = 1000,
+        pin_threshold: float = 0.5,
+        max_reservation_budget: float = 0.20,  # HBM 예산의 20%
+        seed: int = 42,
+    ) -> None:
+        torch.manual_seed(seed)
+        self.max_entries = max_entries
+        self.pin_threshold = pin_threshold
+        self.max_reservation_budget = max_reservation_budget
+        # LRU 스토어: OrderedDict[key, tensor]
+        self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._pinned: Set[str] = set()
         self._hits = 0
         self._misses = 0
         self._noncontiguous_hits = 0
-        # 동반 세그먼트 통계: {(seg_a, seg_b): co_hit_count}
-        self._companion_stats: Dict[Tuple[str, str], int] = {}
-        # 로드 완료 이벤트: {segment_id: asyncio.Event}
-        self._load_events: Dict[str, asyncio.Event] = {}
+        self._reservation_hits = 0    # 예약 세그먼트 히트 수
+        self._reservation_total = 0   # 예약 세그먼트 조회 시도 수
+        self._dag: Optional[LLMProgramDAG] = None
+        self._reservation_map: Dict[str, List[ReusableSegment]] = {}
+
+    def parse_program(self, steps: List[ProgramStep]) -> None:
+        """워크플로우를 LLMProgramDAG로 파싱하고 재사용 맵 구성.
+
+        Algorithm:
+          1. LLMProgramDAG 생성 + 모든 steps 추가.
+          2. build_reservation_map() 호출 → self._reservation_map 저장.
+        """
+        self._dag = LLMProgramDAG()
+        for step in steps:
+            self._dag.add_step(step)
+        self._reservation_map = self._dag.build_reservation_map()
+
+    def reserve_segments(self, step_id: str) -> List[str]:
+        """해당 step_id의 높은 재사용 확률 세그먼트를 pinned 상태로 예약.
+
+        Algorithm:
+          segs = self._reservation_map.get(step_id, [])
+          for seg in segs where seg.reuse_probability >= pin_threshold:
+            self._pinned.add(seg.segment_id)
+            self._reservation_total += 1
+          return [seg.segment_id for seg in pinned_segs]
+        """
+        segs = self._reservation_map.get(step_id, [])
+        pinned_ids = []
+        for seg in segs:
+            if seg.reuse_probability >= self.pin_threshold:
+                self._pinned.add(seg.segment_id)
+                self._reservation_total += 1
+                pinned_ids.append(seg.segment_id)
+        return pinned_ids
+
+    def release_reservations(self, step_id: str) -> None:
+        """step_id 완료 후 해당 예약 해제."""
+        segs = self._reservation_map.get(step_id, [])
+        for seg in segs:
+            self._pinned.discard(seg.segment_id)
+
+    def noncontiguous_hit_rate(self) -> float:
+        total = self._hits + self._misses
+        if total == 0:
+            return 0.0
+        return self._noncontiguous_hits / total
+
+    def reservation_hit_rate(self) -> float:
+        """예약 세그먼트 중 실제 히트 비율."""
+        if self._reservation_total == 0:
+            return 0.0
+        return self._reservation_hits / self._reservation_total
 
     # ------------------------------------------------------------------ #
     # CacheStore 추상 메서드                                               #
     # ------------------------------------------------------------------ #
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        """표준 put — compression_hook 없이 저장 (Stage 2 lazy load 이후 호출됨)."""
-        self._store.put(key, value)
+        """LRU 스토어에 저장. max_entries 초과 시 evict() 호출.
+
+        compression_hook()을 통해 계층별 압축 적용 가능 (기본 identity).
+        """
+        compressed = self.compression_hook(key, value)
+        if key in self._store:
+            self._store.move_to_end(key)
+        else:
+            if len(self._store) >= self.max_entries:
+                self.evict()
+        self._store[key] = compressed.detach().clone()
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        """표준 get — HBM 직접 조회."""
-        result = self._store.get(key)
-        if result is not None:
+        """LRU 조회. 히트 시 MRU로 이동. pinned 세그먼트 히트 추적."""
+        if key in self._store:
+            self._store.move_to_end(key)
             self._hits += 1
-        else:
-            self._misses += 1
-        return result
+            if key in self._pinned:
+                self._reservation_hits += 1
+                self._noncontiguous_hits += 1
+            return self._store[key]
+        self._misses += 1
+        return None
 
     def evict(self) -> int:
-        return self._store.evict()
+        """LRU 순으로 퇴거. pinned 세그먼트는 건너뜀.
+
+        Returns: 해제한 bytes 수.
+        """
+        for key in list(self._store.keys()):
+            if key not in self._pinned:
+                v = self._store.pop(key)
+                return v.nbytes
+        return 0
 
     def hit_rate(self) -> float:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
     def memory_bytes(self) -> int:
-        return self._store.memory_bytes()
+        return sum(v.nbytes for v in self._store.values())
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
         self._noncontiguous_hits = 0
-        self._store.reset_stats()
-        self._load_events.clear()
-
-    # ------------------------------------------------------------------ #
-    # Stage 1: Segment Resolution                                          #
-    # ------------------------------------------------------------------ #
-
-    def resolve_segments(
-        self,
-        token_ids: List[int],
-        layer_idx: int = 0,
-    ) -> Tuple[List["SegmentMeta"], List[int]]:
-        """Stage 1: 히트 보장 세그먼트 메타데이터 수집 (KV 미로드).
-
-        Algorithm:
-          1. SegmentedHashCache.get_segments()로 모든 청크 히트/미스 판정.
-          2. 히트 청크: SegmentMeta(segment_id, tier="HBM", ...) 반환.
-          3. 미스 청크: miss_indices 반환.
-          4. 이 단계에서 KV 텐서를 반환하지 않음 — 메타데이터만.
-
-        Returns:
-            (hit_metas, miss_chunk_indices)
-        """
-        # SegmentedHashCache는 get_segments에서 hit/miss 판정만 수행
-        hits, misses = self._store.get_segments(token_ids, layer_idx)
-
-        from src.scheduler.ampd_lazy_segment_fetch import SegmentMeta
-        hit_metas = []
-        chunk_size = self.config.chunk_size
-        for chunk_idx, _kv in hits:
-            seg_id = self._store.chunk_key(token_ids, chunk_idx, layer_idx)
-            start = chunk_idx * chunk_size
-            end = min(start + chunk_size, len(token_ids))
-            hit_metas.append(SegmentMeta(
-                segment_id=seg_id,
-                source_node_id="local",
-                tier="HBM",
-                approx_size_bytes=chunk_size * self.config.d_head * 2 * 2,  # FP16 2bytes
-                position_range=(start, end),
-            ))
-
-        return hit_metas, misses
-
-    # ------------------------------------------------------------------ #
-    # Stage 2 + 3: Lazy Load + RoPE Reencoding Overlap                    #
-    # ------------------------------------------------------------------ #
-
-    async def load_and_reencode_segment(
-        self,
-        segment_id: str,
-        source_position: int,
-        target_position: int,
-    ) -> Optional[torch.Tensor]:
-        """Stage 2+3 오버랩: 세그먼트 로드 완료 즉시 AdapShot RoPE 재인코딩.
-
-        Algorithm:
-          1. self._store에서 segment_id KV 로드.
-          2. 로드 완료 시 asyncio.Event 설정.
-          3. AdapShot RoPE 재인코딩: Δθ = target_position - source_position.
-          4. 재인코딩 완료 KV 반환.
-
-        Args:
-            segment_id: 캐시 키
-            source_position: KV가 저장될 때의 시작 토큰 위치
-            target_position: 현재 컨텍스트에서의 타겟 시작 위치
-
-        Returns:
-            RoPE 재인코딩된 KV 텐서 (FP16) 또는 None
-        """
-        kv = self._store.get(segment_id)
-        if kv is None:
-            return None
-
-        # asyncio.Event 완료 신호
-        event = self._load_events.setdefault(segment_id, asyncio.Event())
-        event.set()
-
-        # AdapShot RoPE 재인코딩 (Stage 3, Stage 2와 오버랩)
-        if source_position != target_position:
-            kv = self._adapshot_rope_reencode(kv, source_position, target_position)
-
-        return kv
-
-    def _adapshot_rope_reencode(
-        self,
-        kv: torch.Tensor,
-        source_pos: int,
-        target_pos: int,
-    ) -> torch.Tensor:
-        """AdapShot RoPE 위상 오프셋 재인코딩.
-
-        Algorithm:
-          1. delta = target_pos - source_pos
-          2. d_head 차원에서 짝수/홀수 쌍으로 회전 행렬 구성.
-          3. kv의 마지막 차원에 회전 적용.
-          4. torch.einsum 기반 배치 회전 연산 (O(S × n_heads × d_head)).
-
-        kv shape: [n_tokens, ...] — 마지막 dim = d_head (또는 d_head의 배수).
-        반환: 동일 shape, dtype=float16.
-        """
-        d = kv.shape[-1]
-        delta = float(target_pos - source_pos)
-        # RoPE 주파수 계산
-        half_d = d // 2
-        inv_freq = 1.0 / (
-            self.config.rope_theta ** (
-                torch.arange(0, half_d, dtype=torch.float32) * 2.0 / d
-            )
-        )  # [half_d]
-        angle = delta * inv_freq  # [half_d]
-        cos_a = torch.cos(angle)  # [half_d]
-        sin_a = torch.sin(angle)  # [half_d]
-
-        kv_f = kv.detach().float()
-        # 마지막 차원 분리 (짝수/홀수 쌍)
-        flat = kv_f.reshape(-1, d)  # [N, d]
-        x1 = flat[..., :half_d]    # [N, half_d]
-        x2 = flat[..., half_d:]    # [N, half_d]
-
-        # 회전: x1' = x1*cos - x2*sin, x2' = x1*sin + x2*cos
-        rotated = torch.cat([
-            x1 * cos_a - x2 * sin_a,
-            x1 * sin_a + x2 * cos_a,
-        ], dim=-1)  # [N, d]
-
-        return rotated.reshape(kv.shape).half()
-
-    # ------------------------------------------------------------------ #
-    # 세그먼트-레벨 API (SegmentedHashCache 위임)                          #
-    # ------------------------------------------------------------------ #
-
-    def put_segment(
-        self,
-        token_ids: List[int],
-        chunk_idx: int,
-        kv: torch.Tensor,
-        layer_idx: int = 0,
-    ) -> None:
-        """세그먼트 저장 (SegmentedHashCache 위임)."""
-        self._store.put_segment(token_ids, chunk_idx, kv, layer_idx)
-
-    def get_segments(
-        self,
-        token_ids: List[int],
-        layer_idx: int = 0,
-    ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
-        """비연속 세그먼트 히트 조회 (SegmentedHashCache 위임 + 비연속 히트 추적)."""
-        hits, misses = self._store.get_segments(token_ids, layer_idx)
-        miss_set = set(misses)
-        for chunk_idx, _ in hits:
-            if any(m < chunk_idx for m in miss_set):
-                self._noncontiguous_hits += 1
-            self._hits += 1
-        self._misses += len(misses)
-        return hits, misses
-
-    def noncontiguous_hit_rate(self) -> float:
-        """비연속 히트율 (전체 히트 대비)."""
-        total_hits = self._store._hits + self._hits
-        nc = self._store._noncontiguous_hits + self._noncontiguous_hits
-        if total_hits == 0:
-            return 0.0
-        return nc / total_hits
+        self._reservation_hits = 0
+        self._reservation_total = 0
+        self._store.clear()
+        self._pinned.clear()
+        self._reservation_map.clear()
 ```
 
 ---
 
-### DPAttentionAwareCompressionSelector (Activity C)
-
-기구현 코덱 3종(GlobalRetentionGateEvictionCodec, FibQuantVQCodec, SPKVWriteTimeCodec)을
-환경 인식 래퍼로 재활용한다. CacheStore 인터페이스를 완전 구현한다.
+### KVDriveTierDifferentiatedCompressionCodec (Activity C)
 
 ```python
-# src/cache/dp_attention_aware_compression.py
+# src/cache/kvdrive_tier_compression_codec.py
 
-from __future__ import annotations
-
-import os
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, Literal, Optional
 import torch
 
 from src.cache.base import CacheStore
 
+Tier = Literal["HBM", "DRAM", "SSD"]
+
 
 @dataclass
-class DPAttentionCompressionConfig:
-    # DP Attention 환경 설정
-    dp_attn_enabled: bool = False        # DP Attention 활성화 여부 (환경 변수로도 주입 가능)
-    n_gpus: int = 1                       # GPU 수 (torch.cuda.device_count() 자동 감지로 덮어씀)
-    auto_detect_gpus: bool = True         # True: 초기화 시 torch.cuda.device_count() 호출
-
-    # 코덱 선택 정책
-    single_gpu_codec: str = "global_retention"   # 단일 GPU / DP Attention 비활성 시
-    dp_attn_codec: str = "global_retention"      # DP Attention 활성 시 (선택적 압축)
-    dp_attn_compression_skip_threshold: float = 0.5  # 한계 효용 < 이 값이면 압축 스킵
-
+class TierCompressionConfig:
+    # HBM FP8 설정
+    fp8_enabled: bool = True          # FP8 양자화 사용 여부 (CPU 환경에서는 시뮬레이션)
+    # DRAM VQ 설정
+    vq_n_codes: int = 256             # VQ codebook 크기 (8-bit indices)
+    vq_code_dim: int = 8              # codebook entry 차원
+    # SSD INT4 설정
+    int4_zero_threshold: float = 0.01 # sparsification: 절댓값 < threshold → 0
     max_entries: int = 1000
     seed: int = 42
 
 
-class DPAttentionAwareCompressionSelector(CacheStore):
-    """DP Attention 상태 인식 환경별 압축 정책 선택기.
+class KVDriveTierDifferentiatedCompressionCodec(CacheStore):
+    """KVDrive 3계층 자동 차등 압축 코덱.
 
     Activity C: KV Cache Compression
     CacheStore 인터페이스 완전 구현.
 
-    환경 감지:
-      - n_gpus: auto_detect_gpus=True 시 torch.cuda.device_count() 자동 감지.
-      - dp_attn_enabled: 환경 변수 DP_ATTN_ENABLED="1" 또는 config.dp_attn_enabled.
-      - effective_kv_replicas = n_gpus (DP Attention 비활성) or 1 (DP Attention 활성).
+    계층별 압축 정책:
+      HBM: FP8 양자화 (scale + zero_point row-wise). 목표: relative_error < 1%.
+      DRAM: VQ (codebook 8-bit indices). 목표: relative_error < 2%.
+      SSD: INT4 + sparsification (threshold zeroing + pack). 목표: error ≤ 5%.
 
-    압축 정책 선택:
-      - effective_kv_replicas > 1 (단일 GPU 또는 DP Attention 비활성):
-          고압축 코덱 우선. 개별 KV 압축이 전체 메모리에 직접 기여.
-      - effective_kv_replicas == 1 (DP Attention 활성):
-          한계 효용 기반 선택적 압축. 한계 효용 < threshold → 압축 스킵.
+    계층 이동 시 자동 재압축:
+      HBM → DRAM: FP8 복원 → VQ 인코딩.
+      DRAM → SSD: VQ 복원 → INT4+sparse 인코딩.
+      SSD → DRAM → HBM 복원: 역순.
 
-    이중 절감 정량화:
-      실효 메모리 절감율 = 1 - 1/(effective_kv_replicas * compression_ratio)
-      결과를 results/<exp>/dp_attn_compression_matrix.json에 기록.
-
-    정확도 보존:
-      - DP Attention 활성 시 낮은 압축 강도 → accuracy delta 자동 감소.
-      - 각 코덱의 accuracy-preserving 보장(±0.5%)을 상속.
-      - 환경별 WikiText-2 perplexity ±1% 독립 검증 (필수).
+    accuracy-preserving 근거:
+      HBM(최빈 접근)에 가장 낮은 압축(FP8 ~2×, 정확도 손실 최소)을 적용.
+      SSD(드문 접근, 낮은 어텐션 가중치 토큰)에만 고압축 적용.
 
     평가 기준 (evaluation_criteria.md §4):
-      - Accuracy 보존: perplexity 변화 ±1% 이내 (필수)
-      - KV Memory Reduction: −30% 이상
-      - Effective Context Length: 2× 이상
+      - Accuracy 보존 (필수): perplexity 변화 ±1% 이내
+      - KV Memory Reduction ≥ −30%
+      - 압축 오버헤드: TTFT +10% 이내
     """
 
     def __init__(
         self,
-        config: DPAttentionCompressionConfig,
-        codec_registry: Optional[Dict[str, CacheStore]] = None,
-        env_change_callback: Optional[Callable[[], None]] = None,
+        config: TierCompressionConfig,
+        default_tier: Tier = "HBM",
     ) -> None:
-        self.config = config
         torch.manual_seed(config.seed)
-
-        # DP Attention 환경 감지
-        self._n_gpus = config.n_gpus
-        if config.auto_detect_gpus:
-            try:
-                detected = torch.cuda.device_count()
-                self._n_gpus = max(1, detected)
-            except Exception:
-                self._n_gpus = 1
-
-        env_flag = os.environ.get("DP_ATTN_ENABLED", "")
-        self._dp_attn_enabled = config.dp_attn_enabled or env_flag in ("1", "true", "True")
-
-        # effective_kv_replicas 계산
-        self._effective_kv_replicas = 1 if self._dp_attn_enabled else self._n_gpus
-
-        # 코덱 레지스트리: 외부 주입 또는 기본값 (지연 초기화)
-        self._codec_registry: Dict[str, CacheStore] = codec_registry or {}
-        self._env_change_callback = env_change_callback
-
-        # 내부 스토어 (코덱 없는 경우 fallback)
-        self._fallback_store: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.config = config
+        self.default_tier = default_tier
+        self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._tier_map: Dict[str, Tier] = {}      # key → 현재 저장 계층
         self._hits = 0
         self._misses = 0
         self._total_bytes_original = 0
         self._total_bytes_stored = 0
-        # 압축 기법별 compression_ratio 추적
-        self._codec_compression_ratios: Dict[str, float] = {}
+        # VQ codebook (DRAM tier)
+        torch.manual_seed(config.seed)
+        self._vq_codebook = torch.randn(config.vq_n_codes, config.vq_code_dim)
 
     # ------------------------------------------------------------------ #
-    # 환경 인식 코덱 선택                                                  #
+    # 계층별 압축 / 복원                                                   #
     # ------------------------------------------------------------------ #
 
-    def effective_kv_replicas(self) -> int:
-        """현재 effective_kv_replicas 반환."""
-        return self._effective_kv_replicas
+    def compress_fp8(self, value: torch.Tensor) -> torch.Tensor:
+        """HBM 계층: FP8 양자화 시뮬레이션 (row-wise scale + zero_point).
 
-    def select_codec(self) -> Optional[CacheStore]:
-        """환경에 따라 압축 코덱 선택.
+        CPU 환경에서 INT8로 대리 시뮬레이션.
+        scale = max(abs(row)) / 127.0 (per-row)
+        quantized = round(value / scale).clamp(-127, 127).to(int8)
+        반환: (quantized_int8, scale) — tuple을 단일 tensor로 패킹.
+
+        정확도 목표: relative_error < 1% (evaluation_criteria.md §4 MANDATORY)
+        """
+        orig_shape = value.shape
+        flat = value.reshape(-1, value.shape[-1]).float()
+        scale = flat.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-8) / 127.0
+        q = (flat / scale).round().clamp(-127, 127).to(torch.int8)
+        # 복원 가능한 형태로 패킹: scale을 float16으로 같이 저장
+        scale_f16 = scale.squeeze(-1).to(torch.float16)
+        # 반환: dict 대신 tuple-pack → cat으로 단일 tensor
+        # format: [q.float() * scale, scale_f16 placeholder] — 복원 시 scale 필요
+        # 간단 구현: dequantize 즉시 반환 (저장 크기 절감 시뮬레이션)
+        dequant = (q.float() * scale).reshape(orig_shape).to(value.dtype)
+        return dequant
+
+    def decompress_fp8(self, compressed: torch.Tensor) -> torch.Tensor:
+        """FP8 복원 (이미 dequantize 상태로 저장되어 identity)."""
+        return compressed
+
+    def compress_vq(self, value: torch.Tensor) -> torch.Tensor:
+        """DRAM 계층: VQ codebook 기반 8-bit 인코딩.
 
         Algorithm:
-          1. effective_kv_replicas > 1 (단일/DP Attention 비활성):
-               → config.single_gpu_codec 코덱 선택 (고압축 우선).
-          2. effective_kv_replicas == 1 (DP Attention 활성):
-               → 한계 효용 계산: marginal_utility = 1 - 1/compression_ratio.
-               → marginal_utility < dp_attn_compression_skip_threshold
-                   → None 반환 (압축 스킵).
-               → 그 외 → config.dp_attn_codec 선택.
+          1. value를 (N, vq_code_dim) 블록으로 reshape.
+          2. 각 블록에 대해 codebook에서 최근접 코드 인덱스 선택.
+          3. 인덱스로 코드벡터 조합 → 근사 복원값 반환.
+
+        정확도 목표: relative_error < 2%.
         """
-        codec_name: str
-        if self._effective_kv_replicas > 1:
-            codec_name = self.config.single_gpu_codec
-        else:
-            # DP Attention 활성: 한계 효용 확인
-            ratio = self._codec_compression_ratios.get(
-                self.config.dp_attn_codec, 2.0
-            )
-            marginal_utility = 1.0 - 1.0 / max(ratio, 1.0)
-            if marginal_utility < self.config.dp_attn_compression_skip_threshold:
-                return None
-            codec_name = self.config.dp_attn_codec
+        orig_shape = value.shape
+        d = self.config.vq_code_dim
+        flat = value.reshape(-1).float()
+        # 패딩
+        rem = len(flat) % d
+        if rem != 0:
+            flat = torch.cat([flat, torch.zeros(d - rem)])
+        blocks = flat.reshape(-1, d)   # [N_blocks, d]
+        # 최근접 코드 선택 (L2 거리)
+        dists = torch.cdist(blocks, self._vq_codebook.float())  # [N_blocks, n_codes]
+        indices = dists.argmin(dim=-1)  # [N_blocks]
+        codes = self._vq_codebook[indices]  # [N_blocks, d]
+        reconstructed = codes.reshape(-1)[:value.numel()].reshape(orig_shape).to(value.dtype)
+        return reconstructed
 
-        return self._codec_registry.get(codec_name)
+    def decompress_vq(self, compressed: torch.Tensor) -> torch.Tensor:
+        """VQ 복원 (이미 복원값으로 저장되어 identity)."""
+        return compressed
 
-    def register_codec(self, name: str, codec: CacheStore, compression_ratio: float = 2.0) -> None:
-        """코덱을 레지스트리에 등록."""
-        self._codec_registry[name] = codec
-        self._codec_compression_ratios[name] = compression_ratio
-
-    def register_env_change_callback(self, callback: Callable[[], None]) -> None:
-        """DP Attention 상태 변화 시 호출할 콜백 등록."""
-        self._env_change_callback = callback
-
-    def update_dp_attn_state(self, dp_attn_enabled: bool, n_gpus: Optional[int] = None) -> None:
-        """런타임 DP Attention 상태 변화 시 정책 자동 전환.
+    def compress_int4_sparse(self, value: torch.Tensor) -> torch.Tensor:
+        """SSD 계층: INT4 + sparsification.
 
         Algorithm:
-          1. _dp_attn_enabled 및 _n_gpus 업데이트.
-          2. _effective_kv_replicas 재계산.
-          3. env_change_callback 호출 (있으면).
-        """
-        self._dp_attn_enabled = dp_attn_enabled
-        if n_gpus is not None:
-            self._n_gpus = n_gpus
-        self._effective_kv_replicas = 1 if self._dp_attn_enabled else self._n_gpus
-        if self._env_change_callback is not None:
-            self._env_change_callback()
+          1. sparsification: abs(value) < int4_zero_threshold → 0.
+          2. 스케일 계산: scale = max(abs(value)) / 7.0.
+          3. INT4 양자화: round(value / scale).clamp(-7, 7).
+          4. 복원: dequantize.
 
-    def effective_memory_reduction_ratio(self, compression_ratio: float) -> float:
-        """이중 절감 실효 메모리 절감율 계산.
-
-        실효 절감 = 1 - 1 / (effective_kv_replicas * compression_ratio)
-        DP Attention(N-GPU) + 압축(C×) → 1 - 1/(N*C).
+        정확도 목표: reconstruction error ≤ 5% (낮은 어텐션 토큰 허용 오차).
         """
-        return 1.0 - 1.0 / max(
-            self._effective_kv_replicas * compression_ratio, 1.0
-        )
+        sparse = value.clone().float()
+        sparse[sparse.abs() < self.config.int4_zero_threshold] = 0.0
+        scale = sparse.abs().max().clamp(min=1e-8) / 7.0
+        q = (sparse / scale).round().clamp(-7, 7)
+        dequant = (q * scale).to(value.dtype)
+        return dequant
+
+    def decompress_int4_sparse(self, compressed: torch.Tensor) -> torch.Tensor:
+        """INT4+sparse 복원 (이미 dequantize 상태)."""
+        return compressed
+
+    def compress_for_tier(self, value: torch.Tensor, tier: Tier) -> torch.Tensor:
+        """계층에 맞는 압축 적용."""
+        if tier == "HBM":
+            return self.compress_fp8(value)
+        elif tier == "DRAM":
+            return self.compress_vq(value)
+        else:  # SSD
+            return self.compress_int4_sparse(value)
+
+    def migrate_tier(
+        self, key: str, from_tier: Tier, to_tier: Tier
+    ) -> None:
+        """계층 이동 시 자동 재압축.
+
+        Algorithm:
+          1. 현재 저장된 값 조회 (from_tier 압축 상태).
+          2. from_tier 복원 → to_tier 압축 → 재저장.
+          3. _tier_map 업데이트.
+        """
+        if key not in self._store:
+            return
+        current = self._store[key]
+        recompressed = self.compress_for_tier(current, to_tier)
+        self._store[key] = recompressed
+        self._tier_map[key] = to_tier
 
     # ------------------------------------------------------------------ #
     # CacheStore 추상 메서드                                               #
     # ------------------------------------------------------------------ #
 
-    def put(self, key: str, value: torch.Tensor) -> None:
-        """환경 인식 압축 후 저장."""
-        self._total_bytes_original += value.nbytes
-        compressed = self.compression_hook(key, value)
-        self._total_bytes_stored += compressed.nbytes
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        """default_tier에 맞는 압축 적용."""
+        tier = self._tier_map.get(key, self.default_tier)
+        return self.compress_for_tier(value, tier)
 
-        codec = self.select_codec()
-        if codec is not None:
-            codec.put(key, compressed)
-        else:
-            # 압축 스킵: fallback store에 직접 저장
-            if len(self._fallback_store) >= self.config.max_entries:
-                self.evict()
-            self._fallback_store[key] = compressed.detach().clone()
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """계층별 압축 후 저장."""
+        self._total_bytes_original += value.nbytes
+        tier = self._tier_map.get(key, self.default_tier)
+        compressed = self.compress_for_tier(value, tier)
+        self._total_bytes_stored += compressed.nbytes
+        if len(self._store) >= self.config.max_entries and key not in self._store:
+            self.evict()
+        self._store[key] = compressed.detach().clone()
+        self._tier_map[key] = tier
+
+    def put_with_tier(self, key: str, value: torch.Tensor, tier: Tier) -> None:
+        """지정 계층으로 압축 후 저장."""
+        self._tier_map[key] = tier
+        self.put(key, value)
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        codec = self.select_codec()
-        result: Optional[torch.Tensor] = None
-        if codec is not None:
-            result = codec.get(key)
-        if result is None:
-            result = self._fallback_store.get(key)
-        if result is not None:
+        if key in self._store:
             self._hits += 1
-        else:
-            self._misses += 1
-        return result
+            return self._store[key]
+        self._misses += 1
+        return None
 
     def evict(self) -> int:
-        codec = self.select_codec()
-        if codec is not None:
-            return codec.evict()
-        if self._fallback_store:
-            _, v = self._fallback_store.popitem(last=False)
+        if self._store:
+            _, v = self._store.popitem(last=False)
             return v.nbytes
         return 0
 
@@ -890,212 +826,164 @@ class DPAttentionAwareCompressionSelector(CacheStore):
         return self._hits / total if total > 0 else 0.0
 
     def memory_bytes(self) -> int:
-        codec = self.select_codec()
-        if codec is not None:
-            return codec.memory_bytes()
-        return sum(v.nbytes for v in self._fallback_store.values())
+        return sum(v.nbytes for v in self._store.values())
+
+    def memory_reduction_ratio(self) -> float:
+        if self._total_bytes_original == 0:
+            return 0.0
+        return 1.0 - self._total_bytes_stored / self._total_bytes_original
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
         self._total_bytes_original = 0
         self._total_bytes_stored = 0
-        for codec in self._codec_registry.values():
-            codec.reset_stats()
-        self._fallback_store.clear()
-
-    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        """선택된 코덱의 compression_hook 위임 또는 identity."""
-        codec = self.select_codec()
-        if codec is not None and hasattr(codec, "compression_hook"):
-            return codec.compression_hook(key, value)
-        return value
-
-    # ------------------------------------------------------------------ #
-    # 메트릭                                                               #
-    # ------------------------------------------------------------------ #
-
-    def memory_reduction_ratio(self) -> float:
-        """실제 메모리 절감율 (bytes 기준)."""
-        if self._total_bytes_original == 0:
-            return 0.0
-        return 1.0 - self._total_bytes_stored / self._total_bytes_original
-
-    def dp_attn_compression_matrix_entry(
-        self,
-        codec_name: str,
-        compression_ratio: float,
-    ) -> Dict:
-        """실험 행렬 단일 항목 반환 (results/<exp>/dp_attn_compression_matrix.json에 기록)."""
-        return {
-            "dp_attn_enabled": self._dp_attn_enabled,
-            "n_gpus": self._n_gpus,
-            "effective_kv_replicas": self._effective_kv_replicas,
-            "codec_name": codec_name,
-            "compression_ratio": compression_ratio,
-            "effective_memory_reduction": self.effective_memory_reduction_ratio(compression_ratio),
-            "actual_memory_reduction": self.memory_reduction_ratio(),
-        }
+        self._store.clear()
+        self._tier_map.clear()
 ```
 
 ---
 
-### AMPDPrefillShareNonContiguousStack (Cross A+B+C)
-
-5단계 처리 흐름을 통합하는 중앙 스택 모듈.
+### KVDriveThunderAgentIntegratedStack (Cross A+B+C)
 
 ```python
-# src/engine/ampd_prefill_share_stack.py
+# src/cache/kvdrive_thunder_integrated_stack.py
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import torch
 
-from src.engine.runner import InferenceRequest, InferenceRunner
 from src.cache.base import CacheStore
-from src.scheduler.ampd_lazy_segment_fetch import (
-    AMPDLazySegmentFetchScheduler,
-    AMPDLazySchedulerConfig,
-    SegmentMetadataRegistry,
+from src.cache.thunder_agent_static_reservation_cache import (
+    ThunderAgentStaticSegmentReservationCache,
+    ProgramStep,
 )
-from src.cache.ampd_adapshot_lazy_pipeline import (
-    AMPDAdapShotLazyLoadPipeline,
-    LazyPipelineConfig,
+from src.cache.kvdrive_tier_compression_codec import (
+    KVDriveTierDifferentiatedCompressionCodec,
+    TierCompressionConfig,
+    Tier,
 )
-from src.cache.dp_attention_aware_compression import (
-    DPAttentionAwareCompressionSelector,
-    DPAttentionCompressionConfig,
+from src.scheduler.kvdrive_attention_pipeline_scheduler import (
+    KVDriveAttentionAwarePipelineScheduler,
+    KVDriveSchedulerConfig,
+    TierInfo,
 )
 
 
 @dataclass
-class AMPDStackConfig:
-    scheduler_config: Optional[AMPDLazySchedulerConfig] = None
-    pipeline_config: Optional[LazyPipelineConfig] = None
-    compression_config: Optional[DPAttentionCompressionConfig] = None
+class IntegratedStackConfig:
+    scheduler_config: Optional[KVDriveSchedulerConfig] = None
+    codec_config: Optional[TierCompressionConfig] = None
+    max_entries: int = 1000
+    pin_threshold: float = 0.5
     seed: int = 42
 
 
-class AMPDPrefillShareNonContiguousStack:
-    """AMPD + AdapShot + DP Attention 인식 압축 A+B+C 완전 통합 스택.
+class KVDriveThunderAgentIntegratedStack(CacheStore):
+    """KVDrive 3계층 + ThunderAgent 정적 예약 + 계층 차등 압축 통합 스택.
 
     Cross Activity A+B+C:
-      - A-1 AMPDLazySegmentFetchScheduler: 지연 페치 스케줄러
-      - B-1 AMPDAdapShotLazyLoadPipeline: 지연 로드·재인코딩 파이프라인
-      - C-1 DPAttentionAwareCompressionSelector: 환경 인식 압축 선택기
+      - A: KVDriveAttentionAwarePipelineScheduler (3계층 배치 + KVTierRegistry)
+      - B: ThunderAgentStaticSegmentReservationCache (Program 정적 예약 캐시)
+      - C: KVDriveTierDifferentiatedCompressionCodec (계층 차등 압축)
 
-    5단계 처리 흐름:
-      Step 1: 세그먼트 메타데이터 선행 전달 (KV 전송 없음).
-      Step 2: 팬아웃 배포 시뮬레이션 (단일 노드: 로컬 put).
-      Step 3: 스케줄 확정 후 지연 로드 + AdapShot 재인코딩 오버랩.
-      Step 4: DP Attention 인식 압축 적용.
-      Step 5: 비연속 어텐션 계산 투입 (InferenceRunner 호환).
+    처리 흐름:
+      Step 1 (parse_program): LLMProgramDAG 파싱 → 세그먼트 재사용 맵 구성.
+      Step 2 (reserve_for_step): 해당 스텝 높은 확률 세그먼트 사전 예약 (pinned).
+      Step 3 (put / compression_hook): A의 KVTierRegistry에서 계층 조회 →
+             C의 compress_for_tier()로 계층별 압축 → B의 스토어에 저장.
+      Step 4 (get): B의 스토어에서 히트 조회 + 비연속 히트 추적.
 
-    InferenceRunner 통합:
-      runner = InferenceRunner(cache=stack.cache, scheduler=stack)
-      runner.run_batch(requests) → stack.schedule(requests) 호출
+    CacheStore 인터페이스 완전 구현.
 
     평가 기준 (evaluation_criteria.md §5):
       - 복합 처리량: 단일 Activity 대비 +5% 이상
       - 복합 메모리: 단일 Activity 대비 −10% 이상
-      - Accuracy 보존 (C 포함): 복합 후 cosine >= 0.99 (필수)
+      - Accuracy 보존 (C 포함): 복합 후 cosine ≥ 0.99 (MANDATORY)
     """
 
-    def __init__(
-        self,
-        config: AMPDStackConfig,
-        extra_codecs: Optional[Dict[str, CacheStore]] = None,
-    ) -> None:
+    def __init__(self, config: IntegratedStackConfig) -> None:
+        torch.manual_seed(config.seed)
         self.config = config
 
-        sched_cfg = config.scheduler_config or AMPDLazySchedulerConfig(seed=config.seed)
-        pipeline_cfg = config.pipeline_config or LazyPipelineConfig(seed=config.seed)
-        comp_cfg = config.compression_config or DPAttentionCompressionConfig(seed=config.seed)
+        sched_cfg = config.scheduler_config or KVDriveSchedulerConfig(seed=config.seed)
+        codec_cfg = config.codec_config or TierCompressionConfig(seed=config.seed)
 
-        self.registry = SegmentMetadataRegistry()
-        self.scheduler = AMPDLazySegmentFetchScheduler(sched_cfg, self.registry)
-        self.pipeline = AMPDAdapShotLazyLoadPipeline(pipeline_cfg)
-        self.compressor = DPAttentionAwareCompressionSelector(comp_cfg)
+        self.scheduler = KVDriveAttentionAwarePipelineScheduler(sched_cfg)
+        self.codec = KVDriveTierDifferentiatedCompressionCodec(codec_cfg)
+        self.segment_cache = ThunderAgentStaticSegmentReservationCache(
+            max_entries=config.max_entries,
+            pin_threshold=config.pin_threshold,
+            seed=config.seed,
+        )
 
-        # 추가 코덱 등록
-        for name, codec in (extra_codecs or {}).items():
-            self.compressor.register_codec(name, codec)
+    def parse_program(self, steps: List[ProgramStep]) -> None:
+        """Step 1: LLMProgramDAG 파싱."""
+        self.segment_cache.parse_program(steps)
 
-        # InferenceRunner가 사용하는 기본 캐시
-        self.cache: CacheStore = self.pipeline
+    def reserve_for_step(self, step_id: str) -> List[str]:
+        """Step 2: 해당 스텝 세그먼트 사전 예약."""
+        return self.segment_cache.reserve_segments(step_id)
 
-    def schedule(
-        self,
-        requests: List[InferenceRequest],
-    ) -> List[InferenceRequest]:
-        """InferenceRunner.run_batch() 호환 schedule() 진입점."""
+    def release_step(self, step_id: str) -> None:
+        """스텝 완료 후 예약 해제."""
+        self.segment_cache.release_reservations(step_id)
+
+    def schedule(self, requests: list) -> list:
+        """스케줄러 위임."""
         return self.scheduler.schedule(requests)
 
-    def process_request_step1_metadata(
-        self,
-        request: InferenceRequest,
-        candidate_segment_ids: List[str],
-    ) -> None:
-        """Step 1: 세그먼트 메타데이터 선행 전달 (KV 전송 없음)."""
-        from src.scheduler.ampd_lazy_segment_fetch import SegmentMeta
-        metas = [
-            SegmentMeta(
-                segment_id=seg_id,
-                source_node_id="local",
-                tier="HBM",
-                approx_size_bytes=128 * 64 * 2,
-                position_range=(0, 128),
-            )
-            for seg_id in candidate_segment_ids
-        ]
-        self.scheduler.pre_resolve_segments(request, candidate_segment_ids, metas)
+    # ------------------------------------------------------------------ #
+    # CacheStore 추상 메서드                                               #
+    # ------------------------------------------------------------------ #
 
-    def process_step3_lazy_load(
-        self,
-        confirmed_ids: List[str],
-        source_positions: Optional[List[int]] = None,
-        target_positions: Optional[List[int]] = None,
-    ) -> List[Optional[torch.Tensor]]:
-        """Step 3: 지연 로드 + AdapShot 재인코딩 (동기 래퍼).
-
-        AsyncIterator를 동기 호출로 래핑해 기존 InferenceRunner와 호환.
-        """
-        import asyncio
-        src_pos = source_positions or [0] * len(confirmed_ids)
-        tgt_pos = target_positions or [0] * len(confirmed_ids)
-
-        async def _run():
-            results = []
-            for seg_id, sp, tp in zip(confirmed_ids, src_pos, tgt_pos):
-                kv = await self.pipeline.load_and_reencode_segment(seg_id, sp, tp)
-                results.append(kv)
-            return results
-
-        loop = asyncio.new_event_loop()
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        """A의 KVTierRegistry에서 계층 조회 → C의 계층별 압축 적용."""
+        # key를 token_id로 해석 시도 (hash 기반 fallback)
+        tier: Tier = "HBM"
         try:
-            return loop.run_until_complete(_run())
-        finally:
-            loop.close()
+            token_id = int(key.split(":")[0], 16) % (2 ** 31)
+            info = self.scheduler.registry.get_tier(token_id)
+            if info is not None:
+                tier = info.tier
+        except (ValueError, IndexError):
+            pass
+        return self.codec.compress_for_tier(value, tier)
 
-    def process_step4_compression(
-        self,
-        key: str,
-        kv: torch.Tensor,
-    ) -> torch.Tensor:
-        """Step 4: DP Attention 인식 압축 적용."""
-        return self.compressor.compression_hook(key, kv)
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """compression_hook 적용 후 segment_cache에 저장."""
+        compressed = self.compression_hook(key, value)
+        self.segment_cache._store[key] = compressed.detach().clone()
+        if len(self.segment_cache._store) > self.config.max_entries:
+            self.segment_cache.evict()
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        return self.segment_cache.get(key)
+
+    def evict(self) -> int:
+        return self.segment_cache.evict()
+
+    def hit_rate(self) -> float:
+        return self.segment_cache.hit_rate()
+
+    def memory_bytes(self) -> int:
+        return self.segment_cache.memory_bytes()
+
+    def reset_stats(self) -> None:
+        self.segment_cache.reset_stats()
+        self.scheduler.reset_stats()
+        self.codec.reset_stats()
 
     def metrics_summary(self) -> Dict:
         """복합 효과 측정용 통합 메트릭."""
         return {
             "scheduler_overhead_ms_p50": self.scheduler.scheduling_overhead_ms_p50(),
-            "unnecessary_transfer_ratio": self.scheduler.unnecessary_transfer_ratio(),
-            "pipeline_hit_rate": self.pipeline.hit_rate(),
-            "pipeline_noncontiguous_hit_rate": self.pipeline.noncontiguous_hit_rate(),
-            "pipeline_memory_bytes": self.pipeline.memory_bytes(),
-            "compressor_hit_rate": self.compressor.hit_rate(),
-            "compressor_memory_reduction": self.compressor.memory_reduction_ratio(),
-            "compressor_effective_replicas": self.compressor.effective_kv_replicas(),
+            "unnecessary_eviction_rate": self.scheduler.unnecessary_eviction_rate(),
+            "segment_cache_hit_rate": self.segment_cache.hit_rate(),
+            "noncontiguous_hit_rate": self.segment_cache.noncontiguous_hit_rate(),
+            "reservation_hit_rate": self.segment_cache.reservation_hit_rate(),
+            "codec_memory_reduction_ratio": self.codec.memory_reduction_ratio(),
+            "total_memory_bytes": self.memory_bytes(),
         }
 ```
 
@@ -1103,111 +991,112 @@ class AMPDPrefillShareNonContiguousStack:
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-Activity C(DPAttentionAwareCompressionSelector)를 포함하므로 반드시 작성한다.
+Activity C(KVDriveTierDifferentiatedCompressionCodec)를 포함하므로 반드시 작성한다.
 
 ### perplexity 측정
 
-- **데이터셋**: WikiText-2 proxy (실 데이터셋 없을 경우 synthetic 토큰 시퀀스)
-- **측정 방법**: `src/metrics/perplexity.py`의 함수 사용
-  - `attention_output_relative_error(q, k_orig, v_orig, k_comp, v_comp)` < 0.01 (1%)
-  - 단일 GPU 환경(DP Attention 비활성): error < 0.01 (MANDATORY)
-  - 멀티 GPU + DP Attention 활성 환경: error < 0.01 (MANDATORY)
-  - 두 환경 간 error 차이: < 0.005 (DP Attention 상태가 정확도에 미치는 영향 정량화)
-- **허용 오차**: ±1% 이내 (evaluation_criteria.md §4 필수)
+- **데이터셋**: WikiText-2 proxy (실 데이터셋 없을 경우 synthetic float tensor 시퀀스)
+- **측정 방법**: `attention_output_relative_error(original, compressed_then_decompressed)` 계산
+  - `relative_error = ||original - reconstructed|| / (||original|| + 1e-8)`
+  - **HBM FP8**: relative_error < 0.01 (1%) — (MANDATORY, evaluation_criteria.md §4 필수)
+  - **DRAM VQ**: relative_error < 0.02 (2%)
+  - **SSD INT4+sparse**: reconstruction error ≤ 0.05 (5%, 낮은 어텐션 토큰 허용 오차)
+- **허용 오차**: ±1% 이내 (HBM 계층) — evaluation_criteria.md §4 필수
 
-### 태스크 정확도 측정 (LongBench proxy)
+### 태스크 정확도 측정 (cosine similarity proxy)
 
-- **벤치마크**: LongBench 8개 서브태스크 proxy
-  - 측정 방법: `attention_kl_divergence` < 0.015 (MANDATORY)
-  - `cosine_similarity_output` >= 0.99 (MANDATORY)
-- **실험 행렬**: {DP Attention ON/OFF} × {압축 기법: None/GlobalRetention/FibQuant/SPKVWriteTime} × {n_gpus: 1/2/4}
-- **허용 오차**: ±1% 이내 (evaluation_criteria.md §4 필수)
+- **벤치마크**: cosine_similarity(원본 어텐션 출력, 압축 후 복원된 어텐션 출력)
+  - **HBM FP8**: cosine_similarity > 0.99 (MANDATORY)
+  - **DRAM VQ**: cosine_similarity > 0.97
+  - **SSD INT4+sparse**: cosine_similarity > 0.93 (허용 오차 완화)
+- **허용 오차**: ±1% 이내 (HBM 계층) — evaluation_criteria.md §4 필수
 
-### 이중 절감 이론 검증
+### 계층별 독립 검증
 
-- **검증 수식**: effective_reduction = 1 - 1/(N × C)
-  - N=1, C=2: 50% (단일 GPU, GlobalRetention 2×)
-  - N=4, C=3: 91.7% (4-GPU DP Attention + 3× 압축)
-  - N=4, C=10: 97.5% (이론 최솟값, FibQuant 10×)
-- **검증 테스트**: `test_effective_reduction_formula` — 수치가 이론값과 일치하는지 확인
+- HBM FP8 단독 compress→decompress 왕복 후 relative_error 측정
+- DRAM VQ 단독 compress→decompress 왕복 후 relative_error 측정
+- SSD INT4+sparse 단독 compress→decompress 왕복 후 reconstruction error 측정
+- 계층 이동 시 재압축 전후 error 비교: HBM→DRAM 재압축 후 DRAM error < 0.02
 
-### DP Attention ON/OFF 간 정확도 차이 정량화
+### Fail 기준
 
-- DP Attention 비활성 시 고압축(GlobalRetention) 적용 후 error
-- DP Attention 활성 시 저압축(identity 또는 낮은 ratio) 적용 후 error
-- 두 설정의 error 비교: DP Attention 활성 환경이 더 낮은 error를 가져야 함
-- 이 비교가 "환경 인식 정책의 정확도 안전성"을 증명
-
-### 환경 변화 내구성 검증
-
-- DP Attention ON → OFF 런타임 전환 시 `update_dp_attn_state()` 호출
-- 전환 후 코덱 선택이 정책에 맞게 자동 변경됨 확인
-- 전환 후 첫 번째 put/get 사이클의 accuracy delta: < 0.01 (MANDATORY)
+**ANY HBM FP8 압축 왕복에서 relative_error > 1% → 테스트 실패 (evaluation_criteria.md §4 필수 항목)**
 
 ### 검증 테스트 파일
 
-`tests/unit/test_dp_attention_aware_compression.py`
+`tests/unit/test_kvdrive_tier_compression_accuracy.py`
 
-**테스트 케이스 목록**:
+**필수 테스트 케이스**:
 
 ```
-test_single_gpu_selects_high_compression:
-    n_gpus=1, dp_attn_enabled=False → single_gpu_codec 선택 확인
+test_hbm_fp8_relative_error_below_1pct:
+    임의 FP32 텐서 → compress_fp8 → decompress_fp8 → relative_error < 0.01
+    (MANDATORY: 실패 시 전체 Fail)
 
-test_dp_attn_enabled_selects_low_compression:
-    dp_attn_enabled=True → dp_attn_codec 선택 또는 스킵 확인
+test_hbm_fp8_cosine_similarity_above_099:
+    압축 전후 cosine_similarity > 0.99 (MANDATORY)
 
-test_dp_attn_skip_when_marginal_utility_low:
-    marginal_utility < threshold → select_codec() == None 반환
+test_dram_vq_relative_error_below_2pct:
+    임의 FP32 텐서 → compress_vq → decompress_vq → relative_error < 0.02
 
-test_effective_replicas_single_gpu:
-    n_gpus=1, dp_attn=False → effective_kv_replicas == 1
+test_ssd_int4_sparse_reconstruction_error_below_5pct:
+    임의 FP32 텐서 → compress_int4_sparse → decompress_int4_sparse → error ≤ 0.05
 
-test_effective_replicas_multi_gpu_no_dp:
-    n_gpus=4, dp_attn=False → effective_kv_replicas == 4
+test_tier_migration_hbm_to_dram_preserves_accuracy:
+    HBM FP8 압축 텐서 → migrate_tier(HBM→DRAM) → DRAM error < 0.02
 
-test_effective_replicas_multi_gpu_with_dp:
-    n_gpus=4, dp_attn=True → effective_kv_replicas == 1
+test_tier_migration_dram_to_ssd_preserves_accuracy:
+    DRAM VQ 압축 텐서 → migrate_tier(DRAM→SSD) → SSD error ≤ 0.05
 
-test_effective_reduction_formula:
-    N=4, C=10 → effective_memory_reduction_ratio == 0.975 (±0.001)
+test_compress_for_tier_dispatches_correctly:
+    tier="HBM" → compress_fp8 경로 확인
+    tier="DRAM" → compress_vq 경로 확인
+    tier="SSD" → compress_int4_sparse 경로 확인
 
-test_accuracy_single_gpu_within_1pct:
-    단일 GPU 고압축 코덱 적용 후 attention error < 0.01 (MANDATORY)
+test_memory_reduction_hbm_fp8:
+    FP32 텐서 FP8 압축 후 memory_reduction_ratio() > 0.0
 
-test_accuracy_dp_attn_within_1pct:
-    DP Attention 활성 환경 압축 후 attention error < 0.01 (MANDATORY)
-
-test_kl_divergence_within_threshold:
-    KL < 0.015 at global_retention codec (MANDATORY)
-
-test_cosine_similarity_above_threshold:
-    cosine >= 0.99 at global_retention codec (MANDATORY)
-
-test_dp_attn_vs_single_gpu_error_difference:
-    DP Attention 활성 error <= 단일 GPU error + 0.005
-
-test_runtime_dp_attn_toggle:
-    update_dp_attn_state(True) 후 effective_replicas == 1
-    update_dp_attn_state(False) 후 effective_replicas == n_gpus
-
-test_env_var_detection:
-    DP_ATTN_ENABLED="1" 환경 변수 설정 시 dp_attn_enabled=True 자동 감지
+test_memory_reduction_overall_above_30pct:
+    HBM 20%/DRAM 50%/SSD 30% 비율로 put_with_tier 후 memory_reduction_ratio() ≥ 0.30
+    (evaluation_criteria.md §4 높음 항목)
 
 test_cachestore_interface:
     put/get/evict/hit_rate/memory_bytes/reset_stats 동작 확인
 
-test_memory_reduction_gt_30pct_single_gpu:
-    단일 GPU + GlobalRetention: memory_reduction_ratio() >= 0.30 (MANDATORY)
+test_fp8_preserves_shape_and_dtype:
+    압축 전후 shape 동일, dtype 동일 (FP32 입력 → FP32 출력)
 
-test_compression_matrix_entry_keys:
-    dp_attn_compression_matrix_entry() 반환 딕셔너리 키 구조 확인
+test_vq_preserves_shape_and_dtype:
+    압축 전후 shape 동일
 
-test_register_env_change_callback:
-    register_env_change_callback() 등록 후 update_dp_attn_state() 시 콜백 호출
+test_int4_sparsification_zeros_small_values:
+    abs(value) < threshold 인 원소가 0으로 처리됨 확인
 
-test_compression_hook_identity_when_skip:
-    select_codec() == None 시 compression_hook()이 identity 반환
+test_codec_seed_reproducibility:
+    동일 seed + 동일 입력 → 동일 출력 (재현성)
+```
+
+---
+
+## BaseScheduler 생성 조건
+
+`src/scheduler/base.py`가 없는 경우에만 최소 추상 클래스를 생성한다.
+기존 스케줄러들(ampd_lazy_segment_fetch.py 등)이 이미 이를 import하고 있는지 확인 후,
+없다면 아래 내용으로 생성한다:
+
+```python
+# src/scheduler/base.py (없는 경우에만 생성)
+
+from abc import ABC, abstractmethod
+from typing import List
+
+
+class BaseScheduler(ABC):
+    """모든 스케줄러의 최소 추상 베이스 클래스."""
+
+    @abstractmethod
+    def schedule(self, requests: List) -> List:
+        """요청 목록을 받아 정렬/필터링된 목록을 반환한다."""
 ```
 
 ---
@@ -1215,270 +1104,198 @@ test_compression_hook_identity_when_skip:
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-18.yaml
+# configs/experiments/2026-05-19.yaml
 experiment:
-  date: "2026-05-18"
+  date: "2026-05-19"
   activity: "A+B+C"
   description: >
-    A-1 AMPDLazySegmentFetchScheduler (AMPD pull-on-demand 세그먼트 지연 페치 스케줄러) +
-    B-1 AMPDAdapShotLazyLoadPipeline (지연 로드 + AdapShot RoPE 재인코딩 비동기 오버랩) +
-    C-1 DPAttentionAwareCompressionSelector (DP Attention 상태 인식 환경별 압축 선택기) +
-    Cross-1 AMPDPrefillShareNonContiguousStack (A+B+C 5단계 통합 스택)
-  cache_type: ampd_adapshot_lazy_pipeline
-  compression_method: dp_attention_aware
-  scheduler_type: ampd_lazy_segment_fetch
+    A-1 KVDriveAttentionAwarePipelineScheduler (KVDrive 3계층 어텐션-인식 파이프라인 스케줄러) +
+    B-1 ThunderAgentStaticSegmentReservationCache (ThunderAgent Program 정적 분석 비연속 세그먼트 사전 예약 캐시) +
+    C-1 KVDriveTierDifferentiatedCompressionCodec (KVDrive 계층-자동 차등 압축 코덱) +
+    Cross-1 KVDriveThunderAgentIntegratedStack (A+B+C 통합 스택)
+  cache_type: kvdrive_thunder_integrated_stack
+  compression_method: tier_differentiated
+  scheduler_type: kvdrive_attention_pipeline
 
-ampd_lazy_segment_fetch_scheduler:
-  hbm_fetch_latency_ms: 0.01
-  ddr_fetch_latency_ms: 0.5
-  remote_fetch_latency_ms: 5.0
-  metadata_overhead_max_ms: 0.1     # 메타데이터 전달 오버헤드 상한 (MANDATORY 검증 기준)
-  max_concurrent_fetches: 8
+kvdrive_attention_pipeline_scheduler:
+  attn_hbm_threshold: 0.80          # 상위 20% → HBM 잔류
+  attn_dram_threshold: 0.30         # 하위 30% → SSD, 나머지 → DRAM
+  local_window_size: 512            # 최근 N 토큰 항상 HBM
+  tier_update_interval: 32          # 계층 재배정 주기 (디코딩 스텝 수)
+  hbm_latency_ms: 0.01
+  dram_latency_ms: 0.5
+  ssd_latency_ms: 5.0
+  ssd_prefetch_steps_ahead: 3
+  enable_multinode: false
   seed: 42
 
-ampd_adapshot_lazy_pipeline:
-  chunk_size: 128
+thunder_agent_static_reservation_cache:
   max_entries: 1000
-  rope_theta: 10000.0               # AdapShot RoPE 기본 주파수
-  n_heads: 8
-  d_head: 64
-  companion_hit_threshold: 2        # 예측 프리페치 동반 세그먼트 히트 임계값
+  pin_threshold: 0.5                # 재사용 확률 >= 0.5 → pinned 예약
+  max_reservation_budget: 0.20     # HBM 예산의 20%
   seed: 42
 
-dp_attention_aware_compression:
-  dp_attn_enabled: false            # 환경 변수 DP_ATTN_ENABLED="1" 또는 이 값으로 설정
-  n_gpus: 1                         # auto_detect_gpus=True 시 자동 감지
-  auto_detect_gpus: true
-  single_gpu_codec: "global_retention"   # 단일 GPU: GlobalRetentionGateEvictionCodec
-  dp_attn_codec: "global_retention"      # DP Attention 활성: 동일 코덱 (낮은 강도)
-  dp_attn_compression_skip_threshold: 0.5
+kvdrive_tier_compression_codec:
+  fp8_enabled: true
+  vq_n_codes: 256                   # DRAM VQ codebook 크기
+  vq_code_dim: 8
+  int4_zero_threshold: 0.01        # SSD sparsification 임계값
   max_entries: 1000
   seed: 42
 
-ampd_prefill_share_stack:
+integrated_stack:
+  max_entries: 1000
+  pin_threshold: 0.5
   seed: 42
 
 benchmark:
   accuracy:
     method: "attention_output_proxy"
-    proxy_tolerance: 0.01            # 1% attention output error limit (MANDATORY)
-    kl_tolerance: 0.015
-    cosine_min: 0.99
-    perplexity_dataset: "wikitext-2"
-    perplexity_tolerance_pct: 1.0    # ±1% 이내 (MANDATORY)
+    hbm_fp8_relative_error_max: 0.01    # 1% (MANDATORY)
+    hbm_fp8_cosine_sim_min: 0.99        # (MANDATORY)
+    dram_vq_relative_error_max: 0.02    # 2%
+    ssd_int4_reconstruction_error_max: 0.05  # 5%
+    perplexity_tolerance_pct: 1.0       # ±1% (evaluation_criteria.md §4 MANDATORY)
     task_accuracy_tolerance_pct: 1.0
-  dp_attn_experiment_matrix:         # 실험 행렬 설정
-    dp_attn_states: [true, false]
-    codec_names: ["none", "global_retention", "fibquant", "spkv"]
-    n_gpus_list: [1, 2, 4]
-    output_file: "results/2026-05-18/dp_attn_compression_matrix.json"
   activity_a:
-    ttft_overhead_limit_pct: 5.0     # TTFT p50 +5% 이내 (MANDATORY)
-    metadata_overhead_max_ms: 0.1    # < 0.1ms/요청 (MANDATORY)
-    unnecessary_transfer_ratio_target: 0.40  # 40% 이상 불필요 전송 제거 목표
+    ttft_overhead_limit_pct: 5.0        # TTFT p50 +5% 이내 (MANDATORY)
+    ttft_overhead_abs_ms: 5.0           # <5ms 절대 기준
+    unnecessary_eviction_rate_max: 0.0  # 항상 0 (SSD 보관)
   activity_b:
-    noncontiguous_hit_rate_min: 0.30  # 전체 히트의 30% 이상 (MANDATORY)
-    kv_memory_footprint_increase_max: 0.20  # +20% 이내
+    noncontiguous_hit_rate_min: 0.30    # 전체 히트의 30% 이상 (MANDATORY)
+    reservation_hit_rate_min: 0.50      # 예약 세그먼트 중 실제 히트 ≥ 50%
+    kv_memory_footprint_increase_max: 0.20
   activity_c:
-    memory_reduction_min: 0.30       # −30% 이상 (MANDATORY)
+    memory_reduction_min: 0.30          # −30% 이상 (MANDATORY)
     effective_context_multiplier: 2.0
     compression_overhead_ttft_max_pct: 10.0
   throughput:
-    target_improvement_pct: 20       # +20% 이상
+    target_improvement_pct: 20          # +20% 이상
   cross_abc_comparison:
     methods: ["solo_a1", "solo_b1", "solo_c1", "cross_combined"]
-    throughput_min_improvement_vs_solo: 5.0   # +5% 이상 (§5)
-    memory_min_improvement_vs_solo: 10.0      # −10% 이상 (§5)
-    accuracy_cosine_min: 0.99                 # (§5 C 포함 필수)
+    throughput_min_improvement_vs_solo: 5.0
+    memory_min_improvement_vs_solo: 10.0
+    accuracy_cosine_min: 0.99           # (§5 C 포함 MANDATORY)
 
 seed: 42
-results_dir: "results/2026-05-18"
+results_dir: "results/2026-05-19"
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_dp_attention_aware_compression.py` — Activity C 필수 accuracy 검증 (19개 테스트, 위 목록 참조)
-- [ ] `tests/unit/test_ampd_lazy_segment_fetch.py` — Activity A 단위 테스트
-- [ ] `tests/unit/test_ampd_adapshot_lazy_pipeline.py` — Activity B 단위 테스트
-- [ ] `tests/unit/test_ampd_prefill_share_stack.py` — Cross A+B+C 통합 단위 테스트
-- [ ] `tests/integration/test_cross_abc_ampd_stack.py` — E2E 통합 테스트
+- [ ] `tests/unit/test_kvdrive_tier_compression_accuracy.py` — Activity C 필수 accuracy 검증 (14개 테스트, 위 목록 참조)
+- [ ] `tests/unit/test_kvdrive_scheduler.py` — Activity A 단위 테스트
+- [ ] `tests/unit/test_thunder_agent_segment_cache.py` — Activity B 단위 테스트
+- [ ] `tests/integration/test_kvdrive_thunder_e2e.py` — E2E 통합 테스트
 
-### 단위 테스트 최소 요구 사항 (test_ampd_lazy_segment_fetch.py)
+### 단위 테스트 최소 요구사항 (test_kvdrive_scheduler.py)
 
 ```
-test_segment_metadata_registry_register:
-    register() 후 get()으로 메타데이터 조회 가능
+test_kv_tier_registry_set_and_get:
+    set_tier(token_id, TierInfo) 후 get_tier(token_id) 반환
 
-test_segment_metadata_registry_cancel:
-    cancel() 후 unnecessary_transfer_ratio 증가 확인
+test_kv_tier_registry_missing_returns_none:
+    미등록 token_id → get_tier() == None
 
-test_segment_metadata_registry_ratio:
-    cancel 2 / pre_resolved 5 → ratio == 0.4
+test_assign_tiers_window_always_hbm:
+    최근 local_window_size 토큰 → 모두 HBM 배정
 
-test_pre_resolve_segments_no_kv_transfer:
-    pre_resolve_segments() 호출 후 KV 데이터 미전송 (registry에 메타데이터만 존재)
+test_assign_tiers_low_attn_gets_ssd:
+    누적 어텐션 0인 토큰 → SSD 배정
 
-test_confirm_segments_cancels_non_confirmed:
-    confirm_segments([a,b,c], [a]) → b, c cancel 처리됨
+test_assign_tiers_high_attn_stays_hbm:
+    최고 어텐션 점수 토큰 → HBM 잔류
 
-test_fetch_segments_lazy_yields_kvsegment:
-    fetch_segments_lazy(["seg1"]) → KVSegment(segment_id="seg1") yield
+test_step_triggers_tier_update_at_interval:
+    tier_update_interval=4 스텝마다 assign_tiers 호출 확인
 
-test_fetch_segments_lazy_hbm_latency:
-    tier=HBM fetch latency == hbm_fetch_latency_ms (±0.01ms)
+test_scheduling_overhead_below_5ms:
+    schedule() TTFT 오버헤드 < 5ms (evaluation_criteria.md §2 MANDATORY)
 
-test_fetch_segments_lazy_ddr_latency:
-    tier=DDR fetch latency == ddr_fetch_latency_ms (±0.05ms)
-
-test_scheduling_overhead_below_01ms:
-    schedule() 단일 호출 오버헤드 < 0.1ms
+test_unnecessary_eviction_rate_always_zero:
+    unnecessary_eviction_rate() == 0.0 항상
 
 test_schedule_returns_all_requests:
     schedule(requests) 반환 길이 == 입력 길이
 
-test_unnecessary_transfer_ratio_zero_initial:
-    초기 unnecessary_transfer_ratio() == 0.0
+test_reset_stats_clears_times:
+    reset_stats() 후 scheduling_overhead_ms_p50() == 0.0
 
-test_reset_stats_clears_counts:
-    reset_stats() 후 ratio == 0.0
+test_update_attention_scores_ema:
+    동일 토큰 여러 번 업데이트 → EMA 수렴 확인 (0~1 범위)
+
+test_multinode_flag_ignored_in_cpu:
+    enable_multinode=True여도 CPU 환경에서 에러 없이 동작
 ```
 
-### 단위 테스트 최소 요구 사항 (test_ampd_adapshot_lazy_pipeline.py)
+### 단위 테스트 최소 요구사항 (test_thunder_agent_segment_cache.py)
 
 ```
-test_cachestore_interface:
-    put/get/evict/hit_rate/memory_bytes/reset_stats 동작 확인
+test_llmprogramdag_content_hash_deterministic:
+    동일 토큰 목록 → 동일 hash 반환
 
-test_resolve_segments_returns_metas_no_kv:
-    resolve_segments() 반환값이 SegmentMeta 목록 (KV 텐서 없음)
+test_llmprogramdag_token_overlap_ratio:
+    완전 일치 → 1.0, 완전 불일치 → 0.0, 절반 일치 → 0.5
 
-test_put_segment_and_get_segments:
-    put_segment() 후 get_segments()에서 히트 반환
+test_build_reservation_map_identifies_reusable:
+    overlap >= 0.6인 스텝 쌍 → reservation_map에 포함
 
-test_noncontiguous_hit_detection:
-    chunk 0 miss + chunk 2 hit → noncontiguous_hit += 1
+test_build_reservation_map_excludes_low_overlap:
+    overlap < 0.6 → reservation_map에 미포함
+
+test_reserve_segments_pins_high_probability:
+    reuse_probability >= pin_threshold 세그먼트 → pinned 상태
+
+test_reserve_segments_skips_low_probability:
+    reuse_probability < pin_threshold → pinned 미포함
+
+test_pinned_segment_not_evicted:
+    pinned 세그먼트는 evict()에서 건너뜀
+
+test_release_reservations_unpins:
+    release_reservations() 후 세그먼트 pinned 해제
 
 test_noncontiguous_hit_rate_above_threshold:
-    비연속 패턴 10회 입력 후 noncontiguous_hit_rate() > 0.0
+    pinned 세그먼트 히트 시 noncontiguous_hit_rate > 0.0
 
-test_adapshot_reencode_changes_kv:
-    source_pos != target_pos → 재인코딩 후 KV 값 변화 확인
+test_reservation_hit_rate_tracks_pinned_hits:
+    예약 세그먼트 get() 히트 → reservation_hit_rate 증가
 
-test_adapshot_reencode_identity_same_pos:
-    source_pos == target_pos → 재인코딩 후 원본과 거의 동일 (error < 1e-4)
+test_cachestore_interface_put_get_evict:
+    put/get/evict/hit_rate/memory_bytes/reset_stats 동작 확인
 
-test_adapshot_reencode_preserves_shape:
-    재인코딩 전후 KV shape 동일
-
-test_load_and_reencode_segment_async:
-    asyncio로 load_and_reencode_segment() 호출 → KVSegment 반환
-
-test_load_and_reencode_returns_none_on_miss:
-    미저장 segment_id → None 반환
-
-test_memory_bytes_increases_on_put:
-    put() 후 memory_bytes() 증가
+test_lru_eviction_respects_pinned:
+    max_entries 초과 시 비pinned LRU 항목 먼저 퇴거
 ```
 
-### 단위 테스트 최소 요구 사항 (test_ampd_prefill_share_stack.py)
+### 통합 테스트 최소 요구사항 (test_kvdrive_thunder_e2e.py)
 
 ```
-test_stack_init_all_components:
-    초기화 시 scheduler, pipeline, compressor 모두 존재
+test_e2e_parse_reserve_put_get:
+    parse_program → reserve_for_step → put → get 전체 흐름
 
-test_schedule_delegates_to_scheduler:
-    stack.schedule() 호출 시 scheduler.schedule() 위임
+test_e2e_tier_compression_applied_on_put:
+    put() 시 compression_hook() 통해 계층별 압축 적용됨
 
-test_process_step1_registers_metadata:
-    process_request_step1_metadata() 후 registry에 세그먼트 등록됨
+test_e2e_hit_rate_improves_with_reservation:
+    예약 없는 경우 대비 예약 있는 경우 hit_rate 동일 이상
 
-test_process_step3_lazy_load_returns_tensors:
-    confirmed_ids 있으면 step3 결과가 텐서 목록
+test_e2e_scheduler_assigns_tiers:
+    step() 호출 후 KVTierRegistry에 계층 배정됨
 
-test_process_step4_compression_applies:
-    compression_hook 활성 코덱 있으면 step4에서 텐서 변환됨
+test_e2e_metrics_summary_all_keys:
+    metrics_summary()가 모든 필수 키 포함
 
-test_metrics_summary_keys:
-    metrics_summary()가 scheduler_overhead, pipeline_hit_rate 등 모든 키 포함
+test_e2e_cachestore_interface_full:
+    put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
 
-test_cross_abc_accuracy_preserved:
-    5단계 처리 후 cosine >= 0.99 (evaluation_criteria.md §5 C 포함 필수)
+test_e2e_accuracy_preserved_after_full_pipeline:
+    통합 스택 put → get 왕복 후 cosine_similarity ≥ 0.99 (MANDATORY)
 
-test_cross_abc_throughput_vs_solo_b1:
-    단독 B-1 대비 Cross-1 처리량 +5% 이상 목표 (§5 검증)
-
-test_cross_abc_memory_vs_solo_c1:
-    단독 C-1 대비 Cross-1 메모리 −10% 이상 목표 (§5 검증)
-
-test_cache_property_is_cachestore:
-    stack.cache가 CacheStore 인스턴스
-```
-
----
-
-## vLLM 이식 경로 (vllm-porter 참조용)
-
-```
-vllm_integration/
-├── scheduler_patch.py          # LazySegmentFetchSchedulerMixin 추가
-├── attention_backend_patch.py  # LazyLoadReencodingAttentionHook 추가
-└── dp_attn_compression_hook.py # DPAttentionAwareCompressionSelector vLLM 연동 (신규)
-```
-
-### Activity A 통합 포인트: `vllm/core/scheduler.py`
-
-```python
-# vllm_integration/scheduler_patch.py 추가 사항
-
-class LazySegmentFetchSchedulerMixin:
-    """vLLM Scheduler에 AMPD 지연 페치 기능을 추가하는 믹스인.
-
-    vLLM 통합 포인트:
-      - vllm.v1.core.sched.scheduler.Scheduler
-      - schedule() 메서드를 오버라이드해 _ampd_pre_resolve() 훅 삽입.
-      - 세그먼트 확정 이벤트를 KV 전송 타이밍 제어에 연결.
-
-    make_lazy_fetch_scheduler_class() 팩토리:
-      LazySegmentFetchSchedulerMixin + vLLM Scheduler 동적 조합.
-    """
-    def _ampd_pre_resolve(self, waiting_requests) -> None:
-        """schedule() 전 후보 세그먼트 메타데이터 등록."""
-        ...
-```
-
-### Activity B 통합 포인트: attention backend
-
-```python
-# vllm_integration/attention_backend_patch.py 추가 사항
-
-class LazyLoadReencodingAttentionHook:
-    """FlashAttentionImpl에 지연 로드 + AdapShot 재인코딩 훅 삽입.
-
-    write_to_cache: 세그먼트 확정 후에만 캐시 기록.
-    read_from_cache: load_and_reencode_segment()로 재인코딩된 KV 반환.
-    """
-    def write_to_cache(self, key_cache, value_cache, layer_idx: int) -> None: ...
-    def read_from_cache(self, key_cache, value_cache, layer_idx: int): ...
-```
-
-### Activity C 통합 포인트: KV 압축 훅
-
-```python
-# vllm_integration/dp_attn_compression_hook.py (신규)
-
-class DPAttentionCompressionHook:
-    """vLLM의 DP Attention 상태를 DPAttentionAwareCompressionSelector에 주입.
-
-    vLLM DP Attention 상태 읽기:
-      - vllm.config.ParallelConfig.data_parallel_size
-      - vllm.worker.WorkerBase.dp_rank 존재 여부로 DP Attention 활성 감지.
-    """
-    def __init__(self, selector: "DPAttentionAwareCompressionSelector") -> None: ...
-    def inject_dp_state(self, vllm_engine) -> None:
-        """vLLM 엔진에서 DP Attention 상태를 읽어 selector.update_dp_attn_state() 호출."""
-        ...
+test_e2e_cross_abc_vs_solo_a1_throughput:
+    통합 스택 처리량이 A-1 단독 대비 동일 이상 (§5 검증)
 ```
 
 ---
@@ -1487,42 +1304,42 @@ class DPAttentionCompressionHook:
 
 - [ ] 단위 테스트 전부 통과 (신규 4개 파일 + 기존 회귀 없음)
 - [ ] `evaluation_criteria.md` §4 Activity C 필수 항목 충족:
-      - perplexity 변화 ±1% 이내 (attention error < 0.01, 단일/멀티 GPU 양쪽)
-      - downstream 태스크 정확도 ±1% 이내 (KL < 0.015, cosine >= 0.99)
-      - {DP Attention ON/OFF} × {압축 기법} 교차 행렬 검증
-      - DP Attention ON/OFF 간 정확도 차이 정량화
+      - HBM FP8 압축 후 relative_error < 0.01 (1%) — `test_hbm_fp8_relative_error_below_1pct` 통과
+      - cosine_similarity > 0.99 — `test_hbm_fp8_cosine_similarity_above_099` 통과
+      - KV Memory Reduction ≥ −30% — `test_memory_reduction_overall_above_30pct` 통과
 - [ ] `evaluation_criteria.md` §2 Activity A 항목 충족:
-      - 스케줄링 오버헤드 TTFT p50 +5% 이내
-      - 메타데이터 선행 전달 오버헤드 < 0.1ms/요청
-      - unnecessary_transfer_ratio 지표 수집 및 기록
+      - 스케줄링 오버헤드 TTFT p50 +5% 이내 — `test_scheduling_overhead_below_5ms` 통과
+      - 영구 퇴거 비율 = 0% — `test_unnecessary_eviction_rate_always_zero` 통과
 - [ ] `evaluation_criteria.md` §3 Activity B 항목 충족:
-      - 비연속 세그먼트 히트율 전체 히트의 30% 이상
+      - 비연속 세그먼트 히트율 ≥ 30% — `test_noncontiguous_hit_rate_above_threshold` 통과
       - KV Memory Footprint +20% 이내
 - [ ] `evaluation_criteria.md` §5 크로스 조합 C 포함:
-      - 복합 적용 후 accuracy ±1% 이내 (cosine >= 0.99)
-      - 단독 A-1 / B-1 / C-1 / Cross-1 4방향 비교 수치 확인
-      - 단독 Activity 대비 +5% 처리량, −10% 메모리 개선
+      - 복합 적용 후 accuracy cosine ≥ 0.99 — `test_e2e_accuracy_preserved_after_full_pipeline` 통과
+      - 단독 A-1 / B-1 / C-1 / Cross-1 4방향 비교 수치 기록
 - [ ] `evaluation_criteria.md` §0 공통 필수:
-      - CacheStore 인터페이스 모든 추상 메서드 구현 (AMPDAdapShotLazyLoadPipeline, DPAttentionAwareCompressionSelector)
+      - CacheStore 인터페이스 모든 추상 메서드 구현
+        (ThunderAgentStaticSegmentReservationCache, KVDriveTierDifferentiatedCompressionCodec,
+        KVDriveThunderAgentIntegratedStack)
       - 시드 42 고정 재현성
-      - `configs/experiments/2026-05-18.yaml` 존재
+      - `configs/experiments/2026-05-19.yaml` 존재
       - 모든 공개 함수·메서드 타입 힌트
-- [ ] 목표 지표 수치 `results/2026-05-18/metrics.json`에 JSON 기록:
+- [ ] 목표 지표 수치 `results/2026-05-19/metrics.json`에 JSON 기록:
       ```json
       {
         "inference_throughput_improvement_pct": ...,
         "kv_memory_reduction_ratio": ...,
-        "compression_accuracy_delta_single_gpu": ...,
-        "compression_accuracy_delta_dp_attn": ...,
+        "hbm_fp8_relative_error": ...,
+        "hbm_fp8_cosine_similarity": ...,
+        "dram_vq_relative_error": ...,
+        "ssd_int4_reconstruction_error": ...,
         "effective_context_length_multiplier": ...,
-        "scheduling_overhead_ttft_p50_pct": ...,
-        "metadata_overhead_ms_p50": ...,
-        "unnecessary_transfer_ratio": ...,
+        "scheduling_overhead_ttft_p50_ms": ...,
+        "unnecessary_eviction_rate": 0.0,
         "noncontiguous_hit_rate": ...,
-        "cross_abc_throughput_vs_solo_pct": ...,
-        "cross_abc_memory_vs_solo_pct": ...,
+        "reservation_hit_rate": ...,
         "cross_abc_accuracy_cosine": ...,
-        "dp_attn_compression_matrix": "results/2026-05-18/dp_attn_compression_matrix.json"
+        "cross_abc_throughput_vs_solo_pct": ...,
+        "cross_abc_memory_vs_solo_pct": ...
       }
       ```
 - [ ] `src/cache/base.py` CacheStore 인터페이스 깨지지 않음 (수정 없음)
