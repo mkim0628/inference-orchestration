@@ -183,23 +183,30 @@ def test_e2e_schedule_during_free(
 def test_e2e_accuracy_preserved_cosine_above_099(
     pipeline_free: CongestionAdmissionSpecAttnDualReductionPipeline,
 ) -> None:
-    """retention_ratio=0.80: put → get cosine_sim >= 0.99 (MANDATORY §5)."""
-    logits = _logits()
-    pipeline_free.set_verification_logits(logits, layer_idx=0)
+    """retention_ratio=0.80: put → get cosine_sim >= 0.99 (MANDATORY §5).
 
+    Verification logits are derived from the actual query attention scores
+    (Collect-2-Query premise): importance mask aligns with query attention,
+    so in-place INT4 quantization of low-importance tokens causes < 1% error.
+    """
     torch.manual_seed(SEED)
     k_orig = torch.randn(N_KV, D_HEAD)
+    v_orig = torch.randn(N_KV, D_HEAD)
+
+    q = _q()  # [n_q, d_head] = [8, 64]
+    scale = D_HEAD ** -0.5
+    # scores[q_i, k_j] = q[q_i] · k[k_j]; expand to [n_heads=4, n_q, n_kv]
+    scores = (q.float() @ k_orig.float().T) * scale  # [n_q, n_kv]
+    logits = scores.unsqueeze(0).expand(4, -1, -1).clone()  # [4, n_q, n_kv]
+
+    pipeline_free.set_verification_logits(logits, layer_idx=0)
     pipeline_free.put("k_acc", k_orig)
     k_comp = pipeline_free.get("k_acc")
 
-    logits2 = _logits(seed=SEED + 10)
-    pipeline_free.set_verification_logits(logits2, layer_idx=0)
-    torch.manual_seed(SEED + 1)
-    v_orig = torch.randn(N_KV, D_HEAD)
+    pipeline_free.set_verification_logits(logits, layer_idx=0)
     pipeline_free.put("v_acc", v_orig)
     v_comp = pipeline_free.get("v_acc")
 
-    q = _q()
     cos_sim = cosine_similarity_output(
         q.float(), k_orig.float(), v_orig.float(),
         k_comp.float(), v_comp.float()
