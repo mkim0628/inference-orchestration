@@ -164,7 +164,7 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
         else:
             retention = self.config.global_retention_ratio
         unimportant_fraction = 1.0 - retention
-        self._total_bytes_saved += int(n_kv * unimportant_fraction * 0.75)
+        self._total_bytes_saved += round(n_kv * unimportant_fraction * 0.75)
         self._total_bytes_original += n_kv
         # Keep legacy eviction counter consistent (no tokens physically evicted now)
         self._total_tokens_evicted += 0
