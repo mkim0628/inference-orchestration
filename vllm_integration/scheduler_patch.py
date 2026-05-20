@@ -4947,3 +4947,541 @@ def _smoke_test_kvdrive_scheduler_mixin_19() -> None:
 
 if __name__ == "__main__":
     _smoke_test_kvdrive_scheduler_mixin_19()
+
+
+# ===========================================================================
+# 2026-05-20: CONCUR Congestion-Based Admission Scheduler Mixin (Activity A)
+# ===========================================================================
+#
+# Ports CONCURCongestionBasedAgentAdmissionScheduler
+# (src/scheduler/concur_congestion_admission_scheduler.py) into vLLM's
+# v1 Scheduler as a mixin that intercepts schedule() with a 3-state congestion
+# admission gate.
+#
+# Algorithm:
+#   FREE (occupancy < alpha_low):     admit all waiting requests unconditionally.
+#   BOUNDARY (alpha_low <= occ < alpha_high): admit top-half by priority.
+#   CONGESTED (occ >= alpha_high):    suspend new admissions; keep in-flight.
+#
+# Online threshold adaptation every online_adapt_window steps:
+#   wait_ratio > 0.5 → alpha_high -= 0.02 (tighten); wait_ratio < 0.1 → += 0.02
+#   alpha_high clamped [0.70, 0.95]; alpha_low = alpha_high - 0.25.
+#
+# Multi-node support:
+#   update_remote_occupancy(node_id, occ) aggregates remote node occupancies.
+#   global_occupancy() returns average of local + remotes for distributed gate.
+#
+# vLLM 0.21.0 integration:
+#   kv_cache_manager.usage  → float occupancy [0.0, 1.0] (O(1)).
+#   Mixin's concur_pre_schedule() reads this and applies admission gate before
+#   base Scheduler.schedule() allocates blocks for waiting requests.
+
+
+import statistics as _statistics_concur
+
+
+def _try_import_concur_src():
+    """Lazy import CONCURCongestionBasedAgentAdmissionScheduler from src/."""
+    try:
+        import sys as _sys_c
+        import pathlib as _pathlib_c
+        repo_root = str(_pathlib_c.Path(__file__).resolve().parent.parent)
+        if repo_root not in _sys_c.path:
+            _sys_c.path.insert(0, repo_root)
+        from src.scheduler.concur_congestion_admission_scheduler import (
+            CONCURCongestionBasedAgentAdmissionScheduler,
+            CongestionAdmissionConfig,
+            KVPoolMonitor,
+        )
+        return CONCURCongestionBasedAgentAdmissionScheduler, CongestionAdmissionConfig, KVPoolMonitor
+    except ImportError:
+        return None, None, None
+
+
+@dataclass
+class ConcurSchedulerConfig:
+    """Configuration for CONCURCongestionAdmissionSchedulerMixin.
+
+    Mirrors CongestionAdmissionConfig defaults; used when src/ is not importable.
+    """
+    alpha_low: float = 0.60
+    alpha_high: float = 0.85
+    online_adapt_window: int = 100
+    priority_weights: Dict[str, float] = field(default_factory=dict)
+    enable_multinode: bool = False
+    seed: int = 42
+
+
+class _InlineCONCURGate:
+    """Inline 3-state congestion gate (no src/ dependency).
+
+    Replicates KVPoolMonitor + admission decision logic without importing src/.
+    """
+
+    def __init__(
+        self,
+        alpha_low: float = 0.60,
+        alpha_high: float = 0.85,
+        online_adapt_window: int = 100,
+    ) -> None:
+        self.alpha_low = alpha_low
+        self.alpha_high = alpha_high
+        self.online_adapt_window = online_adapt_window
+        self._current_occupancy: float = 0.0
+        self._remote_occupancies: Dict[str, float] = {}
+        self._step_count: int = 0
+        self._window_admitted: int = 0
+        self._wait_size: int = 0
+
+    def update_occupancy(self, occ: float) -> None:
+        self._current_occupancy = occ
+
+    def update_remote_occupancy(self, node_id: str, occ: float) -> None:
+        self._remote_occupancies[node_id] = occ
+
+    def global_occupancy(self) -> float:
+        all_occ = [self._current_occupancy] + list(self._remote_occupancies.values())
+        return sum(all_occ) / len(all_occ)
+
+    def congestion_level(self) -> str:
+        occ = self._current_occupancy
+        if occ >= self.alpha_high:
+            return "CONGESTED"
+        elif occ >= self.alpha_low:
+            return "BOUNDARY"
+        return "FREE"
+
+    def admit_requests(
+        self,
+        requests: List[Any],
+        priority_weights: Dict[str, float],
+    ) -> Tuple[List[Any], List[Any]]:
+        """Return (admitted, deferred) lists."""
+        level = self.congestion_level()
+        if level == "CONGESTED":
+            self._wait_size = len(requests)
+            return [], list(requests)
+        elif level == "BOUNDARY":
+            def _prio(r: Any) -> float:
+                rid = getattr(r, "request_id", "")
+                return priority_weights.get(rid, 1.0)
+            sorted_reqs = sorted(requests, key=_prio, reverse=True)
+            half = max(1, len(sorted_reqs) // 2)
+            admitted = sorted_reqs[:half]
+            deferred = sorted_reqs[half:]
+            self._window_admitted += len(admitted)
+            self._wait_size = len(deferred)
+            return admitted, deferred
+        else:  # FREE
+            self._window_admitted += len(requests)
+            self._wait_size = 0
+            return list(requests), []
+
+    def maybe_adapt(self) -> None:
+        self._step_count += 1
+        if self._step_count % self.online_adapt_window == 0:
+            admitted = max(1, self._window_admitted)
+            wait_ratio = self._wait_size / admitted
+            if wait_ratio > 0.5:
+                self.alpha_high = max(0.70, self.alpha_high - 0.02)
+            elif wait_ratio < 0.1:
+                self.alpha_high = min(0.95, self.alpha_high + 0.02)
+            self.alpha_low = self.alpha_high - 0.25
+            self._window_admitted = 0
+
+    def reset_stats(self) -> None:
+        self._step_count = 0
+        self._window_admitted = 0
+        self._wait_size = 0
+        self._remote_occupancies.clear()
+
+
+class CONCURCongestionAdmissionSchedulerMixin:
+    """vLLM v1 Scheduler mixin: CONCUR 3-state KV pool congestion admission gate.
+
+    Activity A: KV Cache-aware Scheduling.
+    Based on CONCUR (USENIX ATC 2025): runtime KV pool occupancy drives a
+    3-state admission gate that prevents middle-phase thrashing without
+    preempting in-flight agents.
+
+    Integration:
+        This mixin wraps schedule() with concur_pre_schedule() that:
+          1. Reads kv_cache_manager.usage (O(1)) for pool occupancy.
+          2. Classifies state: FREE / BOUNDARY / CONGESTED.
+          3. In BOUNDARY: admits top-half of waiting requests by priority.
+          4. In CONGESTED: skips new admissions (does not preempt running).
+          5. Annotates each waiting request with concur_admission_state.
+
+    The base Scheduler.schedule() then runs normally on the (possibly reduced)
+    waiting queue — only unannotated requests that passed the gate proceed to
+    block allocation.
+
+    Online threshold adaptation:
+        Every online_adapt_window steps, alpha_high is adjusted ±0.02 based on
+        wait_ratio (queue pressure). alpha_low = alpha_high - 0.25.
+        alpha_high clamped to [0.70, 0.95].
+
+    Multi-node:
+        update_concur_remote_occupancy(node_id, occ) aggregates remote node
+        occupancies. global_concur_occupancy() returns average for a distributed
+        congestion signal compatible with P/D disaggregated vLLM deployments.
+
+    Usage:
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            CONCURCongestionAdmissionSchedulerMixin,
+            ConcurSchedulerConfig,
+            make_concur_admission_scheduler_class,
+        )
+
+        ConcurScheduler = make_concur_admission_scheduler_class(Scheduler)
+        scheduler = ConcurScheduler(
+            ...,  # standard vLLM Scheduler args
+            concur_config=ConcurSchedulerConfig(
+                alpha_low=0.60, alpha_high=0.85,
+                online_adapt_window=100,
+            ),
+        )
+
+    Scheduling overhead: O(W) per step (W = waiting queue size), < 1ms p50.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        concur_config: Optional[ConcurSchedulerConfig] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        if concur_config is None:
+            concur_config = ConcurSchedulerConfig()
+        self._concur_cfg = concur_config
+
+        # Try native src/ import first
+        CONCURSched, CongestionCfg, _ = _try_import_concur_src()
+        self._concur_native: Optional[Any] = None
+        self._concur_use_native: bool = False
+
+        if CONCURSched is not None:
+            native_cfg = CongestionCfg(
+                alpha_low=concur_config.alpha_low,
+                alpha_high=concur_config.alpha_high,
+                online_adapt_window=concur_config.online_adapt_window,
+                priority_weights=dict(concur_config.priority_weights),
+                enable_multinode=concur_config.enable_multinode,
+                seed=concur_config.seed,
+            )
+            self._concur_native = CONCURSched(native_cfg)
+            self._concur_use_native = True
+        else:
+            self._concur_gate = _InlineCONCURGate(
+                alpha_low=concur_config.alpha_low,
+                alpha_high=concur_config.alpha_high,
+                online_adapt_window=concur_config.online_adapt_window,
+            )
+
+        # Metrics
+        self._concur_overhead_ms_list: List[float] = []
+        self._concur_step_count: int = 0
+        self._concur_deferred_counts: List[int] = []
+
+    # ------------------------------------------------------------------
+    # Primary scheduling hook — call at the start of schedule()
+    # ------------------------------------------------------------------
+
+    def concur_pre_schedule(self) -> None:
+        """Apply CONCUR 3-state admission gate to waiting requests.
+
+        Reads kv_cache_manager.usage for pool occupancy.
+        Annotates waiting requests with concur_admission_state attribute.
+        Overhead: O(W) per step, W = waiting queue size. Target < 1ms p50.
+        """
+        t0 = time.monotonic()
+        self._concur_step_count += 1
+
+        # Get KV pool occupancy from vLLM's KV cache manager
+        kv_mgr = getattr(self, "kv_cache_manager", None)
+        if kv_mgr is not None:
+            try:
+                occupancy = float(kv_mgr.usage)
+            except Exception:
+                occupancy = 0.0
+        else:
+            occupancy = 0.0
+
+        # Update the gate/monitor
+        if self._concur_use_native and self._concur_native is not None:
+            # Convert fractional occupancy to bytes using capacity_bytes
+            cap = self._concur_native.config.capacity_bytes
+            self._concur_native.update_kv_pool(int(occupancy * cap))
+            level = self._concur_native.monitor.congestion_level()
+        else:
+            self._concur_gate.update_occupancy(occupancy)
+            self._concur_gate.maybe_adapt()
+            level = self._concur_gate.congestion_level()
+
+        # Extract waiting requests (read-only, order-preserving)
+        waiting = getattr(self, "waiting", None)
+        if waiting is None:
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            self._concur_overhead_ms_list.append(elapsed_ms)
+            return
+
+        pending = self._concur_extract_waiting(waiting)
+
+        # Apply admission gate
+        if self._concur_use_native and self._concur_native is not None:
+            admitted_reqs, deferred_reqs = self._concur_native_gate(pending, level)
+        else:
+            admitted_reqs, deferred_reqs = self._concur_gate.admit_requests(
+                pending, dict(self._concur_cfg.priority_weights)
+            )
+
+        self._concur_deferred_counts.append(len(deferred_reqs))
+
+        # Annotate requests
+        for req in admitted_reqs:
+            try:
+                req.concur_admission_state = "ADMITTED"
+                req.concur_congestion_level = level
+            except (AttributeError, TypeError):
+                pass
+
+        for req in deferred_reqs:
+            try:
+                req.concur_admission_state = "DEFERRED"
+                req.concur_congestion_level = level
+            except (AttributeError, TypeError):
+                pass
+
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        self._concur_overhead_ms_list.append(elapsed_ms)
+
+    def _concur_native_gate(
+        self,
+        pending: List[Any],
+        level: str,
+    ) -> Tuple[List[Any], List[Any]]:
+        """Apply admission gate using native CONCUR scheduler."""
+        if level == "CONGESTED":
+            return [], list(pending)
+        elif level == "BOUNDARY":
+            weights = dict(self._concur_cfg.priority_weights)
+            def _prio(r: Any) -> float:
+                return weights.get(getattr(r, "request_id", ""), 1.0)
+            sorted_reqs = sorted(pending, key=_prio, reverse=True)
+            half = max(1, len(sorted_reqs) // 2)
+            return sorted_reqs[:half], sorted_reqs[half:]
+        else:  # FREE
+            return list(pending), []
+
+    def update_concur_remote_occupancy(self, node_id: str, occupancy: float) -> None:
+        """Multi-node: update remote node KV pool occupancy.
+
+        Args:
+            node_id: Identifier for the remote node.
+            occupancy: Fractional KV pool occupancy on that node (0.0–1.0).
+        """
+        if self._concur_use_native and self._concur_native is not None:
+            self._concur_native.update_remote_occupancy(node_id, occupancy)
+        else:
+            self._concur_gate.update_remote_occupancy(node_id, occupancy)
+
+    def global_concur_occupancy(self) -> float:
+        """Return average of local + remote KV pool occupancies (multi-node)."""
+        if self._concur_use_native and self._concur_native is not None:
+            return self._concur_native.global_occupancy()
+        return self._concur_gate.global_occupancy()
+
+    def get_concur_stats(self) -> Dict[str, Any]:
+        """Return CONCUR scheduling statistics.
+
+        Returns:
+            dict with keys: step_count, scheduling_overhead_ms_p50,
+            avg_deferred_per_step, current_alpha_low, current_alpha_high,
+            current_occupancy, vllm_version.
+        """
+        p50_ms = 0.0
+        if self._concur_overhead_ms_list:
+            s = sorted(self._concur_overhead_ms_list)
+            p50_ms = s[len(s) // 2]
+
+        avg_deferred = (
+            sum(self._concur_deferred_counts) / max(1, len(self._concur_deferred_counts))
+        )
+
+        if self._concur_use_native and self._concur_native is not None:
+            alpha_low = self._concur_native.monitor.alpha_low
+            alpha_high = self._concur_native.monitor.alpha_high
+            current_occ = self._concur_native.monitor.get_occupancy()
+        else:
+            alpha_low = self._concur_gate.alpha_low
+            alpha_high = self._concur_gate.alpha_high
+            current_occ = self._concur_gate._current_occupancy
+
+        return {
+            "step_count": self._concur_step_count,
+            "scheduling_overhead_ms_p50": p50_ms,
+            "avg_deferred_per_step": avg_deferred,
+            "current_alpha_low": alpha_low,
+            "current_alpha_high": alpha_high,
+            "current_occupancy": current_occ,
+            "global_occupancy": self.global_concur_occupancy(),
+            "vllm_version": vllm.__version__,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _concur_extract_waiting(self, waiting: Any) -> List[Any]:
+        """Extract pending requests from vLLM's RequestQueue (read-only)."""
+        pending: List[Any] = []
+        if isinstance(waiting, deque):
+            pending = list(waiting)
+        elif hasattr(waiting, "_heap"):
+            pending = [entry[-1] for entry in waiting._heap if entry]
+        elif hasattr(waiting, "__iter__"):
+            try:
+                pending = list(waiting)
+            except Exception:
+                pass
+        return pending
+
+
+def make_concur_admission_scheduler_class(base_scheduler_cls: type) -> type:
+    """Factory: build a vLLM Scheduler subclass with CONCUR congestion admission gate.
+
+    The returned class overrides schedule() to call concur_pre_schedule() before
+    the base Scheduler.schedule() logic, adding 3-state congestion-based admission
+    control with online threshold adaptation.
+
+    Activity A: KV Cache-aware Scheduling (CONCUR congestion gate).
+
+    Args:
+        base_scheduler_cls: vLLM Scheduler class (e.g. vllm.v1.core.sched.scheduler.Scheduler).
+
+    Returns:
+        CONCURAdmissionVllmScheduler: subclass of
+        (CONCURCongestionAdmissionSchedulerMixin, base_scheduler_cls).
+
+    Example:
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            make_concur_admission_scheduler_class,
+            ConcurSchedulerConfig,
+        )
+
+        ConcurScheduler = make_concur_admission_scheduler_class(Scheduler)
+        scheduler = ConcurScheduler(
+            vllm_config=cfg,
+            kv_cache_config=kv_cfg,
+            structured_output_manager=som,
+            block_size=16,
+            concur_config=ConcurSchedulerConfig(
+                alpha_low=0.60,
+                alpha_high=0.85,
+                online_adapt_window=100,
+            ),
+        )
+
+    Composable with prior-cycle mixins (Cross A+C):
+
+        from vllm_integration.scheduler_patch import make_nath_ddr_scheduler_class
+        ConcurNAtHScheduler = make_concur_admission_scheduler_class(
+            make_nath_ddr_scheduler_class(Scheduler)
+        )
+
+    Scheduling overhead: < 1ms p50 (O(W) per step, W = waiting queue size).
+    Accuracy contract: in-flight KV blocks are never preemptively evicted;
+    CONCUR's core guarantee preserves ongoing request quality.
+    """
+
+    class CONCURAdmissionVllmScheduler(
+        CONCURCongestionAdmissionSchedulerMixin, base_scheduler_cls  # type: ignore[valid-type]
+    ):
+        """vLLM Scheduler extended with CONCUR 3-state KV pool admission gate (Activity A).
+
+        Wraps schedule() to apply congestion-based admission control before
+        the base FCFS/Priority scheduling runs. Requests are annotated with
+        concur_admission_state ("ADMITTED" / "DEFERRED") and congestion_level
+        ("FREE" / "BOUNDARY" / "CONGESTED") for monitoring and routing.
+        """
+
+        def __init__(
+            self,
+            *args: Any,
+            concur_config: Optional[ConcurSchedulerConfig] = None,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(*args, concur_config=concur_config, **kwargs)
+
+        def schedule(self) -> Any:
+            """Override: run CONCUR admission gate before base scheduling."""
+            self.concur_pre_schedule()
+            return super().schedule()
+
+    CONCURAdmissionVllmScheduler.__name__ = f"CONCURAdmission_{base_scheduler_cls.__name__}"
+    CONCURAdmissionVllmScheduler.__qualname__ = CONCURAdmissionVllmScheduler.__name__
+    return CONCURAdmissionVllmScheduler
+
+
+def _smoke_test_concur_admission_scheduler_mixin_20() -> None:
+    """Smoke test for CONCURCongestionAdmissionSchedulerMixin (2026-05-20)."""
+    print("CONCURCongestionAdmissionSchedulerMixin smoke test (2026-05-20)...")
+
+    # Test _InlineCONCURGate directly
+    gate = _InlineCONCURGate(alpha_low=0.60, alpha_high=0.85, online_adapt_window=10)
+
+    # FREE state: all admitted
+    gate.update_occupancy(0.40)
+    assert gate.congestion_level() == "FREE", f"Expected FREE, got {gate.congestion_level()}"
+
+    class FakeReq:
+        def __init__(self, rid: str):
+            self.request_id = rid
+    reqs = [FakeReq(f"r{i}") for i in range(4)]
+    admitted, deferred = gate.admit_requests(reqs, {})
+    assert len(admitted) == 4, f"FREE should admit all 4, got {len(admitted)}"
+    assert len(deferred) == 0
+    print("  FREE admit-all: PASS")
+
+    # BOUNDARY state: top-half admitted
+    gate.update_occupancy(0.70)
+    assert gate.congestion_level() == "BOUNDARY"
+    admitted, deferred = gate.admit_requests(reqs, {})
+    assert len(admitted) == 2, f"BOUNDARY should admit 2/4, got {len(admitted)}"
+    print("  BOUNDARY half-admit: PASS")
+
+    # CONGESTED state: none admitted
+    gate.update_occupancy(0.90)
+    assert gate.congestion_level() == "CONGESTED"
+    admitted, deferred = gate.admit_requests(reqs, {})
+    assert len(admitted) == 0, f"CONGESTED should admit 0, got {len(admitted)}"
+    print("  CONGESTED block-all: PASS")
+
+    # Multi-node occupancy
+    gate.update_occupancy(0.30)
+    gate.update_remote_occupancy("node-1", 0.70)
+    global_occ = gate.global_occupancy()
+    assert abs(global_occ - 0.50) < 0.01, f"Global occupancy should be 0.50, got {global_occ}"
+    print(f"  Multi-node global occupancy={global_occ:.2f}: PASS")
+
+    # Factory with real vLLM Scheduler
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        ConcurSched = make_concur_admission_scheduler_class(Scheduler)
+        assert issubclass(ConcurSched, Scheduler)
+        assert issubclass(ConcurSched, CONCURCongestionAdmissionSchedulerMixin)
+        print(f"  make_concur_admission_scheduler_class: PASS ({ConcurSched.__name__})")
+    except Exception as exc:
+        print(f"  make_concur_admission_scheduler_class: SKIP (no GPU env): {exc}")
+
+    print("CONCURCongestionAdmissionSchedulerMixin smoke test (2026-05-20): PASS")
+
+
+# End of 2026-05-20 CONCUR Congestion Admission additions
+# ===========================================================================

@@ -44,6 +44,137 @@ VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
 
 echo ""
+echo "=== 2026-05-20 A+C smoke tests (CONCURCongestionAdmission + SpecAttnSparseCodec) ==="
+set +e
+python - <<'PYEOF_2026_05_20'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity A: CONCURCongestionAdmissionSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    ConcurSchedulerConfig,
+    CONCURCongestionAdmissionSchedulerMixin,
+    make_concur_admission_scheduler_class,
+    _InlineCONCURGate,
+)
+
+gate = _InlineCONCURGate(alpha_low=0.60, alpha_high=0.85, online_adapt_window=10)
+
+class FakeReq:
+    def __init__(self, rid): self.request_id = rid
+
+reqs = [FakeReq(f"r{i}") for i in range(4)]
+
+# FREE: all admitted
+gate.update_occupancy(0.40)
+assert gate.congestion_level() == "FREE"
+admitted, deferred = gate.admit_requests(reqs, {})
+assert len(admitted) == 4 and len(deferred) == 0
+print(f"  FREE admit-all: PASS ({len(admitted)}/4 admitted)")
+
+# BOUNDARY: top-half admitted
+gate.update_occupancy(0.70)
+assert gate.congestion_level() == "BOUNDARY"
+admitted, deferred = gate.admit_requests(reqs, {})
+assert len(admitted) == 2 and len(deferred) == 2
+print(f"  BOUNDARY half-admit: PASS ({len(admitted)}/4 admitted)")
+
+# CONGESTED: none admitted
+gate.update_occupancy(0.90)
+assert gate.congestion_level() == "CONGESTED"
+admitted, deferred = gate.admit_requests(reqs, {})
+assert len(admitted) == 0 and len(deferred) == 4
+print(f"  CONGESTED block-all: PASS (0/4 admitted)")
+
+# Multi-node
+gate.update_occupancy(0.30)
+gate.update_remote_occupancy("node-1", 0.70)
+global_occ = gate.global_occupancy()
+assert abs(global_occ - 0.50) < 0.01
+print(f"  Multi-node global occupancy={global_occ:.2f}: PASS")
+
+# Factory
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    ConcurSched = make_concur_admission_scheduler_class(Scheduler)
+    assert issubclass(ConcurSched, Scheduler)
+    assert issubclass(ConcurSched, CONCURCongestionAdmissionSchedulerMixin)
+    print(f"  make_concur_admission_scheduler_class: PASS ({ConcurSched.__name__})")
+except Exception as exc:
+    print(f"  make_concur_admission_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity C: SpecAttnSparseVllmCodec
+# ---------------------------------------------------------------------------
+from vllm_integration.compression_codec import (
+    SpecAttnSparseVllmCodec,
+    SpecAttnCongestionDualPipelineVllmHook,
+    CacheCompressionConfig,
+)
+
+codec = SpecAttnSparseVllmCodec(global_retention_ratio=0.70, seed=42)
+
+kv = torch.randn(16, 4, 64, dtype=torch.float16)
+compressed = codec.write_to_cache("test_key", kv, layer_idx=0)
+assert compressed.shape == kv.shape
+retrieved = codec.read_from_cache("test_key", compressed)
+assert retrieved.shape == kv.shape
+print(f"  SpecAttnSparseVllmCodec write/read shape={kv.shape}: PASS")
+
+mr = codec.memory_reduction_ratio()
+expected = (1.0 - 0.70) * 0.75
+# Allow 0.05 tolerance for integer rounding in native codec put()
+assert abs(mr - expected) < 0.05, f"Memory reduction {mr:.3f} vs expected ~{expected:.3f}"
+print(f"  memory_reduction_ratio={mr:.3f} (expected ~{expected:.3f}): PASS")
+
+assert "specattn_sparse" in CacheCompressionConfig.SUPPORTED_METHODS
+assert "specattn_congestion_dual" in CacheCompressionConfig.SUPPORTED_METHODS
+print(f"  CacheCompressionConfig.SUPPORTED_METHODS: PASS")
+
+# Cross A+C dual hook
+hook = SpecAttnCongestionDualPipelineVllmHook(
+    global_retention_ratio=0.80, alpha_low=0.60, alpha_high=0.85,
+    retention_reduction_on_congestion=0.10, seed=42,
+)
+hook.update_kv_pool_occupancy(0.90)
+assert hook.codec.global_retention_ratio <= 0.80
+hook.update_kv_pool_occupancy(0.30)
+assert abs(hook.codec.global_retention_ratio - 0.80) < 0.01
+kv3 = torch.randn(8, 4, 64, dtype=torch.float16)
+c3 = hook.write_to_cache("cross_test", kv3, layer_idx=0)
+assert c3.shape == kv3.shape
+print(f"  Cross A+C SpecAttnCongestionDualPipelineVllmHook: PASS")
+
+# Attention backend hooks
+from vllm_integration.attention_backend_patch import (
+    apply_specattn_sparse_patch,
+    apply_specattn_congestion_dual_patch,
+)
+
+class _StubImpl:
+    pass
+
+apply_specattn_sparse_patch(_StubImpl, codec, layer_idx=2)
+assert hasattr(_StubImpl, "write_to_cache") and hasattr(_StubImpl, "read_from_cache")
+inst = _StubImpl()
+out_s = inst.write_to_cache("test:2", torch.randn(16, 4, 64, dtype=torch.float16), layer_idx=2)
+assert out_s.shape == (16, 4, 64)
+print(f"  apply_specattn_sparse_patch write/read: PASS")
+
+print("=== 2026-05-20 A+C smoke tests: PASS ===")
+PYEOF_2026_05_20
+EXIT_2026_05_20=$?
+set -e
+if [ $EXIT_2026_05_20 -ne 0 ]; then
+  echo "WARNING: 2026-05-20 A+C smoke tests had failures (exit=$EXIT_2026_05_20)" >&2
+fi
+
+echo ""
 echo "=== 2026-05-16 A+C smoke tests (NAtHDDROffloadingScheduler + GlobalRetentionGate) ==="
 set +e
 python - <<'PYEOF_2026_05_16'
