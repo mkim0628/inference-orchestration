@@ -787,7 +787,10 @@ class TestSpecAttnAccuracy:
     # ------------------------------------------------------------------ #
 
     def test_specattn_memory_reduction_above_15pct(self) -> None:
-        """retention_ratio=0.80 + INT4 → memory_reduction_ratio() ≥ 0.15."""
+        """retention_ratio=0.80 → memory_reduction_ratio() >= 0.20 (eviction-based).
+
+        With retention_ratio=0.80, 20% of KV tokens are evicted → ratio >= 0.20.
+        """
         codec = _make_specattn_codec(retention_ratio=0.80)
         logits = _make_verification_logits(n_kv=self.N_KV)
         codec.set_verification_logits(logits, layer_idx=0)
@@ -798,22 +801,17 @@ class TestSpecAttnAccuracy:
             codec.set_verification_logits(logits_i, layer_idx=0)
             codec.put(f"key_{i}", kv)
 
-        # Memory reduction tracks bytes_original vs bytes_stored
-        # With INT4 on 20% of tokens, actual nbytes does not change (same dtype stored),
-        # but the compression_ratio is measured by _total_bytes_stored/_total_bytes_original.
-        # Since we store the same dtype, ratio reflects quant accuracy loss, not byte savings.
-        # Per Spec, memory_reduction_ratio >= 0.15 is expected; we verify > 0 at minimum.
         ratio = codec.memory_reduction_ratio()
-        assert ratio >= 0.0, f"memory_reduction_ratio={ratio:.4f} should be non-negative"
+        assert ratio >= 0.15, (
+            f"memory_reduction_ratio={ratio:.4f} < 0.15 (retention=0.80 → 20% evicted)"
+        )
+        assert codec._total_tokens_original > 0
 
     def test_specattn_memory_reduction_above_30pct(self) -> None:
-        """retention_ratio=0.70 + eviction mode → memory tracked correctly (§4 높음).
+        """retention_ratio=0.70 → memory_reduction_ratio() >= 0.30 (§4 MANDATORY).
 
-        The memory_reduction_ratio() tracks _total_bytes_stored/_total_bytes_original.
-        Because compression stores the same dtype, zero-eviction mode (int4=False)
-        gives ratio=0.0.  With int4=True, rounding produces the same dtype so ratio
-        also reflects no byte reduction in this pure-Python simulation.
-        The test verifies the ratio is non-negative and the codec records tracking data.
+        With retention_ratio=0.70, 30% of KV tokens are evicted (not stored).
+        memory_reduction_ratio() = evicted_tokens / original_tokens = 0.30.
         """
         cfg = SpecAttnCodecConfig(
             retention_ratio_by_layer=[0.70] * 12,
@@ -830,8 +828,10 @@ class TestSpecAttnAccuracy:
             codec.put(f"key_{i}", kv)
 
         ratio = codec.memory_reduction_ratio()
-        assert ratio >= 0.0, f"memory_reduction_ratio={ratio:.4f} is negative"
-        assert codec._total_bytes_original > 0
+        assert ratio >= 0.30, (
+            f"memory_reduction_ratio={ratio:.4f} < 0.30 (MANDATORY: retention=0.70 → 30% evicted)"
+        )
+        assert codec._total_tokens_original > 0
 
     # ------------------------------------------------------------------ #
     # 8. CacheStore interface                                              #

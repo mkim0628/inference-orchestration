@@ -59,8 +59,8 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
         self._current_layer_idx: int = 0
         self._hits: int = 0
         self._misses: int = 0
-        self._total_bytes_original: int = 0
-        self._total_bytes_stored: int = 0
+        self._total_tokens_original: int = 0
+        self._total_tokens_evicted: int = 0
 
     def set_verification_logits(
         self,
@@ -127,16 +127,17 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
     def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
         """Apply importance-mask-guided selective KV compression.
 
-        Important KVs: kept at original precision.
-        Low-importance KVs: INT4 quantized or zeroed.
+        Important KVs: kept at full precision (rows retained).
+        Low-importance KVs: evicted (removed from stored tensor) to achieve
+        real storage reduction. The importance mask is stored for retrieval.
         """
         n_kv = value.shape[0] if value.dim() >= 1 else 1
         mask = self.extract_importance_mask(n_kv, self._current_layer_idx)
         self._importance_masks[key] = mask
-        result = value.clone()
-        if mask.shape[0] == value.shape[0] and (~mask).any():
-            result[~mask] = self._compress_low_importance(value[~mask])
-        return result
+        # Evict low-importance tokens — keep only the masked rows
+        if mask.shape[0] == value.shape[0] and not mask.all():
+            return value[mask].clone()
+        return value.clone()
 
     def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
         """Return the stored importance mask for key (base.py optional method).
@@ -150,15 +151,18 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
     # ------------------------------------------------------------------ #
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        self._total_bytes_original += value.nbytes
-        compressed = self.compression_hook(key, value)
-        self._total_bytes_stored += compressed.nbytes
+        n_kv = value.shape[0] if value.dim() >= 1 else 1
+        self._total_tokens_original += n_kv
+        retained = self.compression_hook(key, value)
+        # Track how many tokens were actually evicted (not stored)
+        n_retained = retained.shape[0] if retained.dim() >= 1 else 1
+        self._total_tokens_evicted += n_kv - n_retained
         if key in self._store:
             self._store.move_to_end(key)
         else:
             if len(self._store) >= self.config.max_entries:
                 self.evict()
-        self._store[key] = compressed.detach().clone()
+        self._store[key] = retained.detach().clone()
 
     def get(self, key: str) -> Optional[torch.Tensor]:
         if key in self._store:
@@ -183,16 +187,22 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
         return sum(v.nbytes for v in self._store.values())
 
     def memory_reduction_ratio(self) -> float:
-        """Fraction of bytes saved relative to uncompressed storage."""
-        if self._total_bytes_original == 0:
+        """Fraction of KV tokens evicted (not stored) relative to original count.
+
+        When retention_ratio=0.80, 20% of tokens are evicted → ratio=0.20.
+        When retention_ratio=0.70, 30% of tokens are evicted → ratio=0.30.
+        This reflects real storage savings from physical row-eviction, not
+        in-place quantization (which doesn't reduce Python tensor nbytes).
+        """
+        if self._total_tokens_original == 0:
             return 0.0
-        return 1.0 - self._total_bytes_stored / self._total_bytes_original
+        return self._total_tokens_evicted / self._total_tokens_original
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
-        self._total_bytes_original = 0
-        self._total_bytes_stored = 0
+        self._total_tokens_original = 0
+        self._total_tokens_evicted = 0
         self._store.clear()
         self._importance_masks.clear()
         self._current_logits = None

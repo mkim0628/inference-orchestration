@@ -214,7 +214,7 @@ def test_e2e_accuracy_preserved_cosine_above_099(
 # ---------------------------------------------------------------------------
 
 def test_e2e_memory_reduction_above_30pct() -> None:
-    """retention_ratio=0.70 pipeline: memory tracking works, ratio non-negative."""
+    """retention_ratio=0.70 pipeline: memory_reduction_ratio() >= 0.30 (MANDATORY)."""
     cfg = DualReductionConfig(
         scheduler_config=CongestionAdmissionConfig(capacity_bytes=1_000_000),
         codec_config=SpecAttnCodecConfig(
@@ -234,8 +234,10 @@ def test_e2e_memory_reduction_above_30pct() -> None:
         pipeline.put(f"key_{i}", kv)
 
     ratio = pipeline.codec.memory_reduction_ratio()
-    assert ratio >= 0.0, f"memory_reduction_ratio={ratio:.4f} is negative"
-    assert pipeline.codec._total_bytes_original > 0
+    assert ratio >= 0.30, (
+        f"memory_reduction_ratio={ratio:.4f} < 0.30 (retention=0.70 → 30% evicted)"
+    )
+    assert pipeline.codec._total_tokens_original > 0
 
 
 # ---------------------------------------------------------------------------
