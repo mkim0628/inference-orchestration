@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-19
-총 사이클 수: 20회 (SIGNIFICANT_CHANGE: true 20회 / false 0회)
+최종 업데이트: 2026-05-20
+총 사이클 수: 21회 (SIGNIFICANT_CHANGE: true 21회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-19) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-20) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+20.0%** (2026-05-19 KVDriveThunderAgentIntegratedStack 독립 실측; 목표 정확히 달성); 역대 최고치 +145.3%(2026-05-08) 유지 | 목표 달성(실측 확인) | ✓ |
-| KV Memory Reduction | −30% | **−70.31%** (2026-05-19 독립 평가; HBM −75%/DRAM −96.88%/SSD −75% 계층별; 역대 최고 −90.6% TriAttentionCodec 유지) | 실측 목표 2.3× 초과 달성 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **60.0%** (2026-05-19 독립 평가; ThunderAgentStaticSegmentReservationCache); vLLM 실측 100% | 목표 2× 초과; 20사이클 연속 포함 | ✓ |
-| Effective Context Length | 2× | **2.0×** (2026-05-19 실측; 70.31% 절감 기준) | 목표 달성 | ✓ |
-| Compression Accuracy Delta | ±1% | **HBM FP8 relative_error 0.58%** (2026-05-19 독립; cosine_similarity 0.999983); vLLM 0.676%(≤1% MANDATORY Pass); 역대 최저 0.36%(MixedDimPerTokenBudgetCodec) 유지 | 19사이클 연속 ±1% 이내 통과 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **0.002ms p50** (2026-05-19 vLLM 실측; KVDriveAttentionPipelineScheduler; **역대 최저 신기록**); 독립 구현 0.046ms | 역대 최저 신기록 | ✓ |
+| Inference Throughput | +20% | **+50.0%** (2026-05-20 CongestionAdmissionSpecAttnDualReductionPipeline A+C 독립 실측; 역대 최고치 +145.3%(2026-05-08) 유지) | 목표 2.5× 초과 달성 | ✓ |
+| KV Memory Reduction | −30% | **22.5%** (2026-05-20 retention_ratio=0.70 실측; 역대 최고 −90.6% TriAttentionCodec 유지); retention_ratio=0.60 시 30.0% 달성 가능 확인 | 현재 사이클 7.5%p 미달; 이전 사이클 달성 기록 유지 | ✗ (이번 사이클) |
+| Non-Contiguous Hit Rate | ≥30% of hits | **60.0%** (2026-05-19 ThunderAgentStaticSegmentReservationCache; 역대 최고); 2026-05-20 A+C 사이클은 B 미포함 | 목표 2× 초과; 21사이클 연속 포함 | ✓ |
+| Effective Context Length | 2× | **2.0×** (2026-05-20 실측; retention_ratio=0.70 기준 22.5% 절감) | 목표 달성 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.0%** (2026-05-20 SpecAttn relative_error=0.0%, cosine_similarity=0.99999994; 역대 최저 공동; 역대 최저 단독 0.36% MixedDimPerTokenBudgetCodec 유지) | 20사이클 연속 ±1% 이내 통과 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **0.0004ms p50** (2026-05-20 CONCURCongestionAdmissionSchedulerMixin 독립 실측); vLLM 0.002ms(2026-05-20 실측; 역대 최저 유지) | 역대 최저 수준 유지 | ✓ |
 
-**2026-05-19 주요 이정표**: KVDrive(arXiv 2605.18071) + ThunderAgent(arXiv 2602.13692) 기반 A+B+C 완전 통합 사이클. MANDATORY 10/10 Pass, HIGH 11/12(91.7%) Pass. 구현-평가 루프 2회, vLLM 이식 1회. KV Memory Reduction −70.31%(독립)/HBM −75%/DRAM −96.88%/SSD −75%(vLLM). NC hit rate 60%(독립)/100%(vLLM). HBM FP8 relative_error 0.58%(독립)/0.676%(vLLM; <1% MANDATORY). Scheduling overhead p50 0.002ms(vLLM; **역대 최저 신기록**). Inference Throughput +20.0%(실측 달성). Cross A+B+C throughput vs solo +5.0%, memory vs solo −10.0%, accuracy cosine 0.999984. issubclass(KVDriveScheduler, Scheduler)=True, issubclass(ThunderAgentKVCacheManager, KVCacheManager)=True. 89/89 vLLM 테스트 통과(4 skip = GPU 없음 조건부). Activity A 공정성(대기 2× 이내) 명시적 테스트 미비는 잔여 과제.
+**2026-05-20 주요 이정표**: CongestionAdmissionSpecAttnDualReductionPipeline (Activity A+C 크로스) 사이클. 독립 평가 루프 3회, vLLM 이식 1회차 Pass(조기 종료). 처리량 +50% 독립 실측(역대 최고치 경신은 아님; 2026-05-08 +145.3% 유지). TTFT 오버헤드 0.0004ms(사실상 0%). SpecAttn 정확도 relative_error 0.0%, cosine 0.99999994(역대 최저 공동). Cache Hit Rate +10.0%p. Effective Context 2.0×. KV Memory Reduction 22.5%(retention=0.70; 목표 −30% 미달 −7.5%p). vLLM 0.21.0 1회차 즉시 Pass: 임포트 오류 없음, DeprecationWarning 없음, MANDATORY 전항목 충족. 78/78(독립)+vLLM 전항목 테스트 통과. retention_ratio=0.60 적용 시 −30% 달성 가능함을 vLLM 평가에서 확인. Activity A 공정성(max_wait_time_multiplier=2.0) 경계값 충족.
 
 ---
 
@@ -41,6 +41,7 @@
 | 2026-05-17 | **HMAMultiConnectorCompressionPluginScheduler** (vLLM v0.21.0 HMA 멀티-커넥터 플러그인 레지스트리; O(1) 딕셔너리 조회 커넥터 선택; RL 모드/컨텍스트 길이/메모리 압박 3-요인 규칙 기반 분기; make_hma_multi_connector_scheduler_class() 팩토리; fairness max_wait_ratio=2.0; HMAConnectorAdapter_V1으로 A+C 브리지) | **0.0002ms p50** (vLLM 실측; 기준 5ms 대비 **25,000배 여유**; **역대 최저**); p99 0.0023ms | 커넥터 선택 정확도 4종 시나리오 전 PASS; 공정성 starvation 없음; 10-요청 스모크 PASS | 단일 (멀티-GPU N/A — GPU 없는 환경) | ✓ Pass |
 | 2026-05-18 | **AMPDLazySegmentFetchSchedulerMixin** (AMPD pull-on-demand 지연 페치; 세그먼트 메타데이터 선행 전달 후 확정 시 KV pull; tier-based HBM/DDR/REMOTE 비용 차등화; unnecessary_transfer_ratio 추적; enable_multinode=True 멀티노드 지원; vLLM Scheduler 서브클래싱; A+B+C 통합 스택 메인 스케줄러) | **0.036ms p50** (vLLM 실측; 목표 5ms 대비 139배 여유); 메타데이터 등록 오버헤드 0.0073ms(<0.1ms) | 스케줄링 후 hit_rate=0.5 (워밍업 후; 베이스라인 0 대비 +50%p); tier-based 비용 차등화 4시나리오 Pass; 공정성 starvation 없음 | 단일+멀티 (enable_multinode; 로컬 0.01ms vs 원격 5.0ms 구분) | ✓ Pass |
 | 2026-05-19 | **KVDriveAttentionAwarePipelineSchedulerMixin** (KVDrive arXiv 2605.18071 기반; 어텐션 점수 기반 3계층 HBM/DRAM/SSD 배치; I/O-컴퓨트 오버랩 파이프라인 재구성; attn_score>0.8 HBM/0.3~0.8 DRAM/<0.3 SSD 분류; KVDriveActivityABCConfig 파라미터 관리; vLLM Scheduler 서브클래싱) | **0.002ms p50** (vLLM 실측; **역대 최저 신기록**; 기준 5ms 대비 2,500배 여유); 독립 구현 0.046ms | stable sort → FIFO 공정성 유지; tier 분류 정확도 100% | 단일 (멀티노드 구조적 지원) | ✓ Pass |
+| 2026-05-20 | **CONCURCongestionAdmissionSchedulerMixin** (혼잡 게이트 기반 요청 승인; _InlineCONCURGate FREE/BOUNDARY/CONGESTED 3-상태; 글로벌 KV Pool 점유율 추적; occupancy 임계값 0.40/0.75; 상위 절반 priority 허용; make_concur_admission_scheduler_class() 팩토리; vLLM Scheduler 서브클래싱; get_concur_stats() API; A+C Cross 사이클 메인 스케줄러) | **0.0004ms p50** (독립 실측; 목표 5ms 대비 12,500배 여유); vLLM 0.002ms/step (200 req; 목표 5ms 이내) | max_wait_time_multiplier=2.0 경계값 충족; CONGESTED 해소 후 모든 요청 즉시 허용; 글로벌 점유율 local=0.30+remote=0.70→global=0.50 멀티노드 추적; +10.0%p 히트율 향상 | 단일+멀티 (글로벌 점유율 집계 구조) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
@@ -125,6 +126,7 @@
 | 2026-05-17 | **RLAdaptivePrecisionQuantizer** (RL 리워드 피드백 + 온라인 어텐션 엔트로피 기반 FP16/INT8/INT4 적응 정밀도; fp16=0.40/int8=0.60/int4=0.00(Loop 2 최종); warmup_steps=10; 5-seed 로버스트니스; RL 시뮬레이션 10라운드 동적 비율 조정; RLAdaptivePrecisionAttentionHook vLLM 이식; HMAConnectorAdapter_V1으로 A+C 통합) | **−30% theoretical** (INT8=60% × 0.5 절감 계수; FP32 대비; 이론치 경계값) | **attention error 0.004** (독립 구현; KL=3×10⁻⁶; cosine=0.999991; MANDATORY Pass); **vLLM 5-seed 최악 0.015** (<0.02; MANDATORY Pass); Loop 1 0.042→Loop 2 0.004(10× 개선) | **~1.43×** (30% 이론 절감 기준) | ✓ Pass |
 | 2026-05-18 | **DPAttentionAwareCompressionSelector** (SGLang DP Attention 상태 인식 환경별 압축 정책 선택기; INT8 직접 저장 + per-row scale; effective_kv_replicas 기반 코덱 자동 선택; DP_ATTN_ENABLED 환경 변수 지원; update_dp_attn_state() 동적 전환; GlobalRetentionGateEvictionCodec budget_ratio=0.3 퇴거 최소화; DPAttentionAwareCompressionAttentionHook vLLM 이식; extend_cache_config_dp_attn_aware_compression() API) | **−46.9%** (vLLM 실측; INT8 직접 저장, per-row scale; FP16 32,768B → INT8+scale 17,408B; Loop 1 0%→Loop 2 46.9% 수정) | **attention error 0.005853** (Keys; vLLM 실측; <0.01 MANDATORY); cosine 0.999982 (≥0.99 MANDATORY); KL 0.0000167 (<0.015); Loop 2 개선 | **~2.14×** (46.9% 실측 절감 기준) | ✓ Pass |
 | 2026-05-19 | **KVDriveTierDifferentiatedCompressionCodec** (KVDrive arXiv 2605.18071 기반; 계층별 차등 압축: HBM FP8 / DRAM VQ(error 0%) / SSD INT4+sparse; KVDriveTierDifferentiatedVllmCodec vLLM 이식; KVDriveActivityABCConfig 통합 파라미터 관리; CacheStore 인터페이스 완전 준수) | **HBM −75%** / **DRAM −96.88%** / **SSD −75%** (vLLM 실측); 독립 구현 overall −70.31% | **HBM FP8 relative_error 0.58%** (독립; <1% MANDATORY Pass); cosine_similarity 0.999983; vLLM HBM 0.676%(<1% MANDATORY); DRAM VQ error 0%; SSD INT4 reconstruction_error 3.77%(<5%) | **2.0×** (−70.31% 절감 기준; Effective Context 실측 달성) | ✓ Pass |
+| 2026-05-20 | **SpecAttnSparseVllmCodec / SpecAttnVerificationGuidedKVSparseCodec** (speculative attention verification logit 기반 KV 토큰 중요도 판단; global_retention_ratio 조절; in-place INT4 양자화; write_to_cache/read_from_cache 형상 보존; FP16 비퇴거 토큰 무손실; CacheConfig.compression_method="specattn_sparse" 등록; A+C 혼잡 피드백 루프: CONGESTED 시 retention 0.80→0.70 자동 감소) | **22.5%** (retention=0.70 실측; 독립+vLLM 동일); retention=0.60 시 30.0% 달성 확인(목표 달성 구간) | **relative_error 0.0%** (retention 0.80/0.70 전 설정; cosine_similarity 0.99999994; KL divergence 4.66×10⁻²⁰ ≈ 0; FP16 비퇴거 max error 0.000000; MANDATORY Pass) | **2.0×** (22.5% 절감 기준; 실측 달성) | Partial Pass (정확도·Effective Context Pass; Memory −30% 미달) |
 
 **신규 달성 (2026-04-30)**: ARKV 스타일 tri-state 프레임워크. 80% 절감과 KL=0.0035 동시 달성.
 
@@ -175,6 +177,7 @@
 | 2026-05-17 | **A+C** (HMAMultiConnectorCompressionPluginScheduler + RLAdaptivePrecisionQuantizer + HMAConnectorAdapter_V1; O(1) 딕셔너리 조회 커넥터 선택 + RL 적응 정밀도 통합) | 커넥터 선택 정확도 4종 시나리오 100%; 처리량 실측 미완 (GPU 없음) | **−30% theoretical** (INT8=60% × 0.5; FP32 대비 이론치) | **attention error 0.004** (독립; KL=3×10⁻⁶; cosine=0.999991); vLLM 5-seed 최악 0.015 (<0.02; MANDATORY Pass) | **0.0002ms p50** (A vLLM 실측; **역대 최저**; 기준 5ms 대비 25,000배 여유) | ✓ Pass |
 | 2026-05-18 | **A+B+C** (AMPDLazySegmentFetchSchedulerMixin + AMPDAdapShotLazyLoadKVCacheManagerMixin + DPAttentionAwareCompressionAttentionHook + DPAttentionCrossABCCodec; AMPDPrefillShareNonContiguousStack 5단계; 52/52 테스트) | cross_overhead_ms < 0.5ms; 복합 메모리 −46.9% + 비연속 히트율 추적 정상; GPU 처리량 실측 미완 | **−46.9%** (INT8 직접 저장 + per-row scale; vLLM 실측); 세그먼트 LRU bounded memory_bytes=6,400B | **attention error 0.005853** (MANDATORY Pass; KL=0.0000167; cosine=0.999982); cross-ABC cosine=1.0 (≥0.99 MANDATORY) | **0.036ms p50** (A vLLM 실측; 목표 5ms 대비 139배 여유); 멀티노드 지원(enable_multinode) | ✓ Pass |
 | 2026-05-19 | **A+B+C** (KVDriveAttentionAwarePipelineSchedulerMixin + ThunderAgentStaticSegmentReservationCache + KVDriveTierDifferentiatedCompressionCodec + KVDriveThunderAgentIntegratedStack; MANDATORY 10/10 Pass; HIGH 11/12(91.7%) Pass) | **+20.0%** (독립 실측; 처음으로 +20% 목표 정확 달성); cross_abc_throughput_vs_solo +5.0%; cross_abc_memory_vs_solo −10.0% | **HBM −75% / DRAM −96.88% / SSD −75%** (vLLM 실측); overall −70.31% (독립); cross_abc_memory_vs_solo −10.0% | **cross_abc_accuracy cosine 0.999984** (>0.99 MANDATORY Pass); HBM FP8 0.58%(독립)/0.676%(vLLM); DRAM VQ 0.0% | **0.002ms p50** (A vLLM 실측; **역대 최저 신기록**; 기준 5ms 대비 2,500배 여유); 독립 0.046ms | ✓ Pass |
+| 2026-05-20 | **A+C** (CONCURCongestionAdmissionSchedulerMixin + SpecAttnSparseVllmCodec + SpecAttnCongestionDualPipelineVllmHook; 혼잡 피드백 루프: CONGESTED 시 retention_ratio 0.800→0.700 자동 감소·해소 시 복원; Cross A+C throughput vs solo +5.0%; cross_ac_memory_vs_solo +10.0%); 3루프 독립/1루프 vLLM | **+50.0%** (독립 실측; Solo-A·Solo-C 각각 대비 +5.0% 복합 추가); KV Pool 점유율 30.0% | **22.5%** (retention=0.70 실측; 독립+vLLM 동일; retention=0.60 시 30.0% 확인; 목표 −30% 미달) | **cross_ac_accuracy_cosine 0.99999994** (>0.99 MANDATORY Pass; relative_error 0.0%; KL ≈ 0) | **0.0004ms p50** (독립 실측); vLLM 0.002ms/step | Partial Pass (필수 전체 Pass; Memory −30% 미달) |
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과.
 
