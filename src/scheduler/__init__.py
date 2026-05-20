@@ -8,6 +8,11 @@ from src.scheduler.ppd_append_prefill_router import PPDAppendPrefillRouter, PPDR
 from src.scheduler.hit_aware_ppd_router import HitAwarePPDRouter
 from src.scheduler.nath_ddr_offloading import NAtHDDROffloadingScheduler, NAtHDDROffloadingConfig
 from src.scheduler.nath_retention_tier_decider import NAtHRetentionTierDecider, NAtHRetentionTierDeciderConfig
+from src.scheduler.concur_congestion_admission_scheduler import (
+    CONCURCongestionBasedAgentAdmissionScheduler,
+    CongestionAdmissionConfig,
+    KVPoolMonitor,
+)
 
 __all__ = [
     "CacheAwareScheduler",
@@ -25,4 +30,7 @@ __all__ = [
     "NAtHDDROffloadingConfig",
     "NAtHRetentionTierDecider",
     "NAtHRetentionTierDeciderConfig",
+    "CONCURCongestionBasedAgentAdmissionScheduler",
+    "CongestionAdmissionConfig",
+    "KVPoolMonitor",
 ]

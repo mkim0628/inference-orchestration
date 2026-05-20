@@ -1,0 +1,76 @@
+experiment:
+  date: "2026-05-20"
+  activity: "A+C"
+  description: >
+    Cross-1 CongestionAdmissionSpecAttnDualReductionPipeline:
+    A-1 CONCURCongestionBasedAgentAdmissionScheduler (KV pool congestion-based agent admission control) +
+    C-1 SpecAttnVerificationGuidedKVSparseCodec (verification-logit-guided KV sparsification, Training-free).
+    Integrated feedback loop: KV pool congestion signal dynamically adjusts C-1 retention_ratio.
+  cache_type: congestion_specattn_pipeline
+  compression_method: specattn_verification_guided_sparse
+  scheduler_type: concur_congestion_admission
+
+concur_congestion_admission_scheduler:
+  capacity_bytes: 1_000_000_000    # KV pool max capacity (1 GB)
+  alpha_low: 0.60                  # Recovery threshold (CONGESTED → FREE)
+  alpha_high: 0.85                 # Congestion entry threshold
+  online_adapt_window: 100         # Online threshold adaptation window (steps)
+  enable_multinode: false          # Single-node default
+  seed: 42
+
+specattn_sparse_codec:
+  retention_ratio_by_layer:        # Per-layer KV retention ratios (12-layer basis)
+    - 0.85  # layer 0 (lower)
+    - 0.85
+    - 0.83
+    - 0.83
+    - 0.81
+    - 0.80
+    - 0.78
+    - 0.77
+    - 0.75
+    - 0.73
+    - 0.72
+    - 0.70  # layer 11 (upper)
+  global_retention_ratio: 0.80     # Default when layer config absent
+  low_importance_quant_int4: true  # Low-importance KVs: INT4 quantization
+  int4_threshold: 0.01             # INT4 sparsification zero_threshold
+  max_entries: 1000
+  seed: 42
+
+dual_reduction_pipeline:
+  codec_adapt_on_congestion: true        # Tighten retention_ratio on congestion
+  retention_reduction_on_congestion: 0.10  # retention_ratio -= 0.10 when CONGESTED
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    dataset_proxy: "wikitext103_synthetic"
+    task_accuracy_proxy: "mmlu_cosine_similarity"
+    relative_error_max: 0.01             # ±1% (evaluation_criteria.md §4 MANDATORY)
+    cosine_similarity_min: 0.99          # (evaluation_criteria.md §4 MANDATORY)
+    kl_divergence_max: 0.015             # Auxiliary metric
+    perplexity_tolerance_pct: 1.0        # ±1%
+    task_accuracy_tolerance_pct: 1.0     # ±1%
+    retention_ratios_to_test: [1.0, 0.85, 0.80, 0.70]
+  activity_a:
+    ttft_overhead_limit_pct: 5.0         # TTFT p50 +5% limit (MANDATORY)
+    cache_hit_rate_improvement_min_pct: 10.0
+    max_wait_time_multiplier: 2.0
+    alpha_low: 0.60
+    alpha_high: 0.85
+  activity_c:
+    memory_reduction_min: 0.30           # -30% or more (evaluation_criteria.md §4 높음)
+    effective_context_multiplier: 2.0
+    compression_overhead_ttft_max_pct: 10.0
+  cross_ac:
+    throughput_min_improvement_vs_solo: 5.0
+    memory_min_improvement_vs_solo: 10.0
+    accuracy_cosine_min: 0.99            # C included (§5 MANDATORY)
+    comparison_methods: ["solo_a1", "solo_c1", "cross_ac"]
+  throughput:
+    target_improvement_pct: 20
+
+seed: 42
+results_dir: "results/2026-05-20"
