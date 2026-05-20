@@ -71,3 +71,21 @@ class CacheStore(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not support pre-RoPE loading."
         )
+
+    def get_importance_mask(
+        self,
+        key: str,
+    ) -> Optional[torch.Tensor]:
+        """Return importance mask for the KV entry stored under key.
+
+        Used by SpecAttn-based codecs (Activity C) to expose the
+        verification-logit-guided importance mask to upstream components.
+
+        Returns: bool tensor [n_kv] marking important positions (True = important),
+                 or None if the implementation does not support importance masking.
+        Default implementation raises NotImplementedError — subclasses with
+        Activity C SpecAttn support override this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support importance masking."
+        )
