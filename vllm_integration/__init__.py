@@ -380,6 +380,8 @@ __all__ = [
     "CompactAttentionBlockUnionHook",
     "apply_compact_attention_block_union_patch",
     "extend_cache_config_block_union_codec",
+    "BlockUnionFlashAttentionForwardPatcher",
+    "apply_block_union_flash_attention_forward_patch",
     "BlockUnionBCSchedulerConfig",
     "BlockUnionBCSchedulerMixin",
     "make_block_union_bc_scheduler_class",
@@ -562,6 +564,8 @@ try:
         CompactAttentionBlockUnionHook,
         apply_compact_attention_block_union_patch,
         extend_cache_config_block_union_codec,
+        BlockUnionFlashAttentionForwardPatcher,
+        apply_block_union_flash_attention_forward_patch,
     )
 except Exception as _e_c21:
     warnings.warn(
@@ -572,6 +576,8 @@ except Exception as _e_c21:
     CompactAttentionBlockUnionHook = None                  # type: ignore
     apply_compact_attention_block_union_patch = None       # type: ignore
     extend_cache_config_block_union_codec = None           # type: ignore
+    BlockUnionFlashAttentionForwardPatcher = None          # type: ignore
+    apply_block_union_flash_attention_forward_patch = None  # type: ignore
 
 # Activity B+C: scheduler mixin
 try:

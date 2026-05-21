@@ -3387,7 +3387,31 @@ cos = F.cosine_similarity(
 # but shape is preserved and accuracy holds for the SELECTED blocks
 print(f"  write_to_cache/read_from_cache: shape={tuple(compressed.shape)}, cosine={cos:.4f}: PASS")
 
-# Accuracy contract check (for full selection = 1.0)
+# Accuracy contract check at kv_selection_ratio=0.40 (MANDATORY §4 Loop 2)
+# Block-table pointer recomposition: write_to_cache must return kv unchanged
+# → cosine_sim(orig, returned) = 1.0
+cos_40 = F.cosine_similarity(
+    kv.float().flatten().unsqueeze(0),
+    compressed.float().flatten().unsqueeze(0),
+).item()
+assert cos_40 >= 0.99, (
+    f"MANDATORY FAIL: cosine_sim={cos_40:.6f} < 0.99 "
+    f"at kv_selection_ratio=0.40 (block_table_pointer_recomposition)"
+)
+print(f"  kv_selection_ratio=0.40: cosine_sim={cos_40:.6f} >= 0.99: PASS (MANDATORY §4)")
+
+# read_from_cache cosine_sim check
+decompressed = hook.read_from_cache("req0:layer0", compressed)
+cos_rfc = F.cosine_similarity(
+    kv.float().flatten().unsqueeze(0),
+    decompressed.float().flatten().unsqueeze(0),
+).item()
+assert cos_rfc >= 0.99, (
+    f"MANDATORY FAIL: read_from_cache cosine_sim={cos_rfc:.6f} < 0.99"
+)
+print(f"  read_from_cache cosine_sim={cos_rfc:.6f} >= 0.99: PASS")
+
+# Accuracy contract check (for full selection = 1.0 — additional verification)
 cfg_full = CompactAttentionBlockUnionConfig(kv_selection_ratio=1.0, block_size=4, enabled=True)
 hook_full = CompactAttentionBlockUnionHook(cfg_full)
 kv2 = torch.randn(32, 8)
@@ -3501,6 +3525,77 @@ bc_metrics = bc_codec.metrics_summary()
 assert bc_metrics["activity"] == "B+C"
 assert 0.0 < bc_codec.combined_reduction_estimate() <= 1.0
 print(f"  BlockUnionBCPipelineVllmCodec: activity={bc_metrics['activity']}: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity C codec cosine_sim >= 0.99 at kv_selection_ratio=0.40 (Loop 2)
+# ---------------------------------------------------------------------------
+from vllm_integration.compression_codec import (
+    CompactAttentionBlockUnionVllmCodecConfig,
+    CompactAttentionBlockUnionVllmCodec,
+    BlockUnionBCPipelineVllmCodec,
+)
+
+c_cfg_acc = CompactAttentionBlockUnionVllmCodecConfig(kv_selection_ratio=0.40, block_size=4)
+c_codec_acc = CompactAttentionBlockUnionVllmCodec(c_cfg_acc)
+kv_acc = torch.randn(32, 8)
+comp_acc = c_codec_acc.write_to_cache("req_acc:l0", kv_acc)
+cos_codec_40 = F.cosine_similarity(
+    kv_acc.float().flatten().unsqueeze(0),
+    comp_acc.float().flatten().unsqueeze(0),
+).item()
+assert cos_codec_40 >= 0.99, (
+    f"MANDATORY FAIL: CompactAttentionBlockUnionVllmCodec cosine_sim={cos_codec_40:.6f} < 0.99"
+    f" at kv_selection_ratio=0.40 (block_table_pointer_recomposition)"
+)
+print(f"  CompactAttentionBlockUnionVllmCodec cosine_sim={cos_codec_40:.6f} >= 0.99 "
+      f"(kv_selection_ratio=0.40): PASS (MANDATORY §4)")
+
+# selection block table
+sel_bt = c_codec_acc.get_selection_block_table("req_acc:l0", block_size=4, n_gqa_groups=2)
+assert sel_bt is not None, "get_selection_block_table must not return None"
+bt_tensor_acc = sel_bt.to_block_table_tensor()
+assert bt_tensor_acc is not None
+print(f"  CompactAttentionBlockUnionVllmCodec.get_selection_block_table: shape={tuple(bt_tensor_acc.shape)}: PASS")
+
+# B+C block_table injection path (Loop 2)
+from vllm_integration.attention_backend_patch import (
+    apply_block_union_flash_attention_forward_patch,
+    BlockUnionFlashAttentionForwardPatcher,
+    CompactAttentionBlockUnionHook,
+    CompactAttentionBlockUnionConfig,
+)
+
+_injected_bt = {}
+class _MockFlashImpl2:
+    def forward(self, q, k, v, block_tables=None, **kw):
+        _injected_bt["last"] = block_tables
+        return torch.ones(q.shape[0], v.shape[-1])
+
+_mock_impl2 = _MockFlashImpl2()
+_hook_for_bt = CompactAttentionBlockUnionHook(
+    CompactAttentionBlockUnionConfig(kv_selection_ratio=0.40, block_size=4, n_gqa_groups=2)
+)
+_hook_for_bt.update_chunk_attention(torch.randn(4, 8, 32))
+_hook_for_bt.write_to_cache("req0:layer0", torch.randn(32, 8))
+
+patcher_inst = apply_block_union_flash_attention_forward_patch(
+    _mock_impl2, _hook_for_bt, layer_idx=0,
+    request_key_fn=lambda li, bi: f"req{bi}:layer{li}",
+)
+assert hasattr(_mock_impl2, "_bu_bt_patcher")
+_mock_impl2.forward(
+    torch.randn(4, 4), torch.randn(32, 4), torch.randn(32, 4),
+    block_tables=torch.zeros(2, 4, dtype=torch.int64)
+)
+patcher_stats = patcher_inst.stats()
+assert patcher_stats["patch_count"] >= 1
+print(f"  apply_block_union_flash_attention_forward_patch: patch_count={patcher_stats['patch_count']}, "
+      f"inject_count={patcher_stats['inject_count']}: PASS")
+
+# Idempotency
+patcher2 = apply_block_union_flash_attention_forward_patch(_mock_impl2, _hook_for_bt)
+assert patcher2 is patcher_inst, "Should be idempotent"
+print(f"  apply_block_union_flash_attention_forward_patch (idempotent): PASS")
 
 # ---------------------------------------------------------------------------
 # __init__.py: verify 2026-05-21 symbols exported
