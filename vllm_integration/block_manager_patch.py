@@ -6090,3 +6090,480 @@ def _smoke_test_thunder_agent_mixin_19() -> None:
 
 if __name__ == "__main__":
     _smoke_test_thunder_agent_mixin_19()
+
+
+# ===========================================================================
+# 2026-05-21: BlockUnionNonContiguousKVCacheManagerMixin (Activity B)
+# ===========================================================================
+#
+# Ports BlockUnionNonContiguousReuseIndex (src/cache/block_union_noncontiguous_index.py)
+# into vLLM's v1 KVCacheManager using mixin + factory pattern.
+#
+# Integration points:
+#   - KVCacheManager subclass: parallel auxiliary segment store keyed by
+#     content-hash of token chunks (position-independent, block-union path).
+#   - get_block_union_table(): non-contiguous hit lookup returning
+#     KVSelectionBlockTable ready for PagedAttention block_tables injection.
+#   - pad_block_table_with_block_union(): replaces hit-segment slots in the
+#     standard block_table with block-union pointers before attention call.
+#
+# Block-Union algorithm (CompactAttention 2605.16839):
+#   Non-contiguous PA blocks are assembled into a GQA-aware per-group block
+#   table (KVSelectionBlockTable) without memcpy.  The table is passed
+#   directly to standard PagedAttention kernels via block_tables arg.
+#   group_id = head_id // (n_kv_heads // n_gqa_groups)
+#
+# Accuracy contract:
+#   Block-union assembly is pointer-level; no KV value modification.
+#   Zero accuracy loss from Activity B alone.
+
+
+import hashlib
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+try:
+    import torch as _torch_bu21
+    _TORCH_OK_BU21 = True
+except ImportError:
+    _TORCH_OK_BU21 = False
+
+
+@dataclass
+class BlockUnionKVManagerConfig:
+    """Configuration for BlockUnionNonContiguousKVCacheManagerMixin (Activity B, 2026-05-21)."""
+    block_size: int = 16          # PA block size in tokens (must match vLLM block_size)
+    n_kv_heads: int = 8           # Total KV heads
+    n_gqa_groups: int = 4         # GQA groups (n_kv_heads // heads_per_group)
+    max_aux_entries: int = 2048   # Max entries in auxiliary segment store
+    rope_reencoding_enabled: bool = True
+    seed: int = 42
+
+
+class _BlockUnionAuxStore:
+    """Lightweight auxiliary store: segment_hash -> (block_ptrs, kv_tensor).
+
+    Stores GQA-aware block pointer lists per segment for block-union assembly.
+    Uses LRU eviction (OrderedDict).
+    """
+
+    def __init__(self, max_entries: int = 2048, block_size: int = 16) -> None:
+        self._store: OrderedDict[str, Tuple[List[int], Optional[object]]] = OrderedDict()
+        self._max_entries = max_entries
+        self._block_size = block_size
+        self._block_id_counter: int = 0
+        self._hits: int = 0
+        self._misses: int = 0
+        self._noncontiguous_hits: int = 0
+
+    @staticmethod
+    def _hash_tokens(token_ids: List[int], layer_idx: int = 0) -> str:
+        h = hashlib.sha256()
+        h.update(str(layer_idx).encode())
+        for t in token_ids:
+            h.update(t.to_bytes(4, "little", signed=False) if isinstance(t, int) else b"\x00\x00\x00\x00")
+        return h.hexdigest()[:32]
+
+    def _alloc_block_ptrs(self, n_tokens: int) -> List[int]:
+        n_blocks = max(1, (n_tokens + self._block_size - 1) // self._block_size)
+        ptrs = list(range(self._block_id_counter, self._block_id_counter + n_blocks))
+        self._block_id_counter += n_blocks
+        return ptrs
+
+    def store(self, seg_key: str, n_tokens: int, kv_tensor=None) -> List[int]:
+        """Store a segment and return its block pointer list."""
+        if seg_key in self._store:
+            self._store.move_to_end(seg_key)
+            return self._store[seg_key][0]
+        if len(self._store) >= self._max_entries:
+            self._store.popitem(last=False)
+        ptrs = self._alloc_block_ptrs(n_tokens)
+        self._store[seg_key] = (ptrs, kv_tensor)
+        return ptrs
+
+    def get_block_union(
+        self,
+        segment_keys: List[str],
+        n_gqa_groups: int = 4,
+    ) -> Optional[object]:
+        """Assemble GQA-aware block-union table from hit segments.
+
+        Returns a dict representing KVSelectionBlockTable fields, or None
+        if all segments miss.  Import of the real dataclass is attempted
+        lazily to avoid hard dependency.
+        """
+        hit_keys = [k for k in segment_keys if k in self._store]
+        if not hit_keys:
+            self._misses += len(segment_keys)
+            return None
+
+        self._hits += len(hit_keys)
+        self._misses += len(segment_keys) - len(hit_keys)
+
+        # Detect non-contiguous hit: a hit that follows at least one miss
+        miss_set = set(k for k in segment_keys if k not in self._store)
+        for i, k in enumerate(segment_keys):
+            if k in self._store and any(
+                segment_keys.index(m) < i for m in miss_set if m in segment_keys
+            ):
+                self._noncontiguous_hits += 1
+                break
+
+        # GQA-aware block table assembly (order-preserving union per group)
+        group_blocks: Dict[int, List[int]] = {g: [] for g in range(n_gqa_groups)}
+        seen: Dict[int, set] = {g: set() for g in range(n_gqa_groups)}
+        for seg_key in hit_keys:
+            ptrs, _ = self._store[seg_key]
+            self._store.move_to_end(seg_key)
+            for blk_ptr in ptrs:
+                for g_id in range(n_gqa_groups):
+                    if blk_ptr not in seen[g_id]:
+                        group_blocks[g_id].append(blk_ptr)
+                        seen[g_id].add(blk_ptr)
+
+        total = sum(len(v) for v in group_blocks.values())
+
+        # Try importing the real KVSelectionBlockTable dataclass
+        try:
+            from src.cache.block_union_noncontiguous_index import KVSelectionBlockTable
+            return KVSelectionBlockTable(
+                group_blocks=group_blocks,
+                n_groups=n_gqa_groups,
+                total_blocks=total,
+                selected_blocks=total,
+            )
+        except ImportError:
+            # Fallback: plain dict with same interface
+            class _InlineKVSelectionBlockTable:
+                def __init__(self, group_blocks, n_groups, total_blocks, selected_blocks):
+                    self.group_blocks = group_blocks
+                    self.n_groups = n_groups
+                    self.total_blocks = total_blocks
+                    self.selected_blocks = selected_blocks
+
+                @property
+                def selection_ratio(self):
+                    if self.total_blocks == 0:
+                        return 1.0
+                    return self.selected_blocks / self.total_blocks
+
+                def to_block_table_tensor(self):
+                    if not _TORCH_OK_BU21 or not self.group_blocks:
+                        return None
+                    max_len = max(len(v) for v in self.group_blocks.values()) if self.group_blocks else 0
+                    if max_len == 0:
+                        return _torch_bu21.full((len(self.group_blocks), 1), -1, dtype=_torch_bu21.int64)
+                    n_groups = len(self.group_blocks)
+                    table = _torch_bu21.full((n_groups, max_len), -1, dtype=_torch_bu21.int64)
+                    for g_idx, (g_id, blk_list) in enumerate(sorted(self.group_blocks.items())):
+                        if blk_list:
+                            table[g_idx, :len(blk_list)] = _torch_bu21.tensor(blk_list, dtype=_torch_bu21.int64)
+                    return table
+
+            return _InlineKVSelectionBlockTable(
+                group_blocks=group_blocks,
+                n_groups=n_gqa_groups,
+                total_blocks=total,
+                selected_blocks=total,
+            )
+
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def noncontiguous_hit_rate(self) -> float:
+        return self._noncontiguous_hits / max(1, self._hits)
+
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
+        self._noncontiguous_hits = 0
+
+
+class BlockUnionNonContiguousKVCacheManagerMixin:
+    """Mixin for vLLM KVCacheManager: Activity B block-union non-contiguous reuse.
+
+    2026-05-21 — Activity B: BlockUnion Non-Contiguous KV Cache Reuse.
+
+    Ports BlockUnionNonContiguousReuseIndex (src/cache/block_union_noncontiguous_index.py)
+    into vLLM's v1 KVCacheManager as a non-destructive mixin.  All existing
+    KVCacheManager methods are preserved without modification.
+
+    New capabilities:
+      store_block_union_segment(): register a token chunk in the auxiliary store
+          with its GQA-aware block pointer list.
+      get_block_union_table(segment_keys): assemble KVSelectionBlockTable from
+          hit segments for direct injection into PA block_tables.
+      pad_block_table_with_block_union(block_table_tensor, segment_keys):
+          replace non-contiguous hit slots with block-union pointers.
+      block_union_metrics(): dict with hit_rate, noncontiguous_hit_rate, etc.
+
+    Accuracy contract:
+      Block-union is pointer reassembly only; no KV value modification.
+      Decompress / re-encode operations are NOT performed by this mixin.
+      Activity C compression (if combined) is applied by the attention hook.
+
+    vLLM 0.21.0 integration point:
+      KVCacheManager is in vllm.v1.core.kv_cache_manager.KVCacheManager.
+      This mixin does not override get_computed_blocks(), allocate_slots(), or
+      free_blocks() — vLLM's native prefix cache remains the primary path.
+      The auxiliary store operates as a secondary non-contiguous hit path.
+    """
+
+    def __init_block_union_mixin__(
+        self,
+        bu_config: Optional[BlockUnionKVManagerConfig] = None,
+    ) -> None:
+        """Initialise block-union auxiliary store.  Call from subclass __init__."""
+        cfg = bu_config or BlockUnionKVManagerConfig()
+        self._bu_config = cfg
+        self._bu_aux_store = _BlockUnionAuxStore(
+            max_entries=cfg.max_aux_entries,
+            block_size=cfg.block_size,
+        )
+
+    def store_block_union_segment(
+        self,
+        token_ids: List[int],
+        layer_idx: int = 0,
+        kv_tensor=None,
+    ) -> List[int]:
+        """Register a token-chunk segment in the block-union auxiliary store.
+
+        Parameters
+        ----------
+        token_ids : List[int]
+            Token IDs of the chunk (position-independent hash key).
+        layer_idx : int
+            Layer index (included in hash to avoid cross-layer collision).
+        kv_tensor : torch.Tensor | None
+            Optional KV tensor for fallback memcpy path.
+
+        Returns
+        -------
+        List[int]
+            Assigned PA block pointer list for this segment.
+        """
+        seg_key = _BlockUnionAuxStore._hash_tokens(token_ids, layer_idx)
+        n_tokens = len(token_ids)
+        return self._bu_aux_store.store(seg_key, n_tokens, kv_tensor)
+
+    def get_block_union_table(
+        self,
+        segment_keys: List[str],
+    ):
+        """Assemble GQA-aware KVSelectionBlockTable from hit segments.
+
+        Parameters
+        ----------
+        segment_keys : List[str]
+            Segment hash keys in prompt order.
+
+        Returns
+        -------
+        KVSelectionBlockTable | None
+            Block-union table for direct injection into PA block_tables,
+            or None if all segments miss.
+        """
+        return self._bu_aux_store.get_block_union(
+            segment_keys,
+            n_gqa_groups=self._bu_config.n_gqa_groups,
+        )
+
+    def get_block_union_table_for_tokens(
+        self,
+        token_ids_list: List[List[int]],
+        layer_idx: int = 0,
+    ):
+        """Convenience wrapper: compute segment keys from token-id lists then look up.
+
+        Each element of token_ids_list is a chunk of token IDs for one segment.
+        """
+        seg_keys = [
+            _BlockUnionAuxStore._hash_tokens(tids, layer_idx)
+            for tids in token_ids_list
+        ]
+        return self.get_block_union_table(seg_keys)
+
+    def pad_block_table_with_block_union(
+        self,
+        block_table_tensor,   # [n_groups, max_blocks] int64 tensor
+        segment_keys: List[str],
+        n_prefix_blocks: int = 0,
+    ):
+        """Replace non-contiguous hit slots in block_table with block-union ptrs.
+
+        This mutates block_table_tensor in-place at positions starting from
+        n_prefix_blocks (the contiguous prefix handled by vLLM natively).
+
+        Returns the (possibly modified) block_table_tensor and the assembled
+        KVSelectionBlockTable (or None on miss).
+        """
+        table = self.get_block_union_table(segment_keys)
+        if table is None:
+            return block_table_tensor, None
+        if not _TORCH_OK_BU21 or block_table_tensor is None:
+            return block_table_tensor, table
+
+        bu_tensor = table.to_block_table_tensor()
+        if bu_tensor is None:
+            return block_table_tensor, table
+
+        # Overwrite non-prefix region with block-union pointers
+        n_groups = min(block_table_tensor.shape[0], bu_tensor.shape[0])
+        n_bu_blocks = bu_tensor.shape[1]
+        start_col = n_prefix_blocks
+        end_col = min(start_col + n_bu_blocks, block_table_tensor.shape[1])
+        copy_len = end_col - start_col
+        if copy_len > 0:
+            block_table_tensor[:n_groups, start_col:end_col] = (
+                bu_tensor[:n_groups, :copy_len]
+            )
+        return block_table_tensor, table
+
+    def block_union_metrics(self) -> Dict:
+        """Return block-union auxiliary store performance metrics."""
+        aux = self._bu_aux_store
+        return {
+            "block_union_hit_rate": aux.hit_rate(),
+            "block_union_noncontiguous_hit_rate": aux.noncontiguous_hit_rate(),
+            "block_union_aux_entries": len(aux._store),
+            "block_union_aux_max_entries": aux._max_entries,
+            "block_union_total_hits": aux._hits,
+            "block_union_total_misses": aux._misses,
+            "block_union_noncontiguous_hits": aux._noncontiguous_hits,
+            "vllm_version": "0.21.0",
+            "activity": "B",
+            "algorithm": "BlockUnion_NonContiguous_KV_Reuse_2026-05-21",
+        }
+
+    def reset_block_union_stats(self) -> None:
+        """Reset auxiliary store hit/miss counters."""
+        self._bu_aux_store.reset_stats()
+
+
+def make_block_union_kv_cache_manager_class(
+    base_class: type = None,
+    bu_config: Optional[BlockUnionKVManagerConfig] = None,
+) -> type:
+    """Factory: create KVCacheManager subclass with BlockUnion mixin.
+
+    Parameters
+    ----------
+    base_class : type | None
+        vLLM KVCacheManager class to subclass.  If None, imports
+        vllm.v1.core.kv_cache_manager.KVCacheManager.
+    bu_config : BlockUnionKVManagerConfig | None
+        Block-union configuration.  Defaults to BlockUnionKVManagerConfig().
+
+    Returns
+    -------
+    type
+        New class inheriting from both base_class and
+        BlockUnionNonContiguousKVCacheManagerMixin.
+
+    Usage
+    -----
+    >>> from vllm.v1.core.kv_cache_manager import KVCacheManager
+    >>> BlockUnionKVManager = make_block_union_kv_cache_manager_class(KVCacheManager)
+    >>> # Instantiate as normal KVCacheManager:
+    >>> mgr = BlockUnionKVManager(kv_cache_config=..., max_model_len=4096, ...)
+    >>> mgr.__init_block_union_mixin__()
+    >>> # Store segments:
+    >>> ptrs = mgr.store_block_union_segment(token_ids, layer_idx=0)
+    >>> # Lookup:
+    >>> table = mgr.get_block_union_table_for_tokens([chunk1, chunk2, chunk3])
+    >>> if table is not None:
+    ...     bt_tensor = table.to_block_table_tensor()  # inject into PA kernel
+    """
+    if base_class is None:
+        try:
+            from vllm.v1.core.kv_cache_manager import KVCacheManager as _KVM
+            base_class = _KVM
+        except ImportError:
+            base_class = object
+
+    class BlockUnionKVCacheManager(BlockUnionNonContiguousKVCacheManagerMixin, base_class):  # type: ignore[misc]
+        """KVCacheManager with Activity B block-union non-contiguous reuse (2026-05-21)."""
+
+        def __init__(self, *args, bu_config=bu_config, **kwargs):
+            if base_class is not object:
+                super().__init__(*args, **kwargs)
+            self.__init_block_union_mixin__(bu_config)
+
+    BlockUnionKVCacheManager.__name__ = "BlockUnionKVCacheManager_2026_05_21"
+    BlockUnionKVCacheManager.__qualname__ = BlockUnionKVCacheManager.__name__
+    return BlockUnionKVCacheManager
+
+
+def _smoke_test_block_union_kv_manager_21() -> None:
+    """Smoke test for BlockUnionNonContiguousKVCacheManagerMixin (2026-05-21)."""
+    print("BlockUnionNonContiguousKVCacheManagerMixin smoke test (2026-05-21):")
+
+    # Test _BlockUnionAuxStore
+    store = _BlockUnionAuxStore(max_entries=10, block_size=4)
+    key1 = _BlockUnionAuxStore._hash_tokens([1, 2, 3, 4])
+    key2 = _BlockUnionAuxStore._hash_tokens([5, 6, 7, 8])
+    key3 = _BlockUnionAuxStore._hash_tokens([9, 10, 11, 12])
+    store.store(key1, 4)
+    store.store(key3, 4)
+    # key2 is a miss → hit/miss/hit pattern (non-contiguous)
+    table = store.get_block_union([key1, key2, key3], n_gqa_groups=2)
+    assert table is not None, "get_block_union should return table (2 hits)"
+    assert table.n_groups == 2
+    assert table.total_blocks > 0
+    print(f"  get_block_union (2 hits, 1 miss): n_groups={table.n_groups}, "
+          f"total_blocks={table.total_blocks}: PASS")
+    assert store.noncontiguous_hit_rate() > 0, "Should detect non-contiguous hit"
+    print(f"  noncontiguous_hit_rate={store.noncontiguous_hit_rate():.2f}: PASS")
+
+    # to_block_table_tensor
+    if _TORCH_OK_BU21:
+        bt = table.to_block_table_tensor()
+        assert bt is not None, "to_block_table_tensor should return tensor"
+        assert bt.dtype == _torch_bu21.int64
+        print(f"  to_block_table_tensor shape={tuple(bt.shape)}: PASS")
+
+    # Mixin standalone test
+    class _MockBase:
+        pass
+
+    class _TestMgr(BlockUnionNonContiguousKVCacheManagerMixin, _MockBase):
+        def __init__(self):
+            self.__init_block_union_mixin__(BlockUnionKVManagerConfig(n_gqa_groups=4))
+
+    mgr = _TestMgr()
+    ptrs = mgr.store_block_union_segment([1, 2, 3, 4, 5, 6, 7, 8], layer_idx=0)
+    assert len(ptrs) > 0
+    print(f"  store_block_union_segment: ptrs={ptrs}: PASS")
+
+    table2 = mgr.get_block_union_table_for_tokens([[1, 2, 3, 4, 5, 6, 7, 8]], layer_idx=0)
+    assert table2 is not None
+    print(f"  get_block_union_table_for_tokens: total_blocks={table2.total_blocks}: PASS")
+
+    metrics = mgr.block_union_metrics()
+    assert "block_union_hit_rate" in metrics
+    assert metrics["activity"] == "B"
+    print(f"  block_union_metrics keys={list(metrics.keys())[:4]}...: PASS")
+
+    # Factory
+    BlockUnionMgr = make_block_union_kv_cache_manager_class(base_class=None)
+    assert issubclass(BlockUnionMgr, BlockUnionNonContiguousKVCacheManagerMixin)
+    print(f"  make_block_union_kv_cache_manager_class: {BlockUnionMgr.__name__}: PASS")
+
+    # Factory with real vLLM KVCacheManager
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        BUMgr = make_block_union_kv_cache_manager_class(KVCacheManager)
+        assert issubclass(BUMgr, KVCacheManager)
+        assert issubclass(BUMgr, BlockUnionNonContiguousKVCacheManagerMixin)
+        print(f"  make_block_union_kv_cache_manager_class(KVCacheManager): PASS")
+    except Exception as exc:
+        print(f"  make_block_union_kv_cache_manager_class(KVCacheManager): SKIP ({exc})")
+
+    print("BlockUnionNonContiguousKVCacheManagerMixin smoke test (2026-05-21): PASS")
+
+
+# End of 2026-05-21 BlockUnion Activity B block_manager additions
+# ===========================================================================

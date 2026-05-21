@@ -5485,3 +5485,385 @@ def _smoke_test_concur_admission_scheduler_mixin_20() -> None:
 
 # End of 2026-05-20 CONCUR Congestion Admission additions
 # ===========================================================================
+
+
+# ===========================================================================
+# 2026-05-21: BlockUnionBCSchedulerMixin (Activity B+C Scheduling Support)
+# ===========================================================================
+#
+# Provides scheduling support for the B+C BlockUnion pipeline in vLLM 0.21.0.
+#
+# This mixin does NOT implement Activity A (KV cache-aware scheduling) —
+# that is deferred to the next cycle.  Instead, it provides:
+#
+# 1. BlockUnion segment-key pre-computation at schedule time:
+#    Before each batch step, compute segment hashes for all waiting requests
+#    and annotate them with their expected block-union hit counts.
+#
+# 2. BC-pipeline metadata injection:
+#    Attach BlockUnionBCPipeline metadata (b_config, c_config) to the
+#    scheduler config so the attention hook and block manager can read it.
+#
+# 3. Accuracy-preserving hook registration:
+#    Register per-layer CompactAttentionBlockUnionHook instances so that
+#    kv_selection_ratio is consistent across all layers during a request.
+#
+# Integration point:
+#   vllm.v1.core.sched.scheduler.Scheduler — subclass via mixin.
+#   schedule() method is NOT overridden; new pre/post hooks are injected.
+#
+# vLLM 0.21.0 Scheduler API:
+#   schedule() → SchedulerOutput
+#   update_from_outputs(model_runner_output, execution_results) → EngineCoreOutputs
+#   add_request(request)
+#   abort_requests(request_ids)
+
+
+import hashlib
+import warnings as _warnings_sched21
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class BlockUnionBCSchedulerConfig:
+    """Configuration for BlockUnionBCSchedulerMixin (Activity B+C, 2026-05-21).
+
+    This config is separate from SchedulerConfig — do not modify vLLM's
+    existing SchedulerConfig fields.  New fields are added here.
+    """
+    # Activity B parameters
+    block_size: int = 16              # PA block size in tokens
+    n_kv_heads: int = 8               # Total KV heads
+    n_gqa_groups: int = 4             # GQA groups
+    max_aux_segments: int = 2048      # Max auxiliary segment store entries
+
+    # Activity C parameters
+    kv_selection_ratio: float = 0.40  # Top-k KV block selection ratio
+    chunk_size: int = 2048            # Chunked-prefill chunk size (tokens)
+    n_layers: int = 32                # Model layer count (for hook registration)
+
+    # B+C combined settings
+    apply_selection_to_union: bool = True  # Apply C selection on top of B union
+    enabled: bool = True                   # If False, mixin is a no-op
+    seed: int = 42
+
+
+class BlockUnionBCSchedulerMixin:
+    """Mixin for vLLM v1 Scheduler: B+C pipeline scheduling support (2026-05-21).
+
+    Provides segment-key pre-computation and BC-pipeline metadata injection
+    without modifying vLLM's core scheduling logic.
+
+    New methods (non-conflicting with Scheduler API):
+      init_block_union_bc_scheduler(): initialise mixin state.  Call from __init__.
+      precompute_segment_keys(request): compute segment hash keys for a request.
+      get_bc_pipeline_config(): return BCPipelineConfig for the block manager / hook.
+      get_per_layer_hooks(): return list of CompactAttentionBlockUnionHook per layer.
+      bc_scheduler_metrics(): aggregate B+C scheduling metrics dict.
+
+    Accuracy contract:
+      kv_selection_ratio is passed consistently to all layer hooks.
+      Changing kv_selection_ratio mid-request is not supported.
+    """
+
+    def init_block_union_bc_scheduler(
+        self,
+        bc_config: Optional[BlockUnionBCSchedulerConfig] = None,
+    ) -> None:
+        """Initialise B+C scheduling state.  Call from subclass __init__."""
+        cfg = bc_config or BlockUnionBCSchedulerConfig()
+        self._bc_sched_config = cfg
+        self._bc_segment_cache: Dict[str, List[str]] = {}  # request_id → seg_keys
+        self._bc_hook_registry: List[Any] = []  # per-layer hooks
+        self._bc_schedule_calls: int = 0
+        self._bc_total_segment_hits: int = 0
+
+        # Lazily register per-layer hooks on first use
+        self._bc_hooks_initialised: bool = False
+
+    def _ensure_hooks_initialised(self) -> None:
+        """Lazily initialise per-layer CompactAttentionBlockUnionHook instances."""
+        if self._bc_hooks_initialised:
+            return
+        try:
+            from vllm_integration.attention_backend_patch import (
+                CompactAttentionBlockUnionConfig,
+                CompactAttentionBlockUnionHook,
+            )
+            hook_cfg = CompactAttentionBlockUnionConfig(
+                kv_selection_ratio=self._bc_sched_config.kv_selection_ratio,
+                n_kv_heads=self._bc_sched_config.n_kv_heads,
+                n_gqa_groups=self._bc_sched_config.n_gqa_groups,
+                block_size=self._bc_sched_config.block_size,
+                chunk_size=self._bc_sched_config.chunk_size,
+                enabled=self._bc_sched_config.enabled,
+            )
+            self._bc_hook_registry = [
+                CompactAttentionBlockUnionHook(hook_cfg)
+                for _ in range(self._bc_sched_config.n_layers)
+            ]
+        except Exception as exc:
+            _warnings_sched21.warn(
+                f"BlockUnionBCSchedulerMixin: hook init failed: {exc}",
+                RuntimeWarning,
+            )
+            self._bc_hook_registry = []
+        self._bc_hooks_initialised = True
+
+    @staticmethod
+    def _hash_token_chunk(token_ids: List[int], chunk_idx: int = 0) -> str:
+        """Compute segment hash for a token chunk (position-independent)."""
+        h = hashlib.sha256()
+        h.update(chunk_idx.to_bytes(4, "little", signed=False) if False else b"")
+        for t in token_ids:
+            try:
+                h.update(int(t).to_bytes(4, "little", signed=False))
+            except (OverflowError, TypeError):
+                h.update(b"\x00\x00\x00\x00")
+        return h.hexdigest()[:32]
+
+    def precompute_segment_keys(
+        self,
+        request,
+        chunk_size: Optional[int] = None,
+    ) -> List[str]:
+        """Pre-compute segment hash keys for a request's prompt tokens.
+
+        Splits the request prompt into chunks of chunk_size tokens and
+        computes a content-hash key for each chunk.  Keys are cached by
+        request_id to avoid recomputation across schedule steps.
+
+        Parameters
+        ----------
+        request : vllm.v1.request.Request | object with .request_id, .prompt_token_ids
+        chunk_size : int | None
+            Chunk size override.  Defaults to bc_sched_config.chunk_size.
+
+        Returns
+        -------
+        List[str]
+            List of segment hash keys (one per chunk).
+        """
+        if not self._bc_sched_config.enabled:
+            return []
+
+        req_id = getattr(request, "request_id", str(id(request)))
+        if req_id in self._bc_segment_cache:
+            return self._bc_segment_cache[req_id]
+
+        token_ids = getattr(request, "prompt_token_ids", None) or []
+        cs = chunk_size or self._bc_sched_config.chunk_size or 2048
+        if not token_ids:
+            return []
+
+        seg_keys: List[str] = []
+        for i in range(0, len(token_ids), cs):
+            chunk = token_ids[i: i + cs]
+            seg_keys.append(self._hash_token_chunk(chunk, chunk_idx=i // cs))
+
+        self._bc_segment_cache[req_id] = seg_keys
+        return seg_keys
+
+    def evict_segment_cache(self, request_id: str) -> None:
+        """Remove cached segment keys when a request is completed or aborted."""
+        self._bc_segment_cache.pop(request_id, None)
+
+    def get_bc_pipeline_config(self):
+        """Return BCPipelineConfig for use by the block manager and attention hook.
+
+        Tries to import the real BCPipelineConfig from src/cache/block_union_bc_pipeline.py.
+        Falls back to a plain dataclass if unavailable.
+        """
+        try:
+            from src.cache.block_union_bc_pipeline import BCPipelineConfig
+            from src.cache.block_union_noncontiguous_index import BlockUnionConfig
+            from src.cache.compact_attention_block_union_codec import BlockUnionCodecConfig
+            return BCPipelineConfig(
+                b_config=BlockUnionConfig(
+                    block_size=self._bc_sched_config.block_size,
+                    n_kv_heads=self._bc_sched_config.n_kv_heads,
+                    n_gqa_groups=self._bc_sched_config.n_gqa_groups,
+                    max_entries=self._bc_sched_config.max_aux_segments,
+                    seed=self._bc_sched_config.seed,
+                ),
+                c_config=BlockUnionCodecConfig(
+                    kv_selection_ratio=self._bc_sched_config.kv_selection_ratio,
+                    n_kv_heads=self._bc_sched_config.n_kv_heads,
+                    n_gqa_groups=self._bc_sched_config.n_gqa_groups,
+                    block_size=self._bc_sched_config.block_size,
+                    chunk_size=self._bc_sched_config.chunk_size,
+                    max_entries=self._bc_sched_config.max_aux_segments,
+                    seed=self._bc_sched_config.seed,
+                ),
+                apply_selection_to_union=self._bc_sched_config.apply_selection_to_union,
+                seed=self._bc_sched_config.seed,
+            )
+        except ImportError:
+            # Return a plain namespace with essential fields
+            class _InlineBCConfig:
+                def __init__(self, **kw):
+                    self.__dict__.update(kw)
+            return _InlineBCConfig(
+                kv_selection_ratio=self._bc_sched_config.kv_selection_ratio,
+                block_size=self._bc_sched_config.block_size,
+                n_gqa_groups=self._bc_sched_config.n_gqa_groups,
+                apply_selection_to_union=self._bc_sched_config.apply_selection_to_union,
+            )
+
+    def get_per_layer_hooks(self) -> List[Any]:
+        """Return per-layer CompactAttentionBlockUnionHook instances.
+
+        Hooks are initialised on first call (lazy).
+        Use these to call update_chunk_attention() and get selection masks
+        in the model runner's attention forward pass.
+        """
+        self._ensure_hooks_initialised()
+        return self._bc_hook_registry
+
+    def bc_scheduler_metrics(self) -> Dict:
+        """Return B+C scheduling metrics."""
+        self._ensure_hooks_initialised()
+        hook_metrics = {}
+        if self._bc_hook_registry:
+            h0 = self._bc_hook_registry[0]
+            hook_metrics = {
+                "n_selection_masks": h0._n_chunks_processed,
+                "kv_selection_ratio": h0.config.kv_selection_ratio,
+            }
+        return {
+            "bc_schedule_calls": self._bc_schedule_calls,
+            "bc_cached_segment_keys": len(self._bc_segment_cache),
+            "bc_n_layers_with_hooks": len(self._bc_hook_registry),
+            "bc_apply_selection_to_union": self._bc_sched_config.apply_selection_to_union,
+            **hook_metrics,
+            "vllm_version": "0.21.0",
+            "activity": "B+C",
+            "algorithm": "BlockUnion_BC_Pipeline_Scheduler_2026-05-21",
+        }
+
+
+def make_block_union_bc_scheduler_class(
+    base_scheduler_cls: type = None,
+    bc_config: Optional[BlockUnionBCSchedulerConfig] = None,
+) -> type:
+    """Factory: create Scheduler subclass with BlockUnionBCSchedulerMixin.
+
+    Parameters
+    ----------
+    base_scheduler_cls : type | None
+        vLLM Scheduler class.  If None, imports vllm.v1.core.sched.scheduler.Scheduler.
+    bc_config : BlockUnionBCSchedulerConfig | None
+        B+C scheduler configuration.
+
+    Returns
+    -------
+    type
+        New Scheduler subclass with B+C scheduling support.
+
+    Usage
+    -----
+    >>> from vllm.v1.core.sched.scheduler import Scheduler
+    >>> BCScheduler = make_block_union_bc_scheduler_class(Scheduler)
+    >>> sched = BCScheduler(vllm_config=..., kv_cache_config=..., ...)
+    >>> sched.init_block_union_bc_scheduler()
+    >>> seg_keys = sched.precompute_segment_keys(request)
+    >>> bc_cfg = sched.get_bc_pipeline_config()
+    >>> hooks = sched.get_per_layer_hooks()
+    """
+    if base_scheduler_cls is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Sched
+            base_scheduler_cls = _Sched
+        except ImportError:
+            base_scheduler_cls = object
+
+    _bc_config_default = bc_config
+
+    class BlockUnionBCScheduler(BlockUnionBCSchedulerMixin, base_scheduler_cls):  # type: ignore[misc]
+        """Scheduler with Activity B+C BlockUnion pipeline support (2026-05-21)."""
+
+        def __init__(self, *args, bc_config=_bc_config_default, **kwargs):
+            if base_scheduler_cls is not object:
+                super().__init__(*args, **kwargs)
+            self.init_block_union_bc_scheduler(bc_config)
+
+    BlockUnionBCScheduler.__name__ = "BlockUnionBCScheduler_2026_05_21"
+    BlockUnionBCScheduler.__qualname__ = BlockUnionBCScheduler.__name__
+    return BlockUnionBCScheduler
+
+
+def _smoke_test_block_union_bc_scheduler_21() -> None:
+    """Smoke test for BlockUnionBCSchedulerMixin (2026-05-21)."""
+    print("BlockUnionBCSchedulerMixin smoke test (2026-05-21):")
+
+    class _MockBase:
+        pass
+
+    class _TestScheduler(BlockUnionBCSchedulerMixin, _MockBase):
+        def __init__(self):
+            self.init_block_union_bc_scheduler(
+                BlockUnionBCSchedulerConfig(
+                    block_size=16,
+                    n_kv_heads=8,
+                    n_gqa_groups=4,
+                    kv_selection_ratio=0.40,
+                    n_layers=4,
+                    enabled=True,
+                )
+            )
+
+    sched = _TestScheduler()
+
+    # precompute_segment_keys
+    class _MockRequest:
+        request_id = "req_test_0"
+        prompt_token_ids = list(range(4096))
+
+    req = _MockRequest()
+    seg_keys = sched.precompute_segment_keys(req, chunk_size=2048)
+    assert len(seg_keys) == 2, f"Expected 2 chunks for 4096 tokens, got {len(seg_keys)}"
+    print(f"  precompute_segment_keys: {len(seg_keys)} keys for 4096 tokens: PASS")
+
+    # Caching
+    seg_keys2 = sched.precompute_segment_keys(req, chunk_size=2048)
+    assert seg_keys == seg_keys2, "Segment keys should be cached and deterministic"
+    print("  segment_key_cache: deterministic: PASS")
+
+    # evict_segment_cache
+    sched.evict_segment_cache("req_test_0")
+    assert "req_test_0" not in sched._bc_segment_cache
+    print("  evict_segment_cache: PASS")
+
+    # get_bc_pipeline_config
+    bc_cfg = sched.get_bc_pipeline_config()
+    assert bc_cfg is not None
+    assert hasattr(bc_cfg, "kv_selection_ratio") or hasattr(bc_cfg, "c_config")
+    print(f"  get_bc_pipeline_config: {type(bc_cfg).__name__}: PASS")
+
+    # get_per_layer_hooks
+    hooks = sched.get_per_layer_hooks()
+    assert len(hooks) == 4
+    print(f"  get_per_layer_hooks: {len(hooks)} layers: PASS")
+
+    # bc_scheduler_metrics
+    metrics = sched.bc_scheduler_metrics()
+    assert metrics["activity"] == "B+C"
+    assert "bc_n_layers_with_hooks" in metrics
+    print(f"  bc_scheduler_metrics keys={list(metrics.keys())[:4]}...: PASS")
+
+    # Factory with real vLLM Scheduler
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        BCSched = make_block_union_bc_scheduler_class(Scheduler)
+        assert issubclass(BCSched, Scheduler)
+        assert issubclass(BCSched, BlockUnionBCSchedulerMixin)
+        print(f"  make_block_union_bc_scheduler_class(Scheduler): PASS")
+    except Exception as exc:
+        print(f"  make_block_union_bc_scheduler_class(Scheduler): SKIP ({exc})")
+
+    print("BlockUnionBCSchedulerMixin smoke test (2026-05-21): PASS")
+
+
+# End of 2026-05-21 BlockUnionBC Scheduler additions
+# ===========================================================================

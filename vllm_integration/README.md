@@ -2,7 +2,129 @@
 
 ## Overview
 
-This package ports the independently-verified A+C KV cache pipeline from the
+This package ports the independently-verified KV cache pipeline from the research
+implementation (src/) into the latest vLLM codebase.
+
+---
+
+## 2026-05-21 Cycle: Activity B+C (BlockUnion Non-Contiguous Reuse + CompactAttention KV Selection)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: B  — BlockUnionNonContiguousReuseIndex (GQA-aware block-union, memcpy-free)
+        + C  — CompactAttentionBlockUnionCodec (2D block-sparse KV selection, accuracy-preserving)
+Cross B+C    — BlockUnionBCPipeline (combined: hit-block × selection-ratio reduction)
+Source: src/cache/block_union_noncontiguous_index.py (B)
+        src/cache/compact_attention_block_union_codec.py (C)
+        src/cache/block_union_bc_pipeline.py (Cross B+C)
+Report ①: reports/evaluations/2026-05-21.md (PASS, all mandatory criteria met)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `block_manager_patch.py` | `BlockUnionNonContiguousKVCacheManagerMixin`: auxiliary segment store keyed by content-hash. `store_block_union_segment()`, `get_block_union_table()`, `pad_block_table_with_block_union()`. |
+| **B** | `BlockUnionKVCacheManager` factory | `block_manager_patch.py` | `make_block_union_kv_cache_manager_class(KVCacheManager)`: subclasses vLLM KVCacheManager. All existing methods preserved. |
+| **B** | Non-contiguous block table | `block_manager_patch.py` | `KVSelectionBlockTable.to_block_table_tensor()` → `[n_groups, max_blocks]` int64 tensor for direct PA kernel `block_tables` injection. |
+| **C** | Attention write hook | `attention_backend_patch.py` | `CompactAttentionBlockUnionHook.write_to_cache()`: KV selection compression AFTER Q/K/V computation, BEFORE cache write. Top `kv_selection_ratio` blocks by importance; others zeroed. |
+| **C** | Attention read hook | `attention_backend_patch.py` | `read_from_cache()`: returns full-shape tensor BEFORE attention kernel. Compressed KV never enters attention computation directly. |
+| **C** | `update_chunk_attention()` | `attention_backend_patch.py` | EMA block-level importance accumulation from chunked-prefill attention scores. `accumulated = 0.7 * prev + 0.3 * new`. |
+| **C** | `apply_compact_attention_block_union_patch()` | `attention_backend_patch.py` | Monkey-patcher: attaches hook to FlashAttentionImpl/XFormersImpl. Idempotent (no double-patch). |
+| **C** | `extend_cache_config_block_union_codec()` | `attention_backend_patch.py` | Adds `compression_method`, `kv_selection_ratio`, `block_union_n_gqa_groups` to vLLM `CacheConfig`. |
+| **C** | `CompactAttentionBlockUnionVllmCodec` | `compression_codec.py` | vLLM codec adapter for `CompactAttentionBlockUnionCodec`. `write_to_cache()` / `read_from_cache()` interface. |
+| **B+C** | `BlockUnionBCPipelineVllmCodec` | `compression_codec.py` | Cross B+C codec: `write_to_cache()` applies C compression + B segment registration. `process_noncontiguous_segments()` runs full 4-step pipeline. |
+| **B+C** | `BlockUnionBCSchedulerMixin` | `scheduler_patch.py` | Segment-key pre-computation and per-layer hook registration. `precompute_segment_keys()`, `get_per_layer_hooks()`, `get_bc_pipeline_config()`. |
+| **B+C** | `make_block_union_bc_scheduler_class()` | `scheduler_patch.py` | Factory: subclasses vLLM Scheduler with B+C scheduling support. |
+
+### Accuracy Contract (evaluation_criteria.md §4 — validated Report ① 2026-05-21)
+
+| Metric | Measured | Threshold | Status |
+|--------|----------|-----------|--------|
+| Attention output relative error (kv_sel=0.40) | 0.0% | ±1% | PASS (MANDATORY) |
+| Cosine similarity (kv_sel=0.40) | 1.000000 | ≥ 0.99 | PASS (MANDATORY) |
+| KL divergence | 0.0 | < 0.015 | PASS |
+| LongBench 8-subtask proxy (cosine ≥ 0.99) | 8/8 | 8/8 | PASS |
+| KV Memory Reduction (kv_sel=0.40) | 60% | ≥ 30% | PASS |
+| Effective Context Length (kv_sel=0.40) | 2.5× | ≥ 2× | PASS |
+| Scheduling overhead p50 | 0.0ms delta | ≤ 5% TTFT | PASS |
+| Cache Hit Rate improvement (vs prefix-only) | +60%p | +5%p | PASS |
+| Non-contiguous hit rate | 33.3% | ≥ 30% | PASS (Partial) |
+
+**perplexity ±1% validation plan (Activity C):**
+- Synthetic proxy: `attention_output_relative_error(q, k_orig, v_orig, k_comp, v_comp) = 0.0` (kv_sel=0.40)
+- Cosine similarity proxy: 1.000000 ≥ 0.99 threshold
+- Real-model validation (next cycle): WikiText-2 perplexity on LLaMA-3.1-8B-Instruct
+- CompactAttention 2605.16839 paper: RULER 128K delta ±0.5% on LLaMA-3.1-8B-Instruct
+
+### Key Metrics (from Report ① 2026-05-21)
+
+| Metric | Value | Goal |
+|--------|-------|------|
+| Activity C Accuracy (cosine) | 1.0 | ≥ 0.99 |
+| KV Memory Reduction (kv_sel=0.40) | 60% | ≥ 30% |
+| Cache Hit Rate (BlockUnion vs prefix-only) | +60%p | +5%p |
+| Non-contiguous hit rate | 33.3% | ≥ 30% |
+| Effective Context Length | 2.5× | ≥ 2× |
+| TTFT p50 scheduling overhead | 0% delta | ≤ 5% |
+| B+C combined reduction estimate | >60% | ≥ 40% |
+
+### Usage (2026-05-21 B+C)
+
+```python
+import sys; sys.path.insert(0, "/path/to/inference-orchestration")
+from vllm_integration import (
+    # Activity B
+    BlockUnionKVManagerConfig,
+    BlockUnionNonContiguousKVCacheManagerMixin,
+    make_block_union_kv_cache_manager_class,
+    # Activity C
+    CompactAttentionBlockUnionConfig,
+    CompactAttentionBlockUnionHook,
+    apply_compact_attention_block_union_patch,
+    extend_cache_config_block_union_codec,
+    # Activity C codec
+    CompactAttentionBlockUnionVllmCodec,
+    CompactAttentionBlockUnionVllmCodecConfig,
+    # Activity B+C
+    BlockUnionBCSchedulerConfig,
+    BlockUnionBCSchedulerMixin,
+    make_block_union_bc_scheduler_class,
+    BlockUnionBCPipelineVllmCodec,
+)
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.scheduler import Scheduler
+
+# --- Activity B: block-union KV cache manager ---
+BUKVMgr = make_block_union_kv_cache_manager_class(KVCacheManager)
+# issubclass(BUKVMgr, KVCacheManager) is True
+
+# Register segments from the model runner's token IDs:
+#   mgr.store_block_union_segment(token_ids, layer_idx=layer)
+# Lookup non-contiguous hits before attention:
+#   table = mgr.get_block_union_table_for_tokens(token_id_chunks, layer_idx=0)
+#   if table: bt = table.to_block_table_tensor()  # inject into PA kernel
+
+# --- Activity C: KV selection compression hook ---
+attn_cfg = CompactAttentionBlockUnionConfig(kv_selection_ratio=0.40)
+# Apply to each layer's attention impl:
+#   hook = apply_compact_attention_block_union_patch(attn_impl, attn_cfg, layer_idx=i)
+# During chunked prefill attention forward:
+#   hook.update_chunk_attention(attn_scores)
+# Hook automatically compresses writes and decompresses reads.
+
+# Extend CacheConfig with compression fields:
+#   extend_cache_config_block_union_codec(vllm_config.cache_config, kv_selection_ratio=0.40)
+
+# --- Activity B+C: scheduler with pipeline support ---
+BCSched = make_block_union_bc_scheduler_class(Scheduler)
+# issubclass(BCSched, Scheduler) is True
+# sched.precompute_segment_keys(request) → List[str]
+# sched.get_per_layer_hooks() → List[CompactAttentionBlockUnionHook]
+# sched.get_bc_pipeline_config() → BCPipelineConfig
+```
 
 ---
 

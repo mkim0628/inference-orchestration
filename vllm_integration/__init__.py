@@ -372,6 +372,20 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-21 (Activity B+C — BlockUnion pipeline)
+    "BlockUnionKVManagerConfig",
+    "BlockUnionNonContiguousKVCacheManagerMixin",
+    "make_block_union_kv_cache_manager_class",
+    "CompactAttentionBlockUnionConfig",
+    "CompactAttentionBlockUnionHook",
+    "apply_compact_attention_block_union_patch",
+    "extend_cache_config_block_union_codec",
+    "BlockUnionBCSchedulerConfig",
+    "BlockUnionBCSchedulerMixin",
+    "make_block_union_bc_scheduler_class",
+    "CompactAttentionBlockUnionVllmCodecConfig",
+    "CompactAttentionBlockUnionVllmCodec",
+    "BlockUnionBCPipelineVllmCodec",
     # 2026-05-18
     "AMPDLazySegmentFetchSchedulerConfig",
     "AMPDLazySegmentFetchSchedulerMixin",
@@ -520,3 +534,73 @@ except Exception as _e_cfg19:
     KVDriveActivityABCConfig = None      # type: ignore
     KVDriveActivityABCConfigMixin = None  # type: ignore
     build_kvdrive_abc_config = None      # type: ignore
+
+# ===========================================================================
+# 2026-05-21 imports (Activity B+C — BlockUnion pipeline)
+# ===========================================================================
+
+# Activity B: BlockUnion non-contiguous KV cache manager
+try:
+    from vllm_integration.block_manager_patch import (
+        BlockUnionKVManagerConfig,
+        BlockUnionNonContiguousKVCacheManagerMixin,
+        make_block_union_kv_cache_manager_class,
+    )
+except Exception as _e_b21:
+    warnings.warn(
+        f"vllm_integration: 2026-05-21 Activity B import failed: {_e_b21}",
+        RuntimeWarning,
+    )
+    BlockUnionKVManagerConfig = None                       # type: ignore
+    BlockUnionNonContiguousKVCacheManagerMixin = None      # type: ignore
+    make_block_union_kv_cache_manager_class = None         # type: ignore
+
+# Activity C: CompactAttention block-union attention hook
+try:
+    from vllm_integration.attention_backend_patch import (
+        CompactAttentionBlockUnionConfig,
+        CompactAttentionBlockUnionHook,
+        apply_compact_attention_block_union_patch,
+        extend_cache_config_block_union_codec,
+    )
+except Exception as _e_c21:
+    warnings.warn(
+        f"vllm_integration: 2026-05-21 Activity C attention hook import failed: {_e_c21}",
+        RuntimeWarning,
+    )
+    CompactAttentionBlockUnionConfig = None                # type: ignore
+    CompactAttentionBlockUnionHook = None                  # type: ignore
+    apply_compact_attention_block_union_patch = None       # type: ignore
+    extend_cache_config_block_union_codec = None           # type: ignore
+
+# Activity B+C: scheduler mixin
+try:
+    from vllm_integration.scheduler_patch import (
+        BlockUnionBCSchedulerConfig,
+        BlockUnionBCSchedulerMixin,
+        make_block_union_bc_scheduler_class,
+    )
+except Exception as _e_sched21:
+    warnings.warn(
+        f"vllm_integration: 2026-05-21 Activity B+C scheduler import failed: {_e_sched21}",
+        RuntimeWarning,
+    )
+    BlockUnionBCSchedulerConfig = None     # type: ignore
+    BlockUnionBCSchedulerMixin = None      # type: ignore
+    make_block_union_bc_scheduler_class = None  # type: ignore
+
+# Activity C codec + B+C cross codec
+try:
+    from vllm_integration.compression_codec import (
+        CompactAttentionBlockUnionVllmCodecConfig,
+        CompactAttentionBlockUnionVllmCodec,
+        BlockUnionBCPipelineVllmCodec,
+    )
+except Exception as _e_codec21:
+    warnings.warn(
+        f"vllm_integration: 2026-05-21 Activity C/BC codec import failed: {_e_codec21}",
+        RuntimeWarning,
+    )
+    CompactAttentionBlockUnionVllmCodecConfig = None  # type: ignore
+    CompactAttentionBlockUnionVllmCodec = None         # type: ignore
+    BlockUnionBCPipelineVllmCodec = None               # type: ignore
