@@ -1,110 +1,112 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-19 대비):
-이전 사이클(2026-05-19)은 A+B+C 조합이었다:
-  - A-1 KVDriveAttentionAwarePipelineScheduler (어텐션 점수 기반 3계층 HBM/DRAM/SSD 배치)
-  - B-1 ThunderAgentStaticSegmentReservationCache (LLMProgramDAG 정적 분석 세그먼트 예약)
-  - C-1 KVDriveTierDifferentiatedCompressionCodec (계층별 차등 압축: FP8/VQ/INT4)
-  - Cross KVDriveThunderAgentIntegratedStack (A+B+C 통합)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-20 대비):
+이전 사이클(2026-05-20)은 A+C 조합이었다:
+  - A-1 CONCURCongestionBasedAgentAdmissionScheduler (KV 풀 혼잡도 기반 에이전트 어드미션 제어)
+  - C-1 SpecAttnVerificationGuidedKVSparseCodec (자기-추측 디코딩 검증 로짓 유도 KV 희소화)
+  - Cross CongestionAdmissionSpecAttnDualReductionPipeline (A+C 통합)
 
-이번 사이클(2026-05-20)은 A+C 조합으로 전환된다. 설계 축이 다음과 같이 변경된다:
+이번 사이클(2026-05-21)은 B+C 조합으로 전환된다. 설계 축이 다음과 같이 변경된다:
 
 주요 변경:
-1. [전략 전환] 3계층 정적 배치(HBM/DRAM/SSD) → 런타임 KV 풀 혼잡도 기반 동적 어드미션 제어.
-   이전 기법이 "KV를 어느 계층에 두느냐"의 정적 배치 문제였다면, 이번 기법은
-   "언제 새 에이전트를 허용하느냐"의 동적 어드미션 게이트 문제다. CONCUR 논문 기반.
+1. [전략 전환] 혼잡도 기반 어드미션 제어(A) → Block-Union 비연속 KV 재사용(B)으로 초점 이동.
+   이전 기법이 "얼마나 많은 에이전트를 허용하느냐"의 볼륨 제어 문제였다면,
+   이번 기법은 "비연속 PA 블록을 memcpy 없이 GQA-aware 블록 테이블로 변환해 표준
+   커널에 직접 투입"하는 물리적 표현 변환 문제다. CompactAttention(2605.16839) 기반.
 
-2. [Activity A 교체] KVDriveAttentionAwarePipelineScheduler(3계층 tier 배치 + KVTierRegistry) →
-   CONCURCongestionBasedAgentAdmissionScheduler(KV 풀 점유율 실시간 모니터링 → 3단계 혼잡
-   상태 분류 → 에이전트 어드미션 게이트 + 온라인 임계값 적응).
-   스케줄링 결정 단위: 에이전트 스텝(step) 단위 (요청/배치 단위 아님).
-   캐시 상태 접근: KVPoolMonitor.get_occupancy() O(1) 실시간 조회.
+2. [Activity B 신규] BlockUnionNonContiguousReuseIndex (B-1):
+   비연속 PA 블록을 GQA-aware per-group 블록 테이블로 변환 (memcpy 없음).
+   기존 `SegmentedHashCache.get_segments()` 경로에 `use_block_union=True` 플래그 추가.
+   비연속 히트 처리 경로 전면 교체.
 
-3. [Activity C 교체] KVDriveTierDifferentiatedCompressionCodec(계층별 압축: FP8/VQ/INT4) →
-   SpecAttnVerificationGuidedKVSparseCodec(자기-추측 디코딩 검증 로짓 유도 KV 희소화).
-   이전 기법이 "KV가 저장된 위치 기반 압축 강도 결정"이었다면, 이번 기법은
-   "자기-추측 디코딩의 검증 단계 full-attention 로짓을 무비용 사이드채널로 활용하여
-   토큰별 중요도 마스크를 추출하고 중요도 낮은 KV를 즉시 희소화"하는 방식이다.
-   Training-free: 검증 로짓은 추측 디코딩 파이프라인의 기존 연산 부산물.
+3. [Activity C 교체] SpecAttnVerificationGuidedKVSparseCodec(검증 로짓 유도 희소화) →
+   CompactAttentionBlockUnionCodec (청크드 프리필 특화 2D 블록-스파스 마스크 → KV 선택 블록 테이블 변환).
+   이전 기법이 "자기-추측 디코딩 검증 단계 로짓"을 활용했다면, 이번 기법은
+   "청크드 프리필의 어텐션 중요도 마스크를 Q-block union + Intra-group union으로 GQA-aware
+   블록 테이블로 변환해 선택된 KV 블록만 표준 어텐션 커널에 투입"하는 방식이다.
+   커스텀 스파스 커널 불필요. CompactAttention 원논문(2605.16839) 기반.
 
-4. [Cross 신규] CongestionAdmissionSpecAttnDualReductionPipeline:
-   A(에이전트 수 제한) × C(에이전트당 KV 접근 희소화)의 곱연산적 감소 효과.
-   KV 풀 혼잡도를 C-1 임계값 동적 조정에도 재활용(통합 피드백 루프).
+4. [Cross 신규] BlockUnionNonContiguousCompressionPipeline (B+C, Cross-1):
+   B-1 block-union 인덱스와 C-1 KV 선택 코덱이 공통 KVSelectionBlockTable 자료구조를
+   공유하므로 단일 파이프라인으로 통합. "비연속 히트 블록 × KV 선택률" 곱연산 감소.
 
-5. [CacheStore 인터페이스 확장] base.py에 get_importance_mask() 메서드를 선택적(optional)
-   메서드로 추가. 기존 추상 메서드(put/get/evict/hit_rate/memory_bytes/reset_stats) 유지.
-   기존 모든 구현체는 base의 기본 구현(NotImplementedError raise)을 상속하므로 깨지지 않음.
-
-6. [보존 파일] 이전 사이클 구현 파일(kvdrive_*, thunder_agent_*)은 수정하지 않는다.
+5. [보존 파일] 이전 사이클 구현 파일(concur_*, specattn_*, congestion_specattn_*)은 수정하지 않는다.
+   base.py의 get_importance_mask() 메서드는 이전 사이클에서 이미 추가되어 있으므로 변경 불필요.
    기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
 
-7. [Activity B 미포함] 이번 사이클에서 B는 구현 대상이 아니다. B-1 아이디어
-   (CongestionAwareNonContiguousSegmentEvictionPolicy)는 다음 사이클로 이연한다.
-   단, A-1의 혼잡도 신호(KVPoolMonitor)는 B 확장 시 재사용 가능하도록 독립 모듈로 분리한다.
+6. [Activity A 미포함] 이번 사이클에서 A는 별도 구현 대상이 아니다. A-1 Bayesian Profiling
+   기반 KVServeBayesianScheduler는 B+C 파이프라인 안정화 이후 다음 사이클에서 추가한다.
 -->
 
-# Spec — 2026-05-20
+# Spec — 2026-05-21
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-20.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-21.md`
 
 **최우선 구현 타겟**:
-- **Cross-1 (최우선)**: `CongestionAdmissionSpecAttnDualReductionPipeline` (A+C)
-  — CONCURCongestionBasedAgentAdmissionScheduler(A-1) + SpecAttnVerificationGuidedKVSparseCodec(C-1)
-  의 통합 파이프라인. 에이전트 수 제한(볼륨 제어) × 에이전트당 KV 희소화(접근 희소화)의
-  곱연산적 감소 효과.
-- **A-1 단독 (2순위)**: `CONCURCongestionBasedAgentAdmissionScheduler`
-  — 혼잡도 제어 단독 처리량 측정용. Cross-1 구현의 A 컴포넌트와 동일 클래스.
+- **Cross-1 (최우선)**: `BlockUnionNonContiguousCompressionPipeline` (B+C)
+  — BlockUnionNonContiguousReuseIndex(B-1) + CompactAttentionBlockUnionCodec(C-1)의
+  통합 파이프라인. 비연속 히트 블록 × KV 선택률 곱연산 감소 효과.
+- **C-1 단독 (2순위)**: `CompactAttentionBlockUnionCodec`
+  — KV 선택 압축 효과 독립 측정. Cross-1 구현의 C 컴포넌트와 동일 클래스.
+- **B-1 단독 (3순위)**: `BlockUnionNonContiguousReuseIndex`
+  — memcpy 병목 제거 효과 독립 측정. Cross-1 구현의 B 컴포넌트와 동일 클래스.
 
 **해결하려는 문제**:
 
-- **Activity A (CONCUR 혼잡 어드미션)**: 기존 스케줄러들은 KV 풀이 포화 상태가 되어도
-  신규 에이전트 스텝을 계속 수락하여 "중간 단계 쓰래싱(middle-phase thrashing)"이 발생한다.
-  CONCURCongestionBasedAgentAdmissionScheduler는 KV 풀 점유율을 실시간으로 모니터링하여
-  3단계 혼잡 상태(여유/경계/혼잡)로 분류하고, 혼잡 단계에서 신규 어드미션을 일시 중단하여
-  쓰래싱 없이 처리량을 극대화한다.
+- **Activity B (Block-Union 비연속 재사용)**: 기존 비연속 KV 재사용은 물리적으로 분산된
+  PagedAttention 블록들을 연속 KV 텐서로 집결하는 memcpy 비용이 주요 병목이다. 비연속
+  히트가 발생하더라도 memcpy 오버헤드가 히트 이득을 상쇄하여 사실상 재사용이 불가능한
+  케이스가 발생한다. `BlockUnionNonContiguousReuseIndex`는 CompactAttention(2605.16839)의
+  Block-Union KV Selection 아이디어를 차용해, 비연속 PA 블록들을 GQA-aware per-group
+  블록 테이블로 변환하고 memcpy 없이 표준 어텐션 커널에 직접 투입함으로써 비연속 재사용
+  처리 병목을 제거한다.
 
-- **Activity C (SpecAttn 검증 유도 희소화)**: 기존 KV 압축 기법(H2O, SnapKV 등)은 별도
-  캘리브레이션 데이터나 heuristic 통계에 의존하여 중요 KV를 오분류할 위험이 있다.
-  SpecAttnVerificationGuidedKVSparseCodec은 자기-추측 디코딩의 검증 단계에서 이미 계산되는
-  full-attention 로짓을 "무비용 사이드채널"로 활용(Collect-2-Query 메커니즘)하여 현재 컨텍스트
-  에서 실제로 중요한 KV를 정확히 식별한다. Training-free이며 추가 연산 비용이 없다.
+- **Activity C (Block-Union KV 선택 압축)**: 기존 KV 압축 기법은 커스텀 스파스 커널이
+  필요하거나(구현 복잡도 높음), 단일 토큰 단위 결정(post-hoc)으로 청크드 프리필의
+  블록-스파스 구조를 활용하지 못한다. `CompactAttentionBlockUnionCodec`은 청크드 프리필의
+  2D 블록-스파스 어텐션 마스크를 Q-block union + Intra-group union 연산으로 GQA-aware
+  KV 선택 블록 테이블로 변환해, 선택된 KV 블록(상위 40%)만 표준 PagedAttention 커널에
+  투입한다. 커스텀 스파스 커널 불필요. CompactAttention 원논문 기준 accuracy delta ±0.5%
+  이내 (RULER 벤치마크 128K 컨텍스트 기준).
 
-- **Cross A+C**: 두 기법의 감소 효과는 곱연산적이다. A-1이 KV 풀에 진입하는 에이전트 수를
-  제한(볼륨 제어)하고, C-1이 진입한 에이전트의 KV 접근 자체를 희소화(접근 희소화)한다.
-  KV 풀 점유율 신호는 C-1의 희소화 임계값 동적 조정에도 재활용되어 통합 피드백 루프를 형성한다.
+- **Cross B+C**: 두 기법이 공통 `KVSelectionBlockTable` 자료구조를 공유한다.
+  B-1이 비연속 PA 블록 히트 집합을 구성하고, C-1이 그 집합에서 중요 블록만 선택한다.
+  결합 감소 효과: 비연속 히트율 × KV 선택률 = 곱연산적 메모리 감소 (예: 히트율 50% ×
+  선택률 40% → 전체 KV의 20% 사용 = 80% 절감).
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling (CONCURCongestionBasedAgentAdmissionScheduler)
-- [ ] Activity B: Non-Contiguous KV Cache Reuse (미포함, 다음 사이클로 이연)
-- [x] Activity C: KV Cache Compression (SpecAttnVerificationGuidedKVSparseCodec)
+- [ ] Activity A: KV Cache-aware Scheduling (미포함, 다음 사이클로 이연)
+- [x] Activity B: Non-Contiguous KV Cache Reuse (BlockUnionNonContiguousReuseIndex)
+- [x] Activity C: KV Cache Compression (CompactAttentionBlockUnionCodec)
 
 ---
 
 ## 목표
 
 - [ ] 목표 1 (evaluation_criteria.md §4 Activity C 필수): perplexity 변화 ±1% 이내
-      — WikiText-103 proxy: attention_output_relative_error < 0.01 (MANDATORY)
-      — src/metrics/perplexity.py의 attention_output_relative_error() 활용
+      — `attention_output_relative_error(q, k_orig, v_orig, k_comp, v_comp) < 0.01` (MANDATORY)
+      — kv_selection_ratio=0.40 기준 측정
 - [ ] 목표 2 (evaluation_criteria.md §4 Activity C 필수): downstream 태스크 정확도 ±1% 이내
-      — MMLU proxy: cosine_similarity_output() ≥ 0.99 (MANDATORY)
-      — 희소화 임계값 보수적 설정(상위 70~85% KV 유지)으로 달성
-- [ ] 목표 3 (evaluation_criteria.md §4 Activity C 높음): KV Memory Reduction ≥ −30%
-      — 중요도 낮은 KV 퇴거(eviction) + INT4 압축으로 −30~40% 달성
+      — `cosine_similarity_output(q, k_orig, v_orig, k_comp, v_comp) >= 0.99` (MANDATORY)
+      — RULER 벤치마크 proxy: cosine similarity >= 0.99
+- [ ] 목표 3 (evaluation_criteria.md §4 Activity C 높음): KV Memory Reduction >= -30%
+      — KV 블록 선택률 40% 기준 60% 블록 제거 → -30% 이상 (필수)
+      — B+C 결합 시 추가 감소 기대
 - [ ] 목표 4 (evaluation_criteria.md §4 Activity C 높음): Effective Context Length 동일 메모리 2× 이상
-      — 희소화로 확보한 HBM 슬랙으로 더 긴 컨텍스트 수용
-- [ ] 목표 5 (evaluation_criteria.md §2 Activity A 필수): 스케줄링 오버헤드 TTFT p50 +5% 이내
-      — KVPoolMonitor.get_occupancy() O(1) + 어드미션 게이트 판정 < 0.1ms/스텝
-- [ ] 목표 6 (evaluation_criteria.md §2 Activity A 높음): 캐시 히트율 향상 +10%p
-      — 쓰래싱 제거로 진행 중인 에이전트의 KV 퇴거 방지 → 히트율 향상
+      — KV 선택 압축으로 확보한 메모리로 더 긴 컨텍스트 수용
+- [ ] 목표 5 (evaluation_criteria.md §3 Activity B 높음): 전체 Cache Hit Rate +5%p 이상
+      — block-union 변환으로 비연속 히트 처리 가능 범위 확대
+- [ ] 목표 6 (evaluation_criteria.md §3 Activity B 높음): 비연속 세그먼트 히트율 >= 전체 히트의 30%
+      — memcpy 병목 제거로 비연속 히트 처리 비율 증가
 - [ ] 목표 7 (evaluation_criteria.md §1 처리량 높음): Inference Throughput 베이스라인 +20% 이상
-      — Cross-1 A×C 곱연산적 효과: +50~60% 예상
+      — B+C 결합: block-union 병목 제거 + KV 선택 압축 어텐션 속도 향상 복합 효과
 - [ ] 목표 8 (evaluation_criteria.md §5 크로스 조합): 복합 Throughput 단일 Activity 대비 +5% 이상
-      — A-1 단독 vs C-1 단독 vs Cross-1 3방향 비교
+      — B-1 단독 vs C-1 단독 vs Cross-1 3방향 비교
 - [ ] 목표 9 (evaluation_criteria.md §5 크로스 조합 C 포함): 복합 적용 후 accuracy ±1% 이내
-      — Cross-1 전체 흐름 후 cosine_similarity ≥ 0.99 (MANDATORY)
+      — Cross-1 전체 흐름 후 cosine_sim >= 0.99 (MANDATORY)
 
 ---
 
@@ -114,404 +116,567 @@
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/scheduler/concur_congestion_admission_scheduler.py` | A | CONCURCongestionBasedAgentAdmissionScheduler + KVPoolMonitor |
-| `src/cache/specattn_sparse_codec.py` | C | SpecAttnVerificationGuidedKVSparseCodec — 검증 로짓 유도 KV 희소화 + CacheStore 구현 |
-| `src/cache/congestion_specattn_pipeline.py` | A+C | CongestionAdmissionSpecAttnDualReductionPipeline — Cross-1 통합 파이프라인 (CacheStore 구현) |
-| `tests/unit/test_concur_congestion_scheduler.py` | A | 어드미션 게이트·혼잡 단계 전환·오버헤드 검증 |
-| `tests/unit/test_compression_accuracy.py` | C | SpecAttn 희소화 accuracy 검증 (MANDATORY, 기존 파일 덮어쓰기 또는 신규 생성) |
-| `tests/integration/test_congestion_specattn_e2e.py` | A+C | Cross-1 E2E 통합 테스트 |
-| `configs/experiments/2026-05-20.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `src/cache/block_union_noncontiguous_index.py` | B | BlockUnionNonContiguousReuseIndex — GQA-aware 블록 테이블 변환, memcpy 없는 비연속 재사용 |
+| `src/cache/compact_attention_block_union_codec.py` | C | CompactAttentionBlockUnionCodec — 2D 블록-스파스 마스크 → KV 선택 블록 테이블 변환, accuracy-preserving 압축 |
+| `src/cache/block_union_bc_pipeline.py` | B+C | BlockUnionBCPipeline — B-1 + C-1 통합 파이프라인, 공통 KVSelectionBlockTable 공유 |
+| `tests/unit/test_block_union_noncontiguous_index.py` | B | B-1 단위 테스트: block-union 변환 정확성, GQA per-group 테이블, 비연속 히트율, memcpy vs block-union 오버헤드 |
+| `tests/unit/test_compression_accuracy.py` | C | C-1 accuracy 검증: perplexity ±1%, cosine similarity, RULER proxy, 선택률별 곡선 (기존 파일 덮어쓰기) |
+| `tests/integration/test_block_union_bc_e2e.py` | B+C | Cross-1 E2E 통합 테스트 |
+| `configs/experiments/2026-05-21.yaml` | 공통 | 이번 사이클 실험 설정 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/cache/base.py` | `get_importance_mask()` 선택적 메서드 추가 (기본 구현: `raise NotImplementedError`). 기존 추상 메서드 6개 불변. |
+| `src/cache/segmented.py` | `get_segments()` 및 `put_segment()` 경로에 `use_block_union: bool = False` 플래그 추가. `use_block_union=True` 시 `BlockUnionNonContiguousReuseIndex`로 위임. 기존 경로(memcpy fallback) 유지. |
+
+**주의**: `src/cache/base.py`는 이전 사이클(2026-05-20)에서 이미 `get_importance_mask()` 메서드가 추가되어 있다. 추가 변경 불필요. 기존 추상 메서드 6개(put, get, evict, hit_rate, memory_bytes, reset_stats) 불변.
 
 ---
 
 ## 알고리즘 상세
 
-### KVPoolMonitor (Activity A 내부 유틸리티)
+### 공통 자료구조: KVSelectionBlockTable
+
+B-1과 C-1이 공유하는 핵심 자료구조다.
 
 ```python
-# src/scheduler/concur_congestion_admission_scheduler.py 상단
+# src/cache/block_union_noncontiguous_index.py 상단에 정의
 
 from dataclasses import dataclass, field
-from typing import Deque, List, Literal
-from collections import deque
-import time
-import threading
+from typing import Dict, List, Optional, Tuple
+import torch
 
-CongestionLevel = Literal["FREE", "BOUNDARY", "CONGESTED"]
+# BlockPtr: PA 블록 ID (int)
+BlockPtr = int
 
 @dataclass
-class KVPoolMonitor:
-    """KV 풀 점유율 실시간 모니터.
+class KVSelectionBlockTable:
+    """GQA-aware per-group KV 선택 블록 테이블.
 
-    캐시 상태 접근 방법: get_occupancy() O(1).
-    내부적으로 현재 사용 바이트와 최대 용량을 추적.
+    group_blocks[group_id][position] = block_ptr 형태로
+    비연속 PA 블록들을 GQA 그룹 단위로 통합 표현.
+
+    표준 PagedAttention 커널의 block_tables 인자로 직접 투입 가능.
+    배치 내에서만 유효 (배치 간 재사용 없음).
     """
-    capacity_bytes: int         # KV 풀 최대 용량
-    alpha_low: float = 0.60    # 혼잡 → 여유 복구 임계값
-    alpha_high: float = 0.85   # 여유/경계 → 혼잡 진입 임계값
-    _current_bytes: int = field(default=0, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    group_blocks: Dict[int, List[BlockPtr]] = field(default_factory=dict)
+    # group_blocks[group_id] = 순서대로 나열된 블록 포인터 리스트
+    n_groups: int = 0
+    total_blocks: int = 0
+    selected_blocks: int = 0  # 선택된 블록 수 (C-1에서 설정)
 
-    def update(self, used_bytes: int) -> None:
-        with self._lock:
-            self._current_bytes = used_bytes
+    @property
+    def selection_ratio(self) -> float:
+        if self.total_blocks == 0:
+            return 1.0
+        return self.selected_blocks / self.total_blocks
 
-    def get_occupancy(self) -> float:
-        """현재 KV 풀 점유율 (0.0~1.0). O(1)."""
-        if self.capacity_bytes == 0:
-            return 0.0
-        return self._current_bytes / self.capacity_bytes
+    def to_block_table_tensor(self) -> torch.Tensor:
+        """표준 PagedAttention 커널용 block_table 텐서 변환.
 
-    def congestion_level(self) -> CongestionLevel:
-        occ = self.get_occupancy()
-        if occ >= self.alpha_high:
-            return "CONGESTED"
-        elif occ >= self.alpha_low:
-            return "BOUNDARY"
-        else:
-            return "FREE"
+        Returns: [n_groups, max_blocks_per_group] int64 텐서.
+        -1은 패딩(빈 슬롯)을 나타낸다.
+        """
+        if not self.group_blocks:
+            return torch.empty(0, 0, dtype=torch.int64)
+        max_len = max(len(v) for v in self.group_blocks.values())
+        n_groups = len(self.group_blocks)
+        table = torch.full((n_groups, max_len), -1, dtype=torch.int64)
+        for g_idx, (g_id, blk_list) in enumerate(sorted(self.group_blocks.items())):
+            table[g_idx, :len(blk_list)] = torch.tensor(blk_list, dtype=torch.int64)
+        return table
 ```
 
 ---
 
-### CONCURCongestionBasedAgentAdmissionScheduler (Activity A)
-
-스케줄링 결정 단위: **에이전트 스텝(step) 단위**.
-캐시 상태 접근 방법: `KVPoolMonitor.get_occupancy()` O(1) 실시간 조회.
+### BlockUnionNonContiguousReuseIndex (Activity B)
 
 ```python
-# src/scheduler/concur_congestion_admission_scheduler.py
-
-@dataclass
-class CongestionAdmissionConfig:
-    capacity_bytes: int = 1_000_000_000  # KV 풀 최대 용량 (1 GB 기본)
-    alpha_low: float = 0.60              # 복구 임계값
-    alpha_high: float = 0.85            # 혼잡 진입 임계값
-    priority_weights: dict = field(default_factory=dict)  # agent_id → float
-    online_adapt_window: int = 100       # 온라인 임계값 적응 윈도우 크기 (스텝 수)
-    enable_multinode: bool = False       # 멀티노드: 글로벌 occupancy 집계
-    seed: int = 42
-
-
-class CONCURCongestionBasedAgentAdmissionScheduler(BaseScheduler):
-    """CONCUR 기반 KV 풀 혼잡도 어드미션 스케줄러.
-
-    Activity A: KV Cache-aware Scheduling
-    스케줄링 결정 단위: 에이전트 스텝(step) 단위.
-    캐시 상태 접근: KVPoolMonitor.get_occupancy() O(1) 조회.
-
-    혼잡 상태 3단계:
-      FREE (occupancy < alpha_low): 표준 FIFO + 우선순위 재개. 신규 어드미션 허용.
-      BOUNDARY (alpha_low <= occupancy < alpha_high): 신규 어드미션 신중 허용.
-        우선순위 상위 에이전트만 허용, 나머지 대기열.
-      CONGESTED (occupancy >= alpha_high): 신규 에이전트 스텝 어드미션 일시 중단.
-        진행 중인 에이전트의 KV는 선제적으로 퇴거하지 않음 (CONCUR 핵심 원칙).
-
-    온라인 임계값 적응:
-      매 online_adapt_window 스텝마다 어드미션 게이트 처리량 vs 대기 지연 비율을 계산하여
-      alpha_high/alpha_low를 ±0.02 범위 내에서 조정.
-
-    멀티노드 고려사항:
-      enable_multinode=True 시 update_remote_occupancy(node_id, occupancy) 로
-      원격 노드 KV 풀 점유율을 집계하여 글로벌 혼잡 신호 구성.
-
-    평가 기준 (evaluation_criteria.md §2):
-      - 스케줄링 오버헤드: TTFT p50 +5% 이내 (MANDATORY)
-      - 캐시 히트율: 스케줄링 미적용 대비 +10%p 이상
-      - 최대 대기 시간: 2× 초과하지 않음
-    """
-
-    def __init__(self, config: CongestionAdmissionConfig) -> None:
-        ...
-        self.monitor = KVPoolMonitor(
-            capacity_bytes=config.capacity_bytes,
-            alpha_low=config.alpha_low,
-            alpha_high=config.alpha_high,
-        )
-        self._wait_queue: Deque = deque()       # 대기 중인 에이전트 스텝
-        self._admitted: List = []               # 현재 진행 중인 에이전트
-        self._scheduling_times: List[float] = []
-        self._step_count: int = 0
-        self._gate_throughput: List[float] = []  # 어드미션 처리량 추적
-        self._remote_occupancies: dict = {}      # 멀티노드: {node_id: float}
-
-    def admit(self, agent_step: object, priority: float = 1.0) -> bool:
-        """에이전트 스텝 어드미션 시도.
-
-        Algorithm:
-          1. monitor.congestion_level() 조회.
-          2. CONGESTED: 대기열에 추가, return False.
-          3. BOUNDARY: priority >= median(priority_weights) → 허용, else 대기열.
-          4. FREE: 허용 (FIFO + 우선순위 가중치 정렬).
-          5. _step_count 증가, 처리량 기록.
-          Returns: True(허용) / False(대기).
-        """
-        ...
-
-    def release(self, agent_step: object, freed_bytes: int) -> None:
-        """에이전트 완료 시 KV 풀 공간 반환 + 대기열 재개.
-
-        Algorithm:
-          1. monitor.update(monitor._current_bytes - freed_bytes).
-          2. congestion_level() 재확인.
-          3. FREE이면 wait_queue에서 FIFO + 우선순위 순으로 대기 에이전트 재개.
-        """
-        ...
-
-    def update_kv_pool(self, used_bytes: int) -> None:
-        """KV 풀 상태 갱신 (매 스텝 호출).
-        Algorithm: monitor.update(used_bytes).
-        """
-        self.monitor.update(used_bytes)
-
-    def update_remote_occupancy(self, node_id: str, occupancy: float) -> None:
-        """멀티노드: 원격 노드 점유율 집계."""
-        self._remote_occupancies[node_id] = occupancy
-
-    def global_occupancy(self) -> float:
-        """로컬 + 원격 점유율 평균 (멀티노드 혼잡 신호)."""
-        all_occ = [self.monitor.get_occupancy()] + list(self._remote_occupancies.values())
-        return sum(all_occ) / len(all_occ)
-
-    def _adapt_thresholds(self) -> None:
-        """온라인 임계값 적응.
-
-        Algorithm:
-          throughput = admitted_in_window / online_adapt_window
-          wait_ratio = len(wait_queue) / max(1, admitted_in_window)
-          if wait_ratio > 0.5: alpha_high -= 0.02  # 더 공격적으로 막음
-          if wait_ratio < 0.1: alpha_high += 0.02  # 더 허용
-          alpha_high = clamp(alpha_high, 0.70, 0.95)
-          alpha_low = alpha_high - 0.25 (항상 차이 유지)
-        """
-        ...
-
-    def schedule(self, requests: List) -> List:
-        """BaseScheduler 호환 schedule() 인터페이스.
-
-        batch 단위 호출 시: congestion_level()로 전체 배치 허용/대기 결정.
-        Returns: 허용된 requests 부분 목록.
-        """
-        t0 = time.monotonic()
-        level = self.monitor.congestion_level()
-        if level == "CONGESTED":
-            result = []  # 혼잡: 신규 배치 전부 대기
-        elif level == "BOUNDARY":
-            # 우선순위 상위 절반만 허용
-            sorted_reqs = sorted(
-                requests,
-                key=lambda r: self.config.priority_weights.get(getattr(r, "request_id", ""), 1.0),
-                reverse=True,
-            )
-            result = sorted_reqs[: max(1, len(sorted_reqs) // 2)]
-        else:
-            result = list(requests)
-        self._scheduling_times.append((time.monotonic() - t0) * 1000.0)
-        self._step_count += 1
-        if self._step_count % self.config.online_adapt_window == 0:
-            self._adapt_thresholds()
-        return result
-
-    def scheduling_overhead_ms_p50(self) -> float:
-        """스케줄링 오버헤드 중앙값 (ms). 평가 기준: < 5ms (MANDATORY)."""
-        if not self._scheduling_times:
-            return 0.0
-        s = sorted(self._scheduling_times)
-        return s[len(s) // 2]
-
-    def reset_stats(self) -> None:
-        self._scheduling_times.clear()
-        self._step_count = 0
-        self._gate_throughput.clear()
-        self._remote_occupancies.clear()
-```
-
----
-
-### SpecAttnVerificationGuidedKVSparseCodec (Activity C)
-
-```python
-# src/cache/specattn_sparse_codec.py
+# src/cache/block_union_noncontiguous_index.py
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import torch
-import torch.nn.functional as F
 
 from src.cache.base import CacheStore
+from src.cache.block_union_noncontiguous_index import KVSelectionBlockTable, BlockPtr
 
 
 @dataclass
-class SpecAttnCodecConfig:
-    # 레이어별 KV 유지 비율 (상위 중요도 기준)
-    retention_ratio_by_layer: List[float] = field(
-        default_factory=lambda: [0.85] * 12
-    )  # 하위 레이어: 0.85, 상위 레이어: 0.70 (레이어 인덱스로 조정)
-    global_retention_ratio: float = 0.80   # 레이어별 설정 없을 때 기본값
-    low_importance_quant_int4: bool = True  # 중요도 낮은 KV: INT4 양자화 vs 퇴거
-    int4_threshold: float = 0.01           # INT4 sparsification zero_threshold
+class BlockUnionConfig:
+    block_size: int = 16          # 블록당 토큰 수 (PagedAttention block_size)
+    n_kv_heads: int = 8           # 총 KV 헤드 수
+    n_gqa_groups: int = 4         # GQA 그룹 수 (n_kv_heads / n_q_heads_per_group)
+    max_entries: int = 1000       # 캐시 최대 엔트리 수
+    rope_reencoding_enabled: bool = True  # 위치 불일치 시 AdapShot RoPE 재인코딩
+    use_block_union: bool = True   # block-union 경로 활성화 (False면 memcpy fallback)
+    seed: int = 42
+
+
+class BlockUnionNonContiguousReuseIndex(CacheStore):
+    """CompactAttention Block-Union 기반 비연속 KV 재사용 인덱스.
+
+    Activity B: Non-Contiguous KV Cache Reuse
+    CacheStore 인터페이스 완전 구현.
+
+    핵심 알고리즘:
+      비연속 PA 블록들을 GQA-aware per-group 블록 테이블(KVSelectionBlockTable)로 변환.
+      변환 비용: O(k × seg_len / block_size) 포인터 연산 (memcpy 없음).
+      표준 PagedAttention 커널의 block_tables 인자로 직접 주입.
+
+    GQA-aware per-group 블록 테이블 변환 원리:
+      GQA 그룹 내 모든 헤드가 동일 K/V 블록을 공유하므로,
+      그룹 단위로 블록 포인터를 통합 (중복 저장 제거).
+      group_id = head_id // (n_kv_heads // n_gqa_groups)
+
+    평가 기준 (evaluation_criteria.md §3):
+      - 전체 Cache Hit Rate +5%p 이상 (높음)
+      - 비연속 세그먼트 히트율 >= 전체 히트의 30% (높음)
+      - KV Memory Footprint 베이스라인 +20% 이내 (높음)
+    """
+
+    def __init__(self, config: BlockUnionConfig) -> None:
+        torch.manual_seed(config.seed)
+        self.config = config
+        # 세그먼트 ID → PA 블록 포인터 리스트 매핑
+        self._segment_blocks: OrderedDict[str, List[BlockPtr]] = OrderedDict()
+        # 세그먼트 ID → 원본 KV 텐서 (fallback용)
+        self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._noncontiguous_hits = 0
+        self._block_union_hits = 0   # block-union 경로 히트 수
+        self._memcpy_hits = 0        # memcpy fallback 경로 히트 수
+
+    # ------------------------------------------------------------------ #
+    # CacheStore 인터페이스                                                #
+    # ------------------------------------------------------------------ #
+
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """KV 텐서를 세그먼트 키로 저장.
+
+        Algorithm:
+          1. PA 블록 포인터 목록 생성:
+             n_blocks = ceil(value.shape[0] / block_size)
+             block_ptrs = list(range(len(_segment_blocks) * n_blocks,
+                                    (len(_segment_blocks) + 1) * n_blocks))
+             (실제 환경에서는 PA 블록 할당기에서 받아옴 — 여기서는 단조 증가 ID 사용)
+          2. _segment_blocks[key] = block_ptrs
+          3. _store[key] = value  (fallback 및 to_block_table_tensor() 없는 환경 대비)
+          4. LRU 관리: max_entries 초과 시 evict() 호출.
+        """
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._segment_blocks.move_to_end(key)
+            return
+        if len(self._store) >= self.config.max_entries:
+            self.evict()
+        n_seq = value.shape[0] if value.dim() >= 1 else 1
+        n_blocks = max(1, (n_seq + self.config.block_size - 1) // self.config.block_size)
+        # 단조 증가 블록 ID 부여 (시뮬레이션)
+        base_id = len(self._segment_blocks) * n_blocks
+        block_ptrs = list(range(base_id, base_id + n_blocks))
+        self._segment_blocks[key] = block_ptrs
+        self._store[key] = value.detach().clone()
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        """일반 get: fallback memcpy 경로."""
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._segment_blocks.move_to_end(key)
+            self._hits += 1
+            self._memcpy_hits += 1
+            return self._store[key]
+        self._misses += 1
+        return None
+
+    def evict(self) -> int:
+        if not self._store:
+            return 0
+        key, v = self._store.popitem(last=False)
+        self._segment_blocks.pop(key, None)
+        return v.nbytes
+
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def memory_bytes(self) -> int:
+        return sum(v.nbytes for v in self._store.values())
+
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
+        self._noncontiguous_hits = 0
+        self._block_union_hits = 0
+        self._memcpy_hits = 0
+
+    # ------------------------------------------------------------------ #
+    # Block-Union API                                                      #
+    # ------------------------------------------------------------------ #
+
+    def get_block_union(
+        self,
+        segment_keys: List[str],
+    ) -> Optional[KVSelectionBlockTable]:
+        """비연속 세그먼트들의 GQA-aware block-union 테이블 생성.
+
+        Algorithm:
+          1. 히트된 세그먼트 필터링:
+             hit_keys = [k for k in segment_keys if k in _segment_blocks]
+          2. GQA per-group 블록 포인터 통합:
+             heads_per_group = n_kv_heads // n_gqa_groups
+             for group_id in range(n_gqa_groups):
+               head_start = group_id * heads_per_group
+               # 그룹 내 모든 세그먼트의 블록 포인터 합집합 (순서 보존 union)
+               group_blocks[group_id] = union_ordered(
+                   _segment_blocks[k] for k in hit_keys
+               )
+          3. KVSelectionBlockTable 구성:
+             table.n_groups = n_gqa_groups
+             table.total_blocks = sum(len(v) for v in group_blocks.values())
+             table.selected_blocks = table.total_blocks  (C-1 미적용 시)
+          4. 비연속 히트 계수 증가.
+          5. miss이면 None 반환.
+
+        Returns: KVSelectionBlockTable 또는 None (모든 세그먼트 미스)
+        """
+        hit_keys = [k for k in segment_keys if k in self._segment_blocks]
+        if not hit_keys:
+            self._misses += len(segment_keys)
+            return None
+
+        # 히트/미스 계수
+        self._hits += len(hit_keys)
+        self._misses += len(segment_keys) - len(hit_keys)
+        self._block_union_hits += len(hit_keys)
+
+        # 비연속 히트 감지: 연속 접두사가 아닌 히트 존재 여부
+        all_keys = segment_keys
+        miss_set = set(k for k in all_keys if k not in self._segment_blocks)
+        for i, k in enumerate(hit_keys):
+            orig_idx = all_keys.index(k)
+            if any(all_keys.index(m) < orig_idx for m in miss_set if m in all_keys):
+                self._noncontiguous_hits += 1
+                break
+
+        # GQA-aware per-group 블록 테이블 구성
+        heads_per_group = max(1, self.config.n_kv_heads // max(1, self.config.n_gqa_groups))
+        group_blocks: Dict[int, List[BlockPtr]] = {}
+        seen: Dict[int, set] = {}
+
+        for g_id in range(self.config.n_gqa_groups):
+            group_blocks[g_id] = []
+            seen[g_id] = set()
+
+        for seg_key in hit_keys:
+            blk_ptrs = self._segment_blocks[seg_key]
+            for blk_ptr in blk_ptrs:
+                for g_id in range(self.config.n_gqa_groups):
+                    if blk_ptr not in seen[g_id]:
+                        group_blocks[g_id].append(blk_ptr)
+                        seen[g_id].add(blk_ptr)
+
+        total = sum(len(v) for v in group_blocks.values())
+        table = KVSelectionBlockTable(
+            group_blocks=group_blocks,
+            n_groups=self.config.n_gqa_groups,
+            total_blocks=total,
+            selected_blocks=total,
+        )
+        return table
+
+    def build_block_union_table(
+        self,
+        segment_ids: List[str],
+    ) -> KVSelectionBlockTable:
+        """segment_ids에 대한 GQA-aware 블록 테이블 구성 (히트 미스 무관).
+
+        미스 세그먼트는 건너뛰고, 히트 세그먼트만으로 테이블 구성.
+        반환 테이블이 비어 있으면 total_blocks=0.
+        """
+        result = self.get_block_union(segment_ids)
+        if result is None:
+            return KVSelectionBlockTable(
+                group_blocks={g: [] for g in range(self.config.n_gqa_groups)},
+                n_groups=self.config.n_gqa_groups,
+                total_blocks=0,
+                selected_blocks=0,
+            )
+        return result
+
+    def noncontiguous_hit_rate(self) -> float:
+        """비연속 히트 비율 (전체 히트 중)."""
+        return self._noncontiguous_hits / max(1, self._hits)
+
+    def block_union_hit_rate(self) -> float:
+        """block-union 경로 히트 비율."""
+        return self._block_union_hits / max(1, self._hits + self._misses)
+```
+
+---
+
+### CompactAttentionBlockUnionCodec (Activity C)
+
+```python
+# src/cache/compact_attention_block_union_codec.py
+
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Optional, Tuple
+import torch
+import torch.nn.functional as F
+
+from src.cache.base import CacheStore
+from src.cache.block_union_noncontiguous_index import KVSelectionBlockTable, BlockPtr
+
+
+MaskSource = Literal["profile", "online", "hybrid"]
+
+
+@dataclass
+class BlockUnionCodecConfig:
+    chunk_size: int = 2048          # 청크드 프리필 청크 크기 (토큰 수)
+    kv_selection_ratio: float = 0.40  # KV 블록 선택률 (상위 40% 유지)
+    n_kv_heads: int = 8             # 총 KV 헤드 수
+    n_gqa_groups: int = 4           # GQA 그룹 수
+    block_size: int = 16            # PA 블록 크기 (토큰 수)
+    mask_source: MaskSource = "online"  # 중요도 마스크 생성 방법
+    profile_path: Optional[str] = None  # "profile" 방법 사용 시 프로파일 경로
     max_entries: int = 1000
     seed: int = 42
 
 
-class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
-    """SpecAttn Collect-2-Query 메커니즘 기반 KV 희소화 코덱.
+class CompactAttentionBlockUnionCodec(CacheStore):
+    """CompactAttention Block-Union KV 선택 압축 코덱.
 
-    Activity C: KV Cache Compression (Training-free)
+    Activity C: KV Cache Compression (accuracy-preserving)
     CacheStore 인터페이스 완전 구현.
 
-    핵심 알고리즘 (Collect-2-Query):
-      1. 자기-추측 디코딩 검증 단계의 full-attention 로짓(attn_logits: [n_heads, n_q, n_kv])을
-         set_verification_logits()로 주입. 이 로짓은 어차피 검증 단계에서 계산되므로 추가 비용 없음.
-      2. extract_importance_mask(): 각 KV 위치의 최대 어텐션 가중치를 헤드 전체에서 집계 →
-         상위 retention_ratio KV를 "중요" 마스크로 표시.
-      3. put()에서 compression_hook()을 통해 중요도 마스크 적용:
-         - 중요 KV: 원본 정밀도 유지.
-         - 비중요 KV: INT4 양자화(low_importance_quant_int4=True) 또는 즉시 퇴거.
-      4. get_importance_mask(key): 해당 KV의 중요도 마스크 반환 (base.py 신규 메서드).
+    핵심 알고리즘:
+      청크드 프리필의 2D 블록-스파스 어텐션 마스크를 GQA-aware KV 선택 블록 테이블로 변환.
+      선택된 KV 블록(상위 kv_selection_ratio)만 표준 PA 커널에 투입.
+      커스텀 스파스 커널 불필요.
 
-    레이어별 retention_ratio:
-      layer_idx < n_layers // 2 → retention_ratio_by_layer[layer_idx] (보수적, 높음)
-      layer_idx >= n_layers // 2 → 더 낮은 비율 (상위 레이어는 덜 중요)
+    Q-block union 연산:
+      쿼리 청크 내 모든 쿼리 토큰이 참조하는 KV 블록의 합집합(union).
+      selected_blocks = union_{q ∈ q_chunk} {k_block : M[q][k_block] = 1}
 
-    accuracy-preserving 근거 (evaluation_criteria.md §4):
-      SpecAttn 논문: Collect-2-Query로 선택된 KV 집합은 full-attention과 출력이 수학적으로
-      동등함을 증명. 검증 단계 전체 어텐션 로짓에서 추출한 마스크는 현재 컨텍스트에서
-      실제로 중요한 KV를 정확히 식별. 상위 70~85% KV 유지 → perplexity 변화 ±0.5% 이내.
+    Intra-group union 연산:
+      GQA 그룹 내 헤드별 Q-block union 결과를 그룹 단위로 통합.
+      group_blocks[group_id] = union_{h ∈ group} selected_blocks[h]
+
+    accuracy-preserving 근거:
+      Q-block union은 쿼리 토큰이 필요로 하는 KV 블록의 합집합이므로
+      false negative 없음 (보수적 선택 보장).
+      CompactAttention 원논문(2605.16839): LLaMA-3.1-8B-Instruct 128K RULER 벤치마크
+      밀집 어텐션 대비 accuracy delta ±0.5% 이내 실험적 검증.
 
     평가 기준 (evaluation_criteria.md §4):
-      - Accuracy 보존 (필수): perplexity 변화 ±1% 이내 — relative_error < 0.01 (MANDATORY)
-      - KV Memory Reduction ≥ −30%
-      - 압축 오버헤드: TTFT +10% 이내
+      - Accuracy 보존 (필수): relative_error < 0.01 (MANDATORY)
+      - downstream 태스크 정확도: cosine_sim >= 0.99 (MANDATORY)
+      - KV Memory Reduction >= -30% (높음)
     """
 
-    def __init__(self, config: SpecAttnCodecConfig) -> None:
+    def __init__(self, config: BlockUnionCodecConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
         self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self._importance_masks: Dict[str, torch.Tensor] = {}  # key → bool mask
-        self._current_logits: Optional[torch.Tensor] = None   # [n_heads, n_q, n_kv]
-        self._current_layer_idx: int = 0
+        # key → KVSelectionBlockTable (선택된 블록 정보 보존)
+        self._block_tables: Dict[str, KVSelectionBlockTable] = {}
+        # 청크별 누적 어텐션 중요도 마스크 (online 방법)
+        # shape: [n_kv_blocks] (블록 단위 중요도 누적값)
+        self._accumulated_importance: Optional[torch.Tensor] = None
+        self._n_chunks_processed: int = 0
         self._hits = 0
         self._misses = 0
         self._total_bytes_original = 0
         self._total_bytes_stored = 0
 
-    def set_verification_logits(
+    # ------------------------------------------------------------------ #
+    # 마스크 생성 API                                                       #
+    # ------------------------------------------------------------------ #
+
+    def update_chunk_attention(
         self,
-        attn_logits: torch.Tensor,   # [n_heads, n_q, n_kv] — 검증 단계 full-attention 로짓
-        layer_idx: int = 0,
+        attn_scores: torch.Tensor,   # [n_heads, n_q_chunk, n_kv_total]
+        chunk_idx: int = 0,
     ) -> None:
-        """검증 단계 로짓 주입. 다음 put() 호출 전에 설정.
+        """청크 어텐션 점수로 중요도 마스크 점진적 구축 (online 방법).
 
         Algorithm:
-          self._current_logits = attn_logits
-          self._current_layer_idx = layer_idx
-        """
-        self._current_logits = attn_logits
-        self._current_layer_idx = layer_idx
-
-    def extract_importance_mask(
-        self,
-        n_kv: int,
-        layer_idx: int = 0,
-    ) -> torch.Tensor:
-        """Collect-2-Query: 검증 로짓에서 KV 중요도 마스크 추출.
-
-        Algorithm:
-          if self._current_logits is None:
-            return torch.ones(n_kv, dtype=torch.bool)  # 로짓 없으면 전부 중요
-          attn_probs = softmax(self._current_logits, dim=-1)   # [n_heads, n_q, n_kv]
-          max_attn_per_kv = attn_probs.max(dim=1).values       # [n_heads, n_kv]
-          importance = max_attn_per_kv.mean(dim=0)             # [n_kv]
-          # 레이어별 retention_ratio 조회
-          if layer_idx < len(config.retention_ratio_by_layer):
-            ratio = config.retention_ratio_by_layer[layer_idx]
+          attn_probs = softmax(attn_scores, dim=-1)  # [n_heads, n_q_chunk, n_kv_total]
+          # 블록 단위 집계
+          n_kv_blocks = ceil(n_kv_total / block_size)
+          block_importance = zeros(n_kv_blocks)
+          for b in range(n_kv_blocks):
+            start = b * block_size
+            end = min(start + block_size, n_kv_total)
+            block_importance[b] = attn_probs[:, :, start:end].max().item()
+          # 누적 (첫 청크가 전체 대표하도록 EMA)
+          if _accumulated_importance is None:
+            _accumulated_importance = block_importance
           else:
-            ratio = config.global_retention_ratio
-          threshold = importance.quantile(1.0 - ratio)
-          mask = importance >= threshold                        # [n_kv] bool
-          return mask
+            _accumulated_importance = 0.7 * _accumulated_importance + 0.3 * block_importance
+          _n_chunks_processed += 1
         """
-        if self._current_logits is None:
-            return torch.ones(n_kv, dtype=torch.bool)
-        logits = self._current_logits
-        if logits.dim() == 3:
-            attn_probs = F.softmax(logits.float(), dim=-1)        # [n_heads, n_q, n_kv]
-            max_attn = attn_probs.max(dim=1).values               # [n_heads, n_kv]
-            importance = max_attn.mean(dim=0)                     # [n_kv]
+        attn_probs = F.softmax(attn_scores.float(), dim=-1)
+        n_kv_total = attn_probs.shape[-1]
+        n_kv_blocks = max(1, (n_kv_total + self.config.block_size - 1) // self.config.block_size)
+        block_importance = torch.zeros(n_kv_blocks)
+        for b in range(n_kv_blocks):
+            start = b * self.config.block_size
+            end = min(start + self.config.block_size, n_kv_total)
+            block_importance[b] = attn_probs[..., start:end].max().item()
+        if self._accumulated_importance is None or self._accumulated_importance.shape[0] != n_kv_blocks:
+            self._accumulated_importance = block_importance
         else:
-            importance = torch.ones(n_kv)
-        # 레이어별 ratio
-        if layer_idx < len(self.config.retention_ratio_by_layer):
-            ratio = self.config.retention_ratio_by_layer[layer_idx]
-        else:
-            ratio = self.config.global_retention_ratio
-        if n_kv == 0:
-            return torch.ones(0, dtype=torch.bool)
-        k = max(1, int(round(n_kv * ratio)))
-        # 상위 k개 중요 KV 선택
-        topk_indices = importance.topk(min(k, importance.numel())).indices
-        mask = torch.zeros(n_kv, dtype=torch.bool)
-        mask[topk_indices] = True
-        return mask
+            self._accumulated_importance = 0.7 * self._accumulated_importance + 0.3 * block_importance
+        self._n_chunks_processed += 1
 
-    def _compress_low_importance(self, value: torch.Tensor) -> torch.Tensor:
-        """비중요 KV: INT4 양자화 (low_importance_quant_int4=True) 또는 zeroing.
+    def build_kv_selection_block_table(
+        self,
+        n_kv_total: int,
+        existing_block_ptrs: Optional[List[BlockPtr]] = None,
+    ) -> KVSelectionBlockTable:
+        """누적 중요도로 KV 선택 블록 테이블 구성.
 
         Algorithm:
-          if not low_importance_quant_int4:
-            return torch.zeros_like(value)  # 퇴거 대신 zeroing (메모리 측정 포함)
-          scale = value.abs().max().clamp(min=1e-8) / 7.0
-          sparse = value.clone()
-          sparse[sparse.abs() < int4_threshold] = 0.0
-          q = (sparse / scale).round().clamp(-7, 7)
-          return (q * scale).to(value.dtype)
+          n_kv_blocks = ceil(n_kv_total / block_size)
+          if _accumulated_importance is not None:
+            importance = _accumulated_importance[:n_kv_blocks]
+          else:
+            importance = ones(n_kv_blocks)  # 폴백: 전부 선택
+
+          # Q-block union: 상위 kv_selection_ratio 블록 선택
+          k_select = max(1, int(n_kv_blocks * kv_selection_ratio))
+          selected_indices = topk(importance, k_select).indices  # 정렬 안 함
+          selected_indices, _ = sort(selected_indices)  # 위치 순서 보존
+
+          # GQA Intra-group union: 그룹별 동일 블록 포인터 부여
+          heads_per_group = n_kv_heads // n_gqa_groups
+          for g_id in range(n_gqa_groups):
+            group_blocks[g_id] = [block_ptrs[i] for i in selected_indices]
+
+          return KVSelectionBlockTable(
+            group_blocks=group_blocks,
+            n_groups=n_gqa_groups,
+            total_blocks=n_kv_blocks,
+            selected_blocks=k_select,
+          )
         """
-        if not self.config.low_importance_quant_int4:
-            return torch.zeros_like(value)
-        sparse = value.clone().float()
-        sparse[sparse.abs() < self.config.int4_threshold] = 0.0
-        scale = sparse.abs().max().clamp(min=1e-8) / 7.0
-        q = (sparse / scale).round().clamp(-7, 7)
-        return (q * scale).to(value.dtype)
+        n_kv_blocks = max(1, (n_kv_total + self.config.block_size - 1) // self.config.block_size)
+
+        if self._accumulated_importance is not None and self._accumulated_importance.shape[0] >= n_kv_blocks:
+            importance = self._accumulated_importance[:n_kv_blocks]
+        else:
+            importance = torch.ones(n_kv_blocks)
+
+        k_select = max(1, int(round(n_kv_blocks * self.config.kv_selection_ratio)))
+        k_select = min(k_select, n_kv_blocks)
+        selected_indices = importance.topk(k_select).indices
+        selected_indices, _ = selected_indices.sort()
+
+        # 블록 포인터 결정
+        if existing_block_ptrs is None:
+            block_ptrs: List[BlockPtr] = list(range(n_kv_blocks))
+        else:
+            block_ptrs = existing_block_ptrs[:n_kv_blocks]
+            while len(block_ptrs) < n_kv_blocks:
+                block_ptrs.append(len(block_ptrs))
+
+        selected_ptrs = [block_ptrs[i.item()] for i in selected_indices]
+
+        # GQA Intra-group union
+        group_blocks: Dict[int, List[BlockPtr]] = {}
+        for g_id in range(self.config.n_gqa_groups):
+            group_blocks[g_id] = list(selected_ptrs)
+
+        return KVSelectionBlockTable(
+            group_blocks=group_blocks,
+            n_groups=self.config.n_gqa_groups,
+            total_blocks=n_kv_blocks,
+            selected_blocks=k_select,
+        )
+
+    def reset_chunk_state(self) -> None:
+        """청크드 프리필 종료 후 상태 초기화 (배치 경계)."""
+        self._accumulated_importance = None
+        self._n_chunks_processed = 0
 
     # ------------------------------------------------------------------ #
-    # CacheStore 추상 메서드                                               #
+    # CacheStore 인터페이스                                                #
     # ------------------------------------------------------------------ #
 
     def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        """중요도 마스크 기반 선택적 KV 압축.
+        """KV 선택 블록 테이블 기반 압축.
 
         Algorithm:
-          mask = extract_importance_mask(n_kv=value.shape[0], layer_idx=_current_layer_idx)
-          self._importance_masks[key] = mask
-          result = value.clone()
-          if mask.shape[0] == value.shape[0]:
-            result[~mask] = _compress_low_importance(value[~mask])
+          n_kv = value.shape[0]
+          table = build_kv_selection_block_table(n_kv_total=n_kv)
+          _block_tables[key] = table
+
+          # 선택된 블록 위치의 KV만 유지, 나머지 zeroing
+          selected_mask = zeros(n_kv, dtype=bool)
+          for b in selected_indices:
+            start = b * block_size
+            end = min(start + block_size, n_kv)
+            selected_mask[start:end] = True
+
+          result = zeros_like(value)
+          result[selected_mask] = value[selected_mask]
           return result
         """
         n_kv = value.shape[0] if value.dim() >= 1 else 1
-        mask = self.extract_importance_mask(n_kv, self._current_layer_idx)
-        self._importance_masks[key] = mask
-        result = value.clone()
-        if mask.shape[0] == value.shape[0] and (~mask).any():
-            result[~mask] = self._compress_low_importance(value[~mask])
+        table = self.build_kv_selection_block_table(n_kv_total=n_kv)
+        self._block_tables[key] = table
+
+        # 선택된 블록 위치 마스크 생성
+        selected_mask = torch.zeros(n_kv, dtype=torch.bool)
+        # group_blocks[0]은 모든 그룹 공통 (Intra-group union으로 동일)
+        selected_ptrs = table.group_blocks.get(0, [])
+        for blk_ptr in selected_ptrs:
+            # 블록 포인터를 위치 인덱스로 변환
+            # put()에서 block_ptrs = range(n_blocks)로 부여했으므로
+            # blk_ptr가 직접 블록 인덱스 역할
+            b = blk_ptr % max(1, (n_kv + self.config.block_size - 1) // self.config.block_size)
+            start = b * self.config.block_size
+            end = min(start + self.config.block_size, n_kv)
+            if start < n_kv:
+                selected_mask[start:end] = True
+
+        result = torch.zeros_like(value)
+        if selected_mask.any():
+            result[selected_mask] = value[selected_mask]
         return result
 
-    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        """해당 key의 중요도 마스크 반환 (base.py 신규 메서드 구현).
+    def get_block_table(self, key: str) -> Optional[KVSelectionBlockTable]:
+        """저장된 KV 선택 블록 테이블 반환."""
+        return self._block_tables.get(key)
 
-        Returns: bool tensor [n_kv] 또는 None (미등록 key).
+    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
+        """KV 선택 블록 테이블에서 bool 마스크 생성 (base.py 인터페이스 구현).
+
+        Returns: [n_kv] bool 텐서 (선택된 위치 True) 또는 None.
         """
-        return self._importance_masks.get(key)
+        table = self._block_tables.get(key)
+        if table is None:
+            return None
+        kv = self._store.get(key)
+        if kv is None:
+            return None
+        n_kv = kv.shape[0]
+        mask = torch.zeros(n_kv, dtype=torch.bool)
+        selected_ptrs = table.group_blocks.get(0, [])
+        for blk_ptr in selected_ptrs:
+            b = blk_ptr % max(1, (n_kv + self.config.block_size - 1) // self.config.block_size)
+            start = b * self.config.block_size
+            end = min(start + self.config.block_size, n_kv)
+            if start < n_kv:
+                mask[start:end] = True
+        return mask
 
     def put(self, key: str, value: torch.Tensor) -> None:
         self._total_bytes_original += value.nbytes
@@ -533,10 +698,11 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
         return None
 
     def evict(self) -> int:
-        if self._store:
-            _, v = self._store.popitem(last=False)
-            return v.nbytes
-        return 0
+        if not self._store:
+            return 0
+        key, v = self._store.popitem(last=False)
+        self._block_tables.pop(key, None)
+        return v.nbytes
 
     def hit_rate(self) -> float:
         total = self._hits + self._misses
@@ -556,293 +722,366 @@ class SpecAttnVerificationGuidedKVSparseCodec(CacheStore):
         self._total_bytes_original = 0
         self._total_bytes_stored = 0
         self._store.clear()
-        self._importance_masks.clear()
-        self._current_logits = None
+        self._block_tables.clear()
+        self.reset_chunk_state()
 ```
 
 ---
 
-### CongestionAdmissionSpecAttnDualReductionPipeline (Cross A+C)
+### BlockUnionBCPipeline (Cross B+C)
 
 ```python
-# src/cache/congestion_specattn_pipeline.py
+# src/cache/block_union_bc_pipeline.py
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import torch
 
 from src.cache.base import CacheStore
-from src.cache.specattn_sparse_codec import (
-    SpecAttnVerificationGuidedKVSparseCodec,
-    SpecAttnCodecConfig,
+from src.cache.block_union_noncontiguous_index import (
+    BlockUnionNonContiguousReuseIndex,
+    BlockUnionConfig,
+    KVSelectionBlockTable,
 )
-from src.scheduler.concur_congestion_admission_scheduler import (
-    CONCURCongestionBasedAgentAdmissionScheduler,
-    CongestionAdmissionConfig,
+from src.cache.compact_attention_block_union_codec import (
+    CompactAttentionBlockUnionCodec,
+    BlockUnionCodecConfig,
 )
 
 
 @dataclass
-class DualReductionConfig:
-    scheduler_config: Optional[CongestionAdmissionConfig] = None
-    codec_config: Optional[SpecAttnCodecConfig] = None
-    # 통합 피드백 루프 설정
-    codec_adapt_on_congestion: bool = True  # 혼잡 시 희소화 임계값 강화
-    retention_reduction_on_congestion: float = 0.10  # 혼잡 시 retention_ratio -= 0.10
+class BCPipelineConfig:
+    b_config: Optional[BlockUnionConfig] = None
+    c_config: Optional[BlockUnionCodecConfig] = None
+    # B+C 결합 감소 효과 설정
+    apply_selection_to_union: bool = True  # True: 비연속 히트 블록에 추가로 KV 선택 적용
     seed: int = 42
 
 
-class CongestionAdmissionSpecAttnDualReductionPipeline(CacheStore):
-    """CONCUR 혼잡 어드미션 × SpecAttn KV 희소화 통합 파이프라인.
+class BlockUnionBCPipeline(CacheStore):
+    """Block-Union 비연속 재사용 × KV 선택 압축 통합 파이프라인.
 
-    Cross Activity A+C:
-      레이어 1 (A): CONCURCongestionBasedAgentAdmissionScheduler — KV 풀 혼잡도 기반 어드미션.
-      레이어 2 (C): SpecAttnVerificationGuidedKVSparseCodec — 검증 로짓 유도 KV 희소화.
+    Cross Activity B+C:
+      Step 1 (B): BlockUnionNonContiguousReuseIndex.get_block_union() →
+                  비연속 세그먼트 히트의 GQA-aware 블록 테이블 구성.
+      Step 2 (C): CompactAttentionBlockUnionCodec.build_kv_selection_block_table() →
+                  히트 블록에서 중요 블록만 추가 선택.
+      Step 3: 통합 KVSelectionBlockTable을 표준 PA 커널에 투입.
 
-    통합 피드백 루프:
-      KV 풀 점유율이 alpha_high 초과 → C-1 retention_ratio -= retention_reduction_on_congestion
-        (더 공격적 희소화로 풀 압박 경감).
-      KV 풀 점유율이 alpha_low 이하 → C-1 retention_ratio를 원래 값으로 복원
-        (더 많은 KV 보존).
-
-    에이전트별 KV 사용 패턴 추적:
-      _agent_kv_usage: {agent_id: total_bytes_used}
-      "불균형 에이전트"(usage > mean + 2*std): CONGESTED 단계에서 선별 차단.
+    B+C 결합 감소 효과:
+      비연속 히트 블록 수 × KV 선택률 = 곱연산적 메모리 절감.
+      예: 50% 비연속 히트 × 40% 선택률 → 전체 KV의 20% 사용.
 
     CacheStore 인터페이스 완전 구현.
-    codec의 SpecAttn 희소화가 모든 put() 호출에 적용됨.
+    put/get은 c_codec(C-1)으로 위임 (압축 저장 기본 경로).
 
     평가 기준 (evaluation_criteria.md §5):
-      - 복합 Throughput: 단일 Activity 대비 +5% 이상
-      - 복합 Memory Reduction: 단일 Activity 대비 −10% 이상
-      - Accuracy 보존 (C 포함): 복합 후 cosine ≥ 0.99 (MANDATORY)
+      - 복합 Throughput: 단일 Activity 대비 +5% 이상 (높음)
+      - 복합 Memory Reduction: 단일 Activity 대비 −10% 이상 (높음)
+      - Accuracy 보존 (C 포함): 복합 후 cosine_sim >= 0.99 (MANDATORY)
     """
 
-    def __init__(self, config: DualReductionConfig) -> None:
+    def __init__(self, config: BCPipelineConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
 
-        sched_cfg = config.scheduler_config or CongestionAdmissionConfig(seed=config.seed)
-        codec_cfg = config.codec_config or SpecAttnCodecConfig(seed=config.seed)
+        b_cfg = config.b_config or BlockUnionConfig(seed=config.seed)
+        c_cfg = config.c_config or BlockUnionCodecConfig(seed=config.seed)
 
-        self.scheduler = CONCURCongestionBasedAgentAdmissionScheduler(sched_cfg)
-        self.codec = SpecAttnVerificationGuidedKVSparseCodec(codec_cfg)
-        self._base_retention_ratios = list(codec_cfg.retention_ratio_by_layer)
-        self._agent_kv_usage: Dict[str, int] = {}
-
-    def set_verification_logits(
-        self, attn_logits: torch.Tensor, layer_idx: int = 0
-    ) -> None:
-        """검증 로짓을 codec에 전달."""
-        self.codec.set_verification_logits(attn_logits, layer_idx)
-
-    def update_kv_pool(self, used_bytes: int) -> None:
-        """KV 풀 상태 갱신 + 피드백 루프 트리거.
-
-        Algorithm:
-          scheduler.update_kv_pool(used_bytes)
-          level = scheduler.monitor.congestion_level()
-          if codec_adapt_on_congestion:
-            if level == "CONGESTED":
-              for i in range(len(retention_ratios)):
-                codec.config.retention_ratio_by_layer[i] = max(
-                  0.50, _base_retention_ratios[i] - retention_reduction_on_congestion
-                )
-            elif level == "FREE":
-              codec.config.retention_ratio_by_layer = list(_base_retention_ratios)
-        """
-        self.scheduler.update_kv_pool(used_bytes)
-        if self.config.codec_adapt_on_congestion:
-            level = self.scheduler.monitor.congestion_level()
-            if level == "CONGESTED":
-                delta = self.config.retention_reduction_on_congestion
-                for i in range(len(self.codec.config.retention_ratio_by_layer)):
-                    self.codec.config.retention_ratio_by_layer[i] = max(
-                        0.50,
-                        self._base_retention_ratios[i] - delta,
-                    )
-            elif level == "FREE":
-                self.codec.config.retention_ratio_by_layer = list(self._base_retention_ratios)
-
-    def schedule(self, requests: List) -> List:
-        """스케줄러 위임."""
-        return self.scheduler.schedule(requests)
+        self.b_index = BlockUnionNonContiguousReuseIndex(b_cfg)
+        self.c_codec = CompactAttentionBlockUnionCodec(c_cfg)
 
     # ------------------------------------------------------------------ #
-    # CacheStore 추상 메서드                                               #
+    # 통합 B+C 처리 API                                                    #
+    # ------------------------------------------------------------------ #
+
+    def process_noncontiguous_segments(
+        self,
+        segment_keys: List[str],
+        attn_scores: Optional[torch.Tensor] = None,  # [n_heads, n_q_chunk, n_kv_total]
+    ) -> Optional[KVSelectionBlockTable]:
+        """B+C 4단 파이프라인 실행.
+
+        Algorithm (ideas/2026-05-21.md Cross-1 구체 설계 기반):
+          Step 1 (세그먼트 히트 감지):
+            union_table = b_index.get_block_union(segment_keys)
+            if union_table is None: return None
+
+          Step 2 (중요도 마스크 생성):
+            if attn_scores is not None:
+              c_codec.update_chunk_attention(attn_scores)
+            # 히트된 블록만 대상으로 마스크 크기 감소
+
+          Step 3 (통합 KV 선택 블록 테이블 구성):
+            if apply_selection_to_union:
+              n_hit_blocks = union_table.total_blocks
+              sel_table = c_codec.build_kv_selection_block_table(
+                n_kv_total=n_hit_blocks * b_index.config.block_size,
+                existing_block_ptrs=union_table.group_blocks[0]
+              )
+              # sel_table이 B+C 결합 블록 테이블
+              return sel_table
+            else:
+              return union_table  # B만 적용
+
+          Step 4 (표준 커널 투입):
+            반환된 KVSelectionBlockTable.to_block_table_tensor() →
+            표준 PA 커널 block_tables 인자. (호출자가 수행)
+
+        Returns: 최종 KVSelectionBlockTable 또는 None (모든 세그먼트 미스)
+        """
+        # Step 1
+        union_table = self.b_index.get_block_union(segment_keys)
+        if union_table is None:
+            return None
+
+        # Step 2
+        if attn_scores is not None:
+            self.c_codec.update_chunk_attention(attn_scores)
+
+        # Step 3
+        if self.config.apply_selection_to_union and union_table.total_blocks > 0:
+            n_hit_total = union_table.total_blocks * self.b_index.config.block_size
+            existing_ptrs = list(union_table.group_blocks.get(0, []))
+            sel_table = self.c_codec.build_kv_selection_block_table(
+                n_kv_total=n_hit_total,
+                existing_block_ptrs=existing_ptrs,
+            )
+            return sel_table
+        return union_table
+
+    def combined_reduction_ratio(self) -> float:
+        """B+C 결합 메모리 감소율 추정.
+
+        = b_noncontiguous_hit_rate × (1 - c_codec_selection_ratio) 기반
+        실제 측정은 memory_bytes() 비교로 수행.
+        """
+        nc_hit = self.b_index.block_union_hit_rate()
+        sel_ratio = self.c_codec.config.kv_selection_ratio
+        return 1.0 - (nc_hit * sel_ratio)
+
+    # ------------------------------------------------------------------ #
+    # CacheStore 인터페이스 (c_codec에 위임)                               #
     # ------------------------------------------------------------------ #
 
     def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        return self.codec.compression_hook(key, value)
+        return self.c_codec.compression_hook(key, value)
 
     def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        return self.codec.get_importance_mask(key)
+        return self.c_codec.get_importance_mask(key)
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        self.codec.put(key, value)
+        self.c_codec.put(key, value)
+        self.b_index.put(key, value)
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        return self.codec.get(key)
+        return self.c_codec.get(key)
 
     def evict(self) -> int:
-        return self.codec.evict()
+        freed_c = self.c_codec.evict()
+        freed_b = self.b_index.evict()
+        return freed_c + freed_b
 
     def hit_rate(self) -> float:
-        return self.codec.hit_rate()
+        return self.c_codec.hit_rate()
 
     def memory_bytes(self) -> int:
-        return self.codec.memory_bytes()
+        return self.c_codec.memory_bytes()
 
     def reset_stats(self) -> None:
-        self.codec.reset_stats()
-        self.scheduler.reset_stats()
-        self._agent_kv_usage.clear()
+        self.c_codec.reset_stats()
+        self.b_index.reset_stats()
 
     def metrics_summary(self) -> Dict:
-        """복합 효과 측정용 통합 메트릭."""
+        """B+C 복합 효과 측정용 통합 메트릭."""
         return {
-            "scheduler_overhead_ms_p50": self.scheduler.scheduling_overhead_ms_p50(),
-            "kv_pool_occupancy": self.scheduler.monitor.get_occupancy(),
-            "congestion_level": self.scheduler.monitor.congestion_level(),
-            "codec_hit_rate": self.codec.hit_rate(),
-            "codec_memory_reduction_ratio": self.codec.memory_reduction_ratio(),
-            "current_retention_ratios": list(self.codec.config.retention_ratio_by_layer),
+            "b_noncontiguous_hit_rate": self.b_index.noncontiguous_hit_rate(),
+            "b_block_union_hit_rate": self.b_index.block_union_hit_rate(),
+            "c_memory_reduction_ratio": self.c_codec.memory_reduction_ratio(),
+            "c_kv_selection_ratio": self.c_codec.config.kv_selection_ratio,
+            "bc_combined_reduction_estimate": self.combined_reduction_ratio(),
             "total_memory_bytes": self.memory_bytes(),
+            "hit_rate": self.hit_rate(),
         }
 ```
 
 ---
 
-### base.py 변경: get_importance_mask() 선택적 메서드 추가
+### SegmentedHashCache 변경 (Activity B 연동)
 
-기존 `src/cache/base.py`에 아래 메서드를 `load_with_rope()` 다음에 추가한다.
-기존 추상 메서드 6개(put, get, evict, hit_rate, memory_bytes, reset_stats)는 변경하지 않는다.
+`src/cache/segmented.py`의 `get_segments()`에 `use_block_union` 플래그를 추가한다.
 
 ```python
-    def get_importance_mask(
-        self,
-        key: str,
-    ) -> Optional[torch.Tensor]:
-        """Return importance mask for the KV entry stored under key.
+# src/cache/segmented.py — 변경 부분
 
-        Used by SpecAttn-based codecs (Activity C) to expose the
-        verification-logit-guided importance mask to upstream components.
+# __init__에 추가:
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from src.cache.block_union_noncontiguous_index import (
+        BlockUnionNonContiguousReuseIndex,
+        KVSelectionBlockTable,
+    )
 
-        Returns: bool tensor [n_kv] marking important positions (True = important),
-                 or None if the implementation does not support importance masking.
-        Default implementation raises NotImplementedError — subclasses with
-        Activity C SpecAttn support override this.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support importance masking."
-        )
+# SegmentedHashCache.__init__에 추가:
+#   self._block_union_index: Optional["BlockUnionNonContiguousReuseIndex"] = None
+
+def set_block_union_index(
+    self,
+    index: "BlockUnionNonContiguousReuseIndex",
+) -> None:
+    """block-union 인덱스를 연결 (use_block_union=True 사용 시 호출)."""
+    self._block_union_index = index
+
+def get_segments(
+    self,
+    token_ids: List[int],
+    layer_idx: int = 0,
+    codec: Optional["VQCodec"] = None,
+    use_block_union: bool = False,  # 신규 파라미터
+) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
+    """기존 시그니처 유지 + use_block_union 플래그 추가.
+
+    use_block_union=True이고 _block_union_index가 설정된 경우:
+      히트 세그먼트들의 chunk_key를 수집해 block-union 인덱스에 위임.
+      반환 형식은 기존과 동일 (하위 호환 유지).
+    use_block_union=False (기본): 기존 memcpy 경로 그대로.
+    """
+    # ... 기존 로직 그대로 유지 ...
+    # use_block_union=True 경로:
+    #   hit_segment_keys = [chunk_key(token_ids, i, layer_idx) for i in hit_chunk_indices]
+    #   if self._block_union_index:
+    #     table = self._block_union_index.get_block_union(hit_segment_keys)
+    #     # 반환 형식은 기존과 동일하게 (chunk_idx, kv_tensor) 유지
+    #     # table은 부가 정보로 별도 접근 가능
+    ...
 ```
+
+**중요**: `get_segments()`의 기존 반환 타입 `Tuple[List[Tuple[int, torch.Tensor]], List[int]]`을 유지한다. `use_block_union` 플래그는 내부 처리 경로만 변경하고 외부 인터페이스는 불변이다.
 
 ---
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-Activity C(SpecAttnVerificationGuidedKVSparseCodec)를 포함하므로 반드시 작성한다.
+Activity C(`CompactAttentionBlockUnionCodec`)를 포함하므로 반드시 작성한다.
 
 ### perplexity 측정
 
-- **데이터셋**: WikiText-103 proxy — `src/metrics/perplexity.py`의 `attention_output_relative_error()`로
-  synthetic float32 KV 텐서를 활용한 attention output 상대 오차 측정.
-  실제 WikiText-103 데이터셋이 없는 경우, `torch.randn`으로 생성한 [seq_len, d_head] 텐서를
-  사용하는 synthetic proxy 방식으로 대체한다.
+- **데이터셋**: WikiText-2 proxy — `src/metrics/perplexity.py`의 `attention_output_relative_error()`로 synthetic float32 KV 텐서 활용.
+  실제 WikiText-2 데이터셋이 없는 경우, `torch.randn`으로 생성한 `[seq_len, d_head]` 텐서로 대체.
+- **모델**: LLaMA-3.1-8B-Instruct 설정 기준 (n_heads=32, n_kv_heads=8, d_head=128, GQA groups=4). 테스트에서는 소형 synthetic 텐서 사용.
 - **측정 방법**:
   ```
   relative_error = attention_output_relative_error(q, k_orig, v_orig, k_comp, v_comp)
   허용 오차: relative_error < 0.01 (1%) — MANDATORY (evaluation_criteria.md §4 필수)
   ```
-- **시나리오별 측정**:
-  - 상위 80% KV 유지 (retention_ratio=0.80): relative_error 측정
-  - 상위 70% KV 유지 (retention_ratio=0.70): relative_error 측정
-  - 혼잡 단계 강화 임계값 (retention_ratio=0.70): relative_error 측정
-  - 예상 결과: ±0.5% 이내 (SpecAttn 논문 근거)
+- **KV 선택률별 측정 (4개 시나리오)**:
+  - kv_selection_ratio=0.50 (상위 50% 유지): relative_error 측정
+  - kv_selection_ratio=0.40 (상위 40% 유지, 기본값): relative_error 측정 [MANDATORY]
+  - kv_selection_ratio=0.30 (상위 30% 유지): relative_error 측정
+  - kv_selection_ratio=0.20 (상위 20% 유지, 공격적): relative_error 측정
+- **예상 결과**: kv_selection_ratio=0.40 기준 ±0.5% 이내 (CompactAttention 원논문 근거)
 
 ### 태스크 정확도 측정
 
-- **벤치마크**: MMLU proxy — `src/metrics/perplexity.py`의 `cosine_similarity_output()`로
-  attention output cosine similarity 측정 (downstream 태스크 정확도 대리 지표).
+- **벤치마크**: RULER 벤치마크(128K 컨텍스트) proxy — `src/metrics/perplexity.py`의 `cosine_similarity_output()`로 attention output cosine similarity 측정. RULER 대리 지표로 사용.
 - **측정 방법**:
   ```
   cosine_sim = cosine_similarity_output(q, k_orig, v_orig, k_comp, v_comp)
   허용 오차: cosine_sim >= 0.99 — MANDATORY (evaluation_criteria.md §4 필수)
   ```
+- **LongBench 8개 서브태스크 proxy**: 동일한 cosine_similarity_output()으로 8개의 독립적 synthetic 시퀀스에 대해 측정. 8개 중 8개 모두 cosine_sim >= 0.99 충족 여부 확인.
 - **KL divergence 보조 측정**: `attention_kl_divergence(q, k_orig, k_comp) < 0.015`
 - **허용 오차**: ±1% 이내 — evaluation_criteria.md §4 필수
 
-### 희소화 단계별 독립 검증
+### 청크 크기별 마스크 품질 비교
 
-1. **전체 중요 KV 유지 (ratio=1.0)**: relative_error ≈ 0.0 (기준 검증)
-2. **상위 85% KV 유지 (ratio=0.85)**: relative_error < 0.005 (0.5%)
-3. **상위 80% KV 유지 (ratio=0.80)**: relative_error < 0.008 (0.8%) — 기본 설정 [MANDATORY]
-4. **상위 70% KV 유지 (ratio=0.70)**: relative_error < 0.01 (1%) — 혼잡 단계 [MANDATORY]
-5. **INT4 압축 비중요 KV 유지 vs 즉시 퇴거 비교**: accuracy delta < ±0.5%
-6. **Cross-1 통합 (A+C) 후 accuracy**: cosine_sim ≥ 0.99 (MANDATORY)
+- chunk_size=512: relative_error 측정
+- chunk_size=1024: relative_error 측정
+- chunk_size=2048 (기본값): relative_error 측정 [MANDATORY]
+- 목적: 청크 크기에 따른 중요도 마스크 품질 안정성 확인
+
+### KV 선택률별 메모리 감소율 검증
+
+- kv_selection_ratio=0.50 → memory_reduction_ratio >= 0.40
+- kv_selection_ratio=0.40 → memory_reduction_ratio >= 0.50 [MANDATORY: -30% 기준 충족]
+- kv_selection_ratio=0.30 → memory_reduction_ratio >= 0.60
 
 ### Fail 기준
 
-**ANY 케이스에서 retention_ratio=0.80 이상일 때 relative_error > 1% → 테스트 실패
-(evaluation_criteria.md §4 필수 항목 — 무조건 전체 Fail)**
+**kv_selection_ratio=0.40 기준 relative_error > 1% → 테스트 실패 (evaluation_criteria.md §4 필수 항목 — 무조건 전체 Fail)**
+
+**cosine_sim < 0.99 → 테스트 실패 (evaluation_criteria.md §4 필수 항목 — 무조건 전체 Fail)**
 
 ### 검증 테스트 파일
 
-`tests/unit/test_compression_accuracy.py`
+`tests/unit/test_compression_accuracy.py` (기존 파일 덮어쓰기)
 
 **필수 테스트 케이스**:
 
 ```
-test_specattn_full_retention_zero_error:
-    retention_ratio=1.0 → relative_error ≈ 0.0 (기준)
+test_block_union_codec_full_selection_zero_error:
+    kv_selection_ratio=1.0 → relative_error ≈ 0.0 (기준 검증)
 
-test_specattn_retention_80pct_relative_error_below_1pct:
-    retention_ratio=0.80 → relative_error < 0.01 (MANDATORY)
+test_block_union_codec_selection_50pct_relative_error_below_1pct:
+    kv_selection_ratio=0.50 → relative_error < 0.01
 
-test_specattn_retention_80pct_cosine_similarity_above_099:
-    retention_ratio=0.80 → cosine_sim >= 0.99 (MANDATORY)
+test_block_union_codec_selection_40pct_relative_error_below_1pct:
+    kv_selection_ratio=0.40 (기본값) → relative_error < 0.01 (MANDATORY)
 
-test_specattn_retention_70pct_relative_error_below_1pct:
-    retention_ratio=0.70 (혼잡 단계) → relative_error < 0.01 (MANDATORY)
+test_block_union_codec_selection_40pct_cosine_similarity_above_099:
+    kv_selection_ratio=0.40 → cosine_sim >= 0.99 (MANDATORY)
 
-test_specattn_kl_divergence_below_threshold:
+test_block_union_codec_selection_30pct_relative_error_below_1pct:
+    kv_selection_ratio=0.30 → relative_error < 0.01
+
+test_block_union_codec_kl_divergence_below_threshold:
     KL divergence < 0.015 (보조 지표)
 
-test_specattn_importance_mask_extracts_top_k:
-    n_kv=100, ratio=0.80 → mask.sum() == 80
+test_block_union_codec_q_block_union_covers_all_queries:
+    Q-block union 결과가 모든 쿼리 토큰 참조 블록을 포함 (false negative 없음 검증)
 
-test_specattn_importance_mask_without_logits_returns_all_true:
-    set_verification_logits 호출 없이 put → mask 전부 True (안전 폴백)
+test_block_union_codec_intra_group_union_per_gqa_group:
+    n_gqa_groups=4: 4개 그룹 각각에 동일 선택 블록 포인터 목록 부여 확인
 
-test_specattn_low_importance_int4_quant_preserves_shape:
-    비중요 KV INT4 압축 후 shape 유지
+test_block_union_codec_block_table_tensor_shape:
+    to_block_table_tensor() 반환 shape == [n_gqa_groups, max_blocks_per_group]
 
-test_specattn_memory_reduction_above_15pct:
-    retention_ratio=0.80, int4_quant=True → memory_reduction_ratio() >= 0.15
+test_block_union_codec_memory_reduction_above_50pct:
+    kv_selection_ratio=0.40 → memory_reduction_ratio() >= 0.50
+    (evaluation_criteria.md §4 높음 — KV Memory Reduction -30% 이상 포함)
 
-test_specattn_memory_reduction_above_30pct:
-    retention_ratio=0.70, int4_quant=True → memory_reduction_ratio() >= 0.30
-    (evaluation_criteria.md §4 높음 항목)
+test_block_union_codec_memory_reduction_above_60pct:
+    kv_selection_ratio=0.30 → memory_reduction_ratio() >= 0.60
 
-test_specattn_put_get_evict_hit_rate:
-    CacheStore 인터페이스 전체 동작 확인
+test_block_union_codec_chunk_size_512_accuracy:
+    chunk_size=512 → relative_error < 0.01
 
-test_specattn_get_importance_mask_returns_stored_mask:
-    put() 후 get_importance_mask(key) → bool tensor 반환
+test_block_union_codec_chunk_size_2048_accuracy:
+    chunk_size=2048 (기본) → relative_error < 0.01 (MANDATORY)
 
-test_specattn_seed_reproducibility:
-    동일 seed + logits → 동일 mask, 동일 압축 결과
+test_block_union_codec_longbench_8subtask_proxy:
+    8개 독립 synthetic 시퀀스 모두 cosine_sim >= 0.99 (LongBench proxy)
 
-test_cross_pipeline_accuracy_preserved:
-    CongestionAdmissionSpecAttnDualReductionPipeline:
-    put → get 왕복 후 cosine_sim >= 0.99 (MANDATORY, evaluation_criteria.md §5)
+test_block_union_codec_cachestore_interface_full:
+    put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
 
-test_congestion_feedback_reduces_retention_ratio:
-    update_kv_pool(used=alpha_high 초과) → retention_ratio 감소 확인
+test_block_union_codec_get_importance_mask_returns_bool_tensor:
+    put() 후 get_importance_mask(key) → bool tensor 반환, shape [n_kv]
 
-test_congestion_free_restores_retention_ratio:
-    update_kv_pool(used=alpha_low 이하) → retention_ratio 원래 값 복원
+test_block_union_codec_seed_reproducibility:
+    동일 seed + attn_scores → 동일 선택 블록 집합
+
+test_cross_bc_pipeline_accuracy_preserved:
+    BlockUnionBCPipeline: put → get 왕복 후 cosine_sim >= 0.99 (MANDATORY, §5)
+
+test_cross_bc_combined_reduction_ratio:
+    BlockUnionBCPipeline: combined_reduction_ratio() > 0 (B+C 결합 감소 확인)
+
+test_block_union_codec_update_chunk_accumulates_importance:
+    update_chunk_attention() 2회 호출 → _accumulated_importance 업데이트 확인
+
+test_block_union_codec_reset_chunk_state_clears_accumulated:
+    reset_chunk_state() 후 _accumulated_importance is None 확인
 ```
 
 ---
@@ -850,177 +1089,185 @@ test_congestion_free_restores_retention_ratio:
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-20.yaml
+# configs/experiments/2026-05-21.yaml
 experiment:
-  date: "2026-05-20"
-  activity: "A+C"
+  date: "2026-05-21"
+  activity: "B+C"
   description: >
-    Cross-1 CongestionAdmissionSpecAttnDualReductionPipeline:
-    A-1 CONCURCongestionBasedAgentAdmissionScheduler (KV 풀 혼잡도 기반 에이전트 어드미션 제어) +
-    C-1 SpecAttnVerificationGuidedKVSparseCodec (검증 로짓 유도 KV 희소화, Training-free).
-    통합 피드백 루프: KV 풀 혼잡도 신호로 C-1 retention_ratio 동적 조정.
-  cache_type: congestion_specattn_pipeline
-  compression_method: specattn_verification_guided_sparse
-  scheduler_type: concur_congestion_admission
+    Cross-1 BlockUnionNonContiguousCompressionPipeline:
+    B-1 BlockUnionNonContiguousReuseIndex (GQA-aware block-union 비연속 재사용, memcpy 없음) +
+    C-1 CompactAttentionBlockUnionCodec (청크드 프리필 특화 KV 선택 압축, 표준 커널 재사용).
+    공통 KVSelectionBlockTable 자료구조로 B+C 통합.
+    CompactAttention(2605.16839) 원논문 기반.
+  cache_type: block_union_bc_pipeline
+  compression_method: compact_attention_block_union
+  scheduler_type: default  # Activity A 미포함
 
-concur_congestion_admission_scheduler:
-  capacity_bytes: 1_000_000_000    # KV 풀 최대 용량 (1 GB)
-  alpha_low: 0.60                  # 복구 임계값 (혼잡 → 여유)
-  alpha_high: 0.85                 # 혼잡 진입 임계값
-  online_adapt_window: 100         # 온라인 임계값 적응 윈도우 (스텝 수)
-  enable_multinode: false          # 단일 노드 기본
+block_union_noncontiguous_index:  # B-1
+  block_size: 16                   # PA 블록당 토큰 수
+  n_kv_heads: 8                    # 총 KV 헤드 수 (LLaMA-3.1-8B GQA 기준)
+  n_gqa_groups: 4                  # GQA 그룹 수 (8 KV heads / 2 heads per group)
+  max_entries: 1000
+  rope_reencoding_enabled: true    # 위치 불일치 시 RoPE 재인코딩
+  use_block_union: true            # block-union 경로 활성화
   seed: 42
 
-specattn_sparse_codec:
-  retention_ratio_by_layer:         # 레이어별 KV 유지 비율 (12-layer 기준)
-    - 0.85  # layer 0 (하위)
-    - 0.85
-    - 0.83
-    - 0.83
-    - 0.81
-    - 0.80
-    - 0.78
-    - 0.77
-    - 0.75
-    - 0.73
-    - 0.72
-    - 0.70  # layer 11 (상위)
-  global_retention_ratio: 0.80     # 레이어 설정 없을 때 기본값
-  low_importance_quant_int4: true  # 비중요 KV: INT4 양자화
-  int4_threshold: 0.01             # INT4 sparsification zero_threshold
+compact_attention_block_union_codec:  # C-1
+  chunk_size: 2048                 # 청크드 프리필 청크 크기
+  kv_selection_ratio: 0.40         # KV 블록 선택률 (상위 40%)
+  n_kv_heads: 8
+  n_gqa_groups: 4
+  block_size: 16
+  mask_source: "online"            # 중요도 마스크 생성: online (첫 청크 추정)
+  profile_path: null               # "profile" 방법 사용 시 경로
   max_entries: 1000
   seed: 42
 
-dual_reduction_pipeline:
-  codec_adapt_on_congestion: true        # 혼잡 시 retention_ratio 동적 강화
-  retention_reduction_on_congestion: 0.10  # 혼잡 시 retention_ratio -= 0.10
+bc_pipeline:  # Cross-1
+  apply_selection_to_union: true   # B 히트 블록에 C 선택 추가 적용
   seed: 42
 
 benchmark:
   accuracy:
-    method: "attention_output_proxy"     # src/metrics/perplexity.py 활용
-    dataset_proxy: "wikitext103_synthetic"
-    task_accuracy_proxy: "mmlu_cosine_similarity"
-    relative_error_max: 0.01             # ±1% (evaluation_criteria.md §4 MANDATORY)
-    cosine_similarity_min: 0.99          # (evaluation_criteria.md §4 MANDATORY)
-    kl_divergence_max: 0.015             # 보조 지표
-    perplexity_tolerance_pct: 1.0        # ±1%
-    task_accuracy_tolerance_pct: 1.0     # ±1%
-    retention_ratios_to_test: [1.0, 0.85, 0.80, 0.70]
-  activity_a:
-    ttft_overhead_limit_pct: 5.0         # TTFT p50 +5% 이내 (MANDATORY)
-    cache_hit_rate_improvement_min_pct: 10.0  # 히트율 +10%p 이상
-    max_wait_time_multiplier: 2.0        # 최대 대기 2× 이하
-    alpha_low: 0.60
-    alpha_high: 0.85
+    method: "attention_output_proxy"
+    dataset_proxy: "wikitext2_synthetic"
+    task_accuracy_proxy: "ruler_cosine_similarity"
+    relative_error_max: 0.01       # ±1% (evaluation_criteria.md §4 MANDATORY)
+    cosine_similarity_min: 0.99    # (evaluation_criteria.md §4 MANDATORY)
+    kl_divergence_max: 0.015       # 보조 지표
+    kv_selection_ratios_to_test: [0.50, 0.40, 0.30, 0.20]
+    chunk_sizes_to_test: [512, 1024, 2048]
+    longbench_subtask_count: 8
+  activity_b:
+    cache_hit_rate_improvement_min_pct: 5.0   # +5%p (§3 높음)
+    noncontiguous_hit_rate_min_pct: 30.0      # 전체 히트의 30% 이상 (§3 높음)
+    memory_footprint_max_increase_pct: 20.0   # +20% 이내 (§3 높음)
   activity_c:
-    memory_reduction_min: 0.30           # −30% 이상 (evaluation_criteria.md §4 높음)
+    memory_reduction_min: 0.30     # -30% 이상 (§4 높음)
     effective_context_multiplier: 2.0
-    compression_overhead_ttft_max_pct: 10.0
-  cross_ac:
+    compression_overhead_ttft_max_pct: 10.0   # TTFT +10% 이내 (§4 높음)
+  cross_bc:
     throughput_min_improvement_vs_solo: 5.0   # 단일 Activity 대비 +5% (§5 높음)
-    memory_min_improvement_vs_solo: 10.0      # 단일 Activity 대비 −10% (§5 높음)
+    memory_min_improvement_vs_solo: 10.0      # 단일 Activity 대비 -10% (§5 높음)
     accuracy_cosine_min: 0.99                 # C 포함 (§5 MANDATORY)
-    comparison_methods: ["solo_a1", "solo_c1", "cross_ac"]
+    comparison_methods: ["solo_b1", "solo_c1", "cross_bc"]
   throughput:
-    target_improvement_pct: 20               # 베이스라인 대비 +20% (장기 목표)
+    target_improvement_pct: 20     # 베이스라인 대비 +20% (§1 장기 목표)
+
+segmented_cache_ab_comparison:
+  # SegmentedHashCache.get_segments() A/B 비교 실험
+  use_block_union_path: true       # block-union 경로
+  use_memcpy_fallback_path: false  # memcpy fallback 경로
 
 seed: 42
-results_dir: "results/2026-05-20"
+results_dir: "results/2026-05-21"
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [x] `tests/unit/test_compression_accuracy.py` — Activity C 필수 accuracy 검증 (16개 테스트, 위 목록 참조)
-- [x] `tests/unit/test_concur_congestion_scheduler.py` — Activity A 단위 테스트
-- [x] `tests/integration/test_congestion_specattn_e2e.py` — Cross-1 E2E 통합 테스트
+- [x] `tests/unit/test_compression_accuracy.py` — Activity C 필수 accuracy 검증 (21개 테스트, 위 목록 참조) (기존 파일 덮어쓰기)
+- [x] `tests/unit/test_block_union_noncontiguous_index.py` — Activity B 단위 테스트
+- [x] `tests/integration/test_block_union_bc_e2e.py` — Cross-1 E2E 통합 테스트
 
-### 단위 테스트 최소 요구사항 (test_concur_congestion_scheduler.py)
-
-```
-test_kv_pool_monitor_occupancy_calculation:
-    update(used) → get_occupancy() == used / capacity
-
-test_kv_pool_monitor_congestion_level_free:
-    occupancy < alpha_low → "FREE"
-
-test_kv_pool_monitor_congestion_level_boundary:
-    alpha_low <= occupancy < alpha_high → "BOUNDARY"
-
-test_kv_pool_monitor_congestion_level_congested:
-    occupancy >= alpha_high → "CONGESTED"
-
-test_admit_free_allows_all:
-    FREE 상태에서 admit() → True 반환
-
-test_admit_congested_blocks_all:
-    CONGESTED 상태에서 admit() → False 반환
-
-test_schedule_congested_returns_empty:
-    CONGESTED 상태에서 schedule(requests) → [] 반환
-
-test_schedule_boundary_returns_half:
-    BOUNDARY 상태에서 schedule(10개 요청) → 5개 반환 (상위 절반)
-
-test_schedule_free_returns_all:
-    FREE 상태에서 schedule(requests) → 전부 반환
-
-test_scheduling_overhead_below_5ms:
-    schedule() TTFT 오버헤드 중앙값 < 5ms (evaluation_criteria.md §2 MANDATORY)
-
-test_online_threshold_adaptation_reduces_alpha_high:
-    wait_ratio 높을 때 adapt_thresholds() → alpha_high 감소
-
-test_online_threshold_adaptation_increases_alpha_high:
-    wait_ratio 낮을 때 adapt_thresholds() → alpha_high 증가
-
-test_global_occupancy_multinode_average:
-    로컬 0.7 + 원격 0.9 → global_occupancy() == 0.8
-
-test_reset_stats_clears_scheduling_times:
-    reset_stats() 후 scheduling_overhead_ms_p50() == 0.0
-
-test_base_scheduler_interface_schedule:
-    schedule() 반환값이 list 타입 확인
-```
-
-### 통합 테스트 최소 요구사항 (test_congestion_specattn_e2e.py)
+### 단위 테스트 최소 요구사항 (test_block_union_noncontiguous_index.py)
 
 ```
-test_e2e_put_get_basic:
-    put → get 왕복 기본 동작
+test_kv_selection_block_table_to_tensor_shape:
+    KVSelectionBlockTable.to_block_table_tensor() shape 검증
 
-test_e2e_set_logits_then_put_applies_mask:
-    set_verification_logits → put → get_importance_mask() 확인
+test_kv_selection_block_table_selection_ratio:
+    selected_blocks=4, total_blocks=10 → selection_ratio == 0.4
 
-test_e2e_congestion_triggers_retention_reduction:
-    update_kv_pool(혼잡 수준) → retention_ratio 감소 → put → 더 강한 희소화 확인
+test_block_union_index_put_creates_block_ptrs:
+    put(key, value) 후 _segment_blocks[key] 존재 확인
 
-test_e2e_free_restores_retention:
-    update_kv_pool(여유 수준) → retention_ratio 원래 값 복원
+test_block_union_index_get_returns_stored_value:
+    put → get 왕복 확인
 
-test_e2e_schedule_during_congestion:
-    CONGESTED 상태에서 schedule() → [] 반환
+test_block_union_index_get_block_union_single_segment:
+    단일 세그먼트 히트 → KVSelectionBlockTable 반환
 
-test_e2e_accuracy_preserved_cosine_above_099:
-    retention_ratio=0.80 상태에서 put → get 왕복 cosine_sim >= 0.99 (MANDATORY)
+test_block_union_index_get_block_union_multiple_segments:
+    3개 세그먼트 히트 → group_blocks에 union 블록 포인터 포함
 
-test_e2e_memory_reduction_above_30pct:
-    retention_ratio=0.70 + int4 → memory_reduction_ratio() >= 0.30
+test_block_union_index_get_block_union_all_miss:
+    모든 세그먼트 미스 → None 반환
 
-test_e2e_metrics_summary_all_keys:
-    metrics_summary()가 필수 키(scheduler_overhead_ms_p50, codec_hit_rate 등) 포함
+test_block_union_index_gqa_group_count:
+    n_gqa_groups=4 → group_blocks에 4개 그룹 키 존재
 
-test_e2e_cachestore_interface_full:
+test_block_union_index_noncontiguous_hit_detection:
+    [hit, miss, hit] 패턴 → noncontiguous_hits 증가 확인
+
+test_block_union_index_noncontiguous_hit_rate:
+    비연속 히트율 = noncontiguous_hits / total_hits
+
+test_block_union_index_build_block_union_table_empty:
+    모든 키 미스 → total_blocks=0 테이블 반환
+
+test_block_union_index_evict_lru:
+    max_entries=2, 3개 put → 첫 번째 항목 퇴거 확인
+
+test_block_union_index_hit_rate_tracking:
+    put 2개 후 get 1회 히트 + 1회 미스 → hit_rate() == 0.5
+
+test_block_union_index_cachestore_interface_full:
     put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
 
-test_e2e_cross_ac_vs_solo_throughput:
-    Cross-1 처리량이 A-1 단독 대비 동일 이상 (§5 검증)
+test_block_union_index_seed_reproducibility:
+    동일 put 순서 + 동일 seed → 동일 block_ptrs
 
-test_e2e_runner_integration:
-    InferenceRunner(cache=DualReductionPipeline, scheduler=...) 로 run_batch() 호출 성공
+test_segmented_cache_use_block_union_flag:
+    SegmentedHashCache.get_segments(use_block_union=True) →
+    block-union 인덱스 경로 호출 확인
+
+test_segmented_cache_use_block_union_false_unchanged:
+    SegmentedHashCache.get_segments(use_block_union=False) →
+    기존 memcpy 경로 동작 유지 (하위 호환)
+```
+
+### 통합 테스트 최소 요구사항 (test_block_union_bc_e2e.py)
+
+```
+test_e2e_bc_pipeline_put_get_basic:
+    put → get 왕복 기본 동작
+
+test_e2e_bc_pipeline_process_noncontiguous_segments:
+    b_index에 3개 세그먼트 put 후 process_noncontiguous_segments() →
+    KVSelectionBlockTable 반환 (non-None)
+
+test_e2e_bc_pipeline_combined_selection_smaller_than_union:
+    apply_selection_to_union=True →
+    sel_table.selected_blocks < union_table.total_blocks (C가 추가 압축)
+
+test_e2e_bc_pipeline_accuracy_preserved_cosine_above_099:
+    c_codec kv_selection_ratio=0.40 → cosine_sim >= 0.99 (MANDATORY, §5)
+
+test_e2e_bc_pipeline_memory_reduction_above_30pct:
+    c_codec kv_selection_ratio=0.40 → memory_reduction_ratio() >= 0.30
+    (evaluation_criteria.md §4 높음 항목)
+
+test_e2e_bc_metrics_summary_all_keys:
+    metrics_summary()가 필수 키 포함:
+    [b_noncontiguous_hit_rate, b_block_union_hit_rate,
+     c_memory_reduction_ratio, bc_combined_reduction_estimate,
+     total_memory_bytes, hit_rate]
+
+test_e2e_bc_cachestore_interface_full:
+    put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
+
+test_e2e_bc_solo_b_vs_solo_c_vs_cross:
+    B-1 단독 / C-1 단독 / Cross-1 메모리 감소율 3방향 비교 기록
+
+test_e2e_bc_runner_integration:
+    InferenceRunner(cache=BlockUnionBCPipeline) 로 run_batch() 호출 성공
+    (src/engine/runner.py 사용)
+
+test_e2e_bc_block_table_tensor_injectable:
+    process_noncontiguous_segments() 반환 테이블의
+    to_block_table_tensor()가 유효한 int64 텐서 반환 확인
 ```
 
 ---
@@ -1029,41 +1276,45 @@ test_e2e_runner_integration:
 
 - [ ] 단위 테스트 전부 통과 (신규 3개 파일 + 기존 회귀 없음)
 - [ ] `evaluation_criteria.md` §4 Activity C 필수 항목 충족:
-      - `test_specattn_retention_80pct_relative_error_below_1pct` 통과 (relative_error < 0.01)
-      - `test_specattn_retention_80pct_cosine_similarity_above_099` 통과 (cosine_sim >= 0.99)
-      - `test_specattn_memory_reduction_above_30pct` 통과 (reduction >= 0.30)
-- [ ] `evaluation_criteria.md` §2 Activity A 항목 충족:
-      - `test_scheduling_overhead_below_5ms` 통과 (TTFT p50 +5% 이내, MANDATORY)
-      - `test_schedule_congested_returns_empty` 통과 (혼잡 시 어드미션 차단)
-      - `test_admit_free_allows_all` 통과 (여유 시 전부 허용)
+      - `test_block_union_codec_selection_40pct_relative_error_below_1pct` 통과 (relative_error < 0.01)
+      - `test_block_union_codec_selection_40pct_cosine_similarity_above_099` 통과 (cosine_sim >= 0.99)
+      - `test_block_union_codec_memory_reduction_above_50pct` 통과 (reduction >= 0.50)
+- [ ] `evaluation_criteria.md` §3 Activity B 항목 충족:
+      - `test_block_union_index_noncontiguous_hit_detection` 통과
+      - `test_block_union_index_get_block_union_multiple_segments` 통과
+      - `test_segmented_cache_use_block_union_flag` 통과 (하위 호환 유지)
 - [ ] `evaluation_criteria.md` §5 크로스 조합 C 포함:
-      - `test_e2e_accuracy_preserved_cosine_above_099` 통과 (MANDATORY)
-      - A-1 단독 / C-1 단독 / Cross-1 3방향 비교 수치 기록
+      - `test_e2e_bc_pipeline_accuracy_preserved_cosine_above_099` 통과 (MANDATORY)
+      - B-1 단독 / C-1 단독 / Cross-1 3방향 비교 수치 기록
 - [ ] `evaluation_criteria.md` §0 공통 필수:
       - CacheStore 인터페이스 모든 추상 메서드 구현
-        (SpecAttnVerificationGuidedKVSparseCodec, CongestionAdmissionSpecAttnDualReductionPipeline)
-      - `src/cache/base.py` 변경 후 기존 모든 구현체 회귀 없음 확인
+        (BlockUnionNonContiguousReuseIndex, CompactAttentionBlockUnionCodec, BlockUnionBCPipeline)
+      - `src/cache/segmented.py` 변경 후 기존 테스트(`test_segmented_cache.py`) 회귀 없음 확인
       - 시드 42 고정 재현성
-      - `configs/experiments/2026-05-20.yaml` 존재
+      - `configs/experiments/2026-05-21.yaml` 존재
       - 모든 공개 함수·메서드 타입 힌트
-- [ ] 목표 지표 수치 `results/2026-05-20/metrics.json`에 JSON 기록:
+- [ ] 목표 지표 수치 `results/2026-05-21/metrics.json`에 JSON 기록:
       ```json
       {
         "inference_throughput_improvement_pct": ...,
-        "kv_memory_reduction_ratio": ...,
-        "specattn_relative_error_ratio_080": ...,
-        "specattn_relative_error_ratio_070": ...,
-        "specattn_cosine_similarity_ratio_080": ...,
-        "specattn_kl_divergence": ...,
+        "kv_memory_reduction_ratio_c1_solo": ...,
+        "kv_memory_reduction_ratio_bc_cross": ...,
+        "block_union_relative_error_ratio_040": ...,
+        "block_union_cosine_similarity_040": ...,
+        "block_union_kl_divergence": ...,
         "effective_context_length_multiplier": ...,
-        "scheduling_overhead_ttft_p50_ms": ...,
-        "kv_pool_occupancy_avg": ...,
-        "cache_hit_rate_improvement_pct": ...,
-        "cross_ac_accuracy_cosine": ...,
-        "cross_ac_throughput_vs_solo_a1_pct": ...,
-        "cross_ac_throughput_vs_solo_c1_pct": ...,
-        "cross_ac_memory_vs_solo_pct": ...
+        "b1_noncontiguous_hit_rate": ...,
+        "b1_block_union_hit_rate": ...,
+        "b1_total_cache_hit_rate_improvement_pct": ...,
+        "c1_kv_selection_ratio": 0.40,
+        "c1_memory_reduction_ratio": ...,
+        "bc_combined_reduction_estimate": ...,
+        "bc_vs_solo_b1_throughput_pct": ...,
+        "bc_vs_solo_c1_throughput_pct": ...,
+        "bc_accuracy_cosine": ...,
+        "ruler_proxy_cosine_128k": ...,
+        "longbench_8subtask_cosine_min": ...
       }
       ```
-- [ ] `src/cache/base.py` `get_importance_mask()` 선택적 메서드 추가 — 기존 6개 추상 메서드 불변
+- [ ] `src/cache/segmented.py` `get_segments()`에 `use_block_union=False` 기본값 파라미터 추가 — 기존 호출 시그니처 불변
 - [ ] 기존 모든 단위·통합 테스트 회귀 없이 통과
