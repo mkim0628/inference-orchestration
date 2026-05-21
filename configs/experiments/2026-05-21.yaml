@@ -1,0 +1,71 @@
+experiment:
+  date: "2026-05-21"
+  activity: "B+C"
+  description: >
+    Cross-1 BlockUnionNonContiguousCompressionPipeline:
+    B-1 BlockUnionNonContiguousReuseIndex (GQA-aware block-union 비연속 재사용, memcpy 없음) +
+    C-1 CompactAttentionBlockUnionCodec (청크드 프리필 특화 KV 선택 압축, 표준 커널 재사용).
+    공통 KVSelectionBlockTable 자료구조로 B+C 통합.
+    CompactAttention(2605.16839) 원논문 기반.
+  cache_type: block_union_bc_pipeline
+  compression_method: compact_attention_block_union
+  scheduler_type: default  # Activity A 미포함
+
+block_union_noncontiguous_index:  # B-1
+  block_size: 16                   # PA 블록당 토큰 수
+  n_kv_heads: 8                    # 총 KV 헤드 수 (LLaMA-3.1-8B GQA 기준)
+  n_gqa_groups: 4                  # GQA 그룹 수 (8 KV heads / 2 heads per group)
+  max_entries: 1000
+  rope_reencoding_enabled: true    # 위치 불일치 시 RoPE 재인코딩
+  use_block_union: true            # block-union 경로 활성화
+  seed: 42
+
+compact_attention_block_union_codec:  # C-1
+  chunk_size: 2048                 # 청크드 프리필 청크 크기
+  kv_selection_ratio: 0.40         # KV 블록 선택률 (상위 40%)
+  n_kv_heads: 8
+  n_gqa_groups: 4
+  block_size: 16
+  mask_source: "online"            # 중요도 마스크 생성: online (첫 청크 추정)
+  profile_path: null               # "profile" 방법 사용 시 경로
+  max_entries: 1000
+  seed: 42
+
+bc_pipeline:  # Cross-1
+  apply_selection_to_union: true   # B 히트 블록에 C 선택 추가 적용
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    dataset_proxy: "wikitext2_synthetic"
+    task_accuracy_proxy: "ruler_cosine_similarity"
+    relative_error_max: 0.01       # ±1% (evaluation_criteria.md §4 MANDATORY)
+    cosine_similarity_min: 0.99    # (evaluation_criteria.md §4 MANDATORY)
+    kl_divergence_max: 0.015       # 보조 지표
+    kv_selection_ratios_to_test: [0.50, 0.40, 0.30, 0.20]
+    chunk_sizes_to_test: [512, 1024, 2048]
+    longbench_subtask_count: 8
+  activity_b:
+    cache_hit_rate_improvement_min_pct: 5.0   # +5%p (§3 높음)
+    noncontiguous_hit_rate_min_pct: 30.0      # 전체 히트의 30% 이상 (§3 높음)
+    memory_footprint_max_increase_pct: 20.0   # +20% 이내 (§3 높음)
+  activity_c:
+    memory_reduction_min: 0.30     # -30% 이상 (§4 높음)
+    effective_context_multiplier: 2.0
+    compression_overhead_ttft_max_pct: 10.0   # TTFT +10% 이내 (§4 높음)
+  cross_bc:
+    throughput_min_improvement_vs_solo: 5.0   # 단일 Activity 대비 +5% (§5 높음)
+    memory_min_improvement_vs_solo: 10.0      # 단일 Activity 대비 -10% (§5 높음)
+    accuracy_cosine_min: 0.99                 # C 포함 (§5 MANDATORY)
+    comparison_methods: ["solo_b1", "solo_c1", "cross_bc"]
+  throughput:
+    target_improvement_pct: 20     # 베이스라인 대비 +20% (§1 장기 목표)
+
+segmented_cache_ab_comparison:
+  # SegmentedHashCache.get_segments() A/B 비교 실험
+  use_block_union_path: true       # block-union 경로
+  use_memcpy_fallback_path: false  # memcpy fallback 경로
+
+seed: 42
+results_dir: "results/2026-05-21"

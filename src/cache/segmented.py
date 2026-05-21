@@ -9,6 +9,10 @@ from src.cache.base import CacheStore
 
 if TYPE_CHECKING:
     from src.compression.vq_codec import VQCodec
+    from src.cache.block_union_noncontiguous_index import (
+        BlockUnionNonContiguousReuseIndex,
+        KVSelectionBlockTable,
+    )
 
 
 class SegmentedHashCache(CacheStore):
@@ -26,6 +30,7 @@ class SegmentedHashCache(CacheStore):
         self._misses = 0
         self._noncontiguous_hits = 0
         self._importance: Dict[str, float] = {}  # chunk importance scores
+        self._block_union_index: Optional["BlockUnionNonContiguousReuseIndex"] = None
 
     # ------------------------------------------------------------------ #
     # CacheStore interface                                                 #
@@ -126,11 +131,17 @@ class SegmentedHashCache(CacheStore):
         token_ids: List[int],
         layer_idx: int = 0,
         codec: Optional["VQCodec"] = None,
+        use_block_union: bool = False,
     ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
         """Look up all chunks for a given layer; return (hits, miss_chunk_indices).
 
         hits: list of (chunk_idx, kv_tensor) for cache hits
         misses: list of chunk_idx values that were not cached
+
+        use_block_union=True이고 _block_union_index가 설정된 경우:
+          히트 세그먼트들의 chunk_key를 수집해 block-union 인덱스에 위임.
+          반환 형식은 기존과 동일 (하위 호환 유지).
+        use_block_union=False (기본): 기존 memcpy 경로 그대로.
         """
         n_chunks = max(1, (len(token_ids) + self.chunk_size - 1) // self.chunk_size)
         hits: List[Tuple[int, torch.Tensor]] = []
@@ -151,7 +162,20 @@ class SegmentedHashCache(CacheStore):
                 if any(m < idx for m in miss_set):
                     self._noncontiguous_hits += 1
 
+        # block-union 경로: 히트 세그먼트 키를 block-union 인덱스에 위임
+        if use_block_union and self._block_union_index is not None:
+            hit_keys = [self.chunk_key(token_ids, i, layer_idx) for i, _ in hits]
+            if hit_keys:
+                self._block_union_index.get_block_union(hit_keys)
+
         return hits, misses
+
+    def set_block_union_index(
+        self,
+        index: "BlockUnionNonContiguousReuseIndex",
+    ) -> None:
+        """block-union 인덱스를 연결 (use_block_union=True 사용 시 호출)."""
+        self._block_union_index = index
 
     def noncontiguous_hit_rate(self) -> float:
         """Fraction of hits that are non-contiguous (out-of-prefix)."""
