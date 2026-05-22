@@ -202,14 +202,23 @@ class DapQPositionAwareEvictionAttentionHook:
         config: Optional["DapQAttentionHookConfig"] = None,
         *,
         enabled: bool = True,
+        budget_ratio: Optional[float] = None,
+        recent_window: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
         """
         Args:
-            config: DapQAttentionHookConfig. If None, uses defaults.
+            config: DapQAttentionHookConfig. If None, uses defaults (or convenience kwargs).
             enabled: If False, write_to_cache / read_from_cache act as passthrough.
+            budget_ratio: Convenience kwarg — fraction of KV to retain (overrides config default).
+            recent_window: Convenience kwarg — recent tokens always preserved (overrides config default).
+            **kwargs: Additional keyword arguments forwarded to DapQAttentionHookConfig if needed.
         """
         if config is None:
-            config = DapQAttentionHookConfig()
+            config = DapQAttentionHookConfig(
+                budget_ratio=budget_ratio if budget_ratio is not None else 0.30,
+                recent_window=recent_window if recent_window is not None else 32,
+            )
         self.config = config
         self.enabled = enabled
 
@@ -248,14 +257,15 @@ class DapQPositionAwareEvictionAttentionHook:
     def write_to_cache(
         self,
         kv_key: str,
+        layer_idx: int,
         key_tensor: "torch.Tensor",
         value_tensor: "torch.Tensor",
-        layer_idx: int = 0,
+        *,
         pos_decode: Optional[int] = None,
     ) -> Tuple["torch.Tensor", "torch.Tensor"]:
         """Store compact K/V in auxiliary segment store; return ORIGINAL tensors.
 
-        CORRECTED DESIGN (loop 2, 2026-05-22):
+        CORRECTED DESIGN (loop 3, 2026-05-22):
             Computes DapQ compact K/V (selected tokens gathered contiguously) and
             stores them in self._segment_store[(kv_key, layer_idx)].
             Returns the ORIGINAL key_tensor / value_tensor UNCHANGED so the vLLM
@@ -264,10 +274,10 @@ class DapQPositionAwareEvictionAttentionHook:
 
         Args:
             kv_key: String key for the segment (e.g. "{request_id}_layer_{layer_idx}").
+            layer_idx: Transformer layer index (second positional arg, for per-layer q_template selection).
             key_tensor: Key tensor [seq_len, d_head] or [seq_len, n_heads, d_head].
             value_tensor: Value tensor — same shape as key_tensor.
-            layer_idx: Transformer layer index (for per-layer q_template selection).
-            pos_decode: Current decode position. If None, inferred from seq_len.
+            pos_decode: Current decode position (keyword-only). If None, inferred from seq_len.
 
         Returns:
             (key_tensor, value_tensor): The ORIGINAL tensors, unchanged.
@@ -605,7 +615,7 @@ def apply_dapq_patch(
                     # write_to_cache returns ORIGINAL key/value unchanged — primary
                     # attention kernel receives full unmodified KV (zero error).
                     key, value = hook.write_to_cache(
-                        kv_key, key, value, layer_idx=0
+                        kv_key, 0, key, value
                     )
                 return _original_forward(
                     self_impl, layer, query, key, value, kv_cache,
@@ -745,7 +755,7 @@ class DapQDualReductionAttentionHook:
         #         returns original tensors unchanged for the primary attention kernel.
         kv_key = f"{session_id}_turn{turn_id}_layer{layer_idx}_chunk{chunk_idx}"
         orig_k, orig_v = self._dapq_hook.write_to_cache(
-            kv_key, key_tensor, value_tensor, layer_idx=layer_idx
+            kv_key, layer_idx, key_tensor, value_tensor
         )
 
         # Step 2: Register compact K/V in session-aware segment cache (Activity B)
