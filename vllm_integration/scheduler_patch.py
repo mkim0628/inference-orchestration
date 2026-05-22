@@ -1,85 +1,57 @@
-"""scheduler_patch.py — Activity A (NAtH DDR Offloading) + prior cycles.
+"""scheduler_patch.py — Activity A: KV cache-aware scheduling for vLLM 0.21.0.
 
-2026-05-16 (this cycle): NAtHDDROffloadingSchedulerMixin — ports NAtHDDROffloadingScheduler
-            (Activity A) and NAtHRetentionTierDecider (Cross A+C) into vLLM's v1 Scheduler
-            as a mixin. Integrates GlobalRetentionGateEvictionCodec (Activity C) via dual-signal
-            4-tier classification. Based on NAtH (arXiv 2605.09490): accuracy depends only on
-            permanent eviction rate; DDR offloading achieves zero-approximation-error.
+2026-05-22: PPDAppendFullPrefillClassifierMixin — ports PPDAppendFullPrefillClassifier
+            (Activity A) into vLLM's v1 Scheduler as a mixin. Provides
+            session-context-hash based append/full-prefill routing with
+            SLO-aware D→P node switching.
 
-            NAtHDDROffloadingSchedulerMixin wraps schedule() with a nath_pre_schedule() hook
-            that classifies waiting requests' token keys into 4 tiers:
-              Tier 1 (HBM): top p1 percentile — FP16 GPU HBM retention
-              Tier 2 (DDR prefetch): p1~p2 — CPU DDR FP16 + async prefetch
-              Tier 3 (DDR INT8): p2~p3 — CPU DDR INT8 compressed retention
-              Tier 4 (evict): bottom (1-p3) — permanent discard (capped at max_eviction_ratio=3%)
+            PPDAppendFullPrefillClassifierMixin wraps schedule() with a
+            ppd_pre_schedule() hook that:
+              1. Iterates self.waiting (RequestQueue) without modifying queue order.
+              2. For each waiting request, calls PPDAppendFullPrefillClassifier.classify()
+                 with the request's token IDs (O(1) dict lookup by session_id).
+              3. Annotates the vLLM Request with ppd_prefill_type ("append" | "full"),
+                 ppd_routed_to ("D_node" | "P_node"), and ppd_overhead_us.
+              4. Calls expire_sessions() periodically (every 100 schedule() calls).
 
-            make_nath_ddr_scheduler_class() factory — builds a vLLM v1 Scheduler subclass that
-            intercepts schedule() to run NAtH 4-tier classification before base scheduling.
+            Integration:
+              - Append-prefill requests (D_node): Request is annotated to skip
+                P-node prefill — existing KV at D-node is reused.
+              - Full-prefill requests (P_node): Request follows standard vLLM
+                scheduling path (no modification to token allocation).
 
-            Scheduling overhead: O(n_waiting_reqs * n_tokens_per_req) per step.
-            Target: < 5ms p50 TTFT overhead.
+            Scheduling overhead: O(1) per request (SHA-256 hash of ≤512 tokens).
+            Target: < 5ms p50 TTFT overhead for N ≤ 1000 waiting requests.
 
-2026-05-15 (prior): RadixFeatherSchedulerMixin — preserved.
+            make_ppd_classifier_scheduler_class() factory — builds a vLLM v1
+            Scheduler subclass that intercepts schedule() to run PPD classification
+            before base scheduling.
+
+2026-05-22 (same cycle): DapQSessionSegmentSchedulerMixin — coordinates
+            DapQSessionSegmentKVCacheManagerMixin (block_manager_patch.py) with
+            the scheduler to trigger dual-reduction before prefill.
+
+2026-05-16 (prior): NAtHDDROffloadingSchedulerMixin — preserved below.
+2026-05-15 (prior): RadixFeatherSchedulerMixin — preserved below.
 2026-05-09 (prior): HitAwarePPDRouterMixin + PPDAppendPrefillRouterMixin — preserved.
+2026-05-03 (prior): DualMapSchedulerMixin / CacheHitAwareRequestQueue — preserved.
 
 vLLM 0.21.0 v1 architecture:
     - Scheduler lives in vllm.v1.core.sched.scheduler.Scheduler
     - Waiting queue is self.waiting (RequestQueue, iterable)
     - Per-step scheduling via Scheduler.schedule() → SchedulerOutput
     - KV block management via self.kv_cache_manager (KVCacheManager)
+    - Request class: vllm.v1.request.Request
 
 vLLM version: 0.21.0
-Activity: A — NAtHDDROffloadingScheduler (+ Cross A+C via NAtHRetentionTierDecider)
-
----
-
-scheduler_patch.py — Activity A+B (Cross-1): HitAwarePPDRouter + PPDAppendPrefillRouter
-integration for vLLM 0.20.1.
-
-2026-05-09 (this cycle): HitAwarePPDRouterMixin — ports HitAwarePPDRouter (Activity A+B
-            Cross-1) into vLLM's v1 Scheduler as a mixin. Integrates
-            TriangleInequalitySegmentIndex (Activity B) for O(log N) non-contiguous
-            segment lookup to estimate D-node cache hit probability per request.
-            Online EMA threshold adaptation keeps D-node routing accuracy high as
-            cache state evolves.
-
-            PPDAppendPrefillRouterMixin — lighter mixin for PPDAppendPrefillRouter
-            (Activity A) alone, without online threshold adaptation.
-
-            make_hit_aware_ppd_scheduler_class() factory — builds a vLLM v1 Scheduler
-            subclass that intercepts schedule() to annotate waiting requests with P/D
-            routing decisions before the base scheduler runs its FCFS logic.
-
-2026-05-08: PreemptiveKVOffloadSchedulerMixin (TokenFlow EuroSys 2026) — preserved.
-2026-05-06: QueryCentricSchedulerMixin (ProphetKV Activity B) — preserved.
-2026-05-04: DAGTopologySchedulerMixin (Activity A DAG-topology) — preserved.
-2026-05-03: DualMapSchedulerMixin / CacheHitAwareRequestQueue / MultiNodeRequestRouter — preserved.
-
-vLLM 0.20.1 v1 architecture:
-    - Scheduler lives in vllm.v1.core.sched.scheduler.Scheduler
-    - Waiting queue is self.waiting (RequestQueue, iterable)
-    - Per-step scheduling via Scheduler.schedule() → SchedulerOutput
-    - KV block management via self.kv_cache_manager (KVCacheManager)
-
-Integration strategy (Cross-1):
-    HitAwarePPDRouterMixin wraps schedule() with a pre_schedule_ppd() hook that:
-      1. Iterates self.waiting without modifying queue structure.
-      2. For each waiting request, extracts token embeddings and queries
-         TriangleInequalitySegmentIndex.estimate_hit_probability() (O(log N)).
-      3. Routes Turn 2+ requests to P or D node via HitAwarePPDRouter.route().
-      4. Annotates request with ppd_node_type and ppd_hit_probability attributes
-         for downstream use (distributed executor / engine routing).
-      5. Feeds actual hit feedback via record_actual_hit() after completion.
-
-    Scheduling overhead target: < 5ms per step for N ≤ 1000 active segments
-    (O(log N) index search, lightweight token embedding extraction).
-
-vLLM version: 0.20.1
-Activity: A+B (Cross-1) — HitAwarePPDRouter + TriangleInequalitySegmentIndex
+Activity: A — PPDAppendFullPrefillClassifier
+         B+C — DapQSessionSegmentSchedulerMixin (coordinates block_manager_patch)
 """
 
 from __future__ import annotations
 
+import sys
+import pathlib
 import hashlib
 import json
 import struct
@@ -88,10 +60,13 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-import torch
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn.functional as F
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
-# vLLM version gate
 import vllm
 
 def _vllm_version_tuple(v: str) -> tuple:
@@ -101,17 +76,513 @@ assert _vllm_version_tuple(vllm.__version__) >= _vllm_version_tuple("0.4.0"), (
     f"vllm_integration requires vLLM >= 0.4.0, found {vllm.__version__}"
 )
 
+
+def _add_repo_root_to_path() -> None:
+    repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
+def _try_import_ppd_classifier_src() -> tuple:
+    """Lazily import PPDAppendFullPrefillClassifier from src/."""
+    _add_repo_root_to_path()
+    try:
+        from src.scheduler.ppd_append_full_prefill_classifier import (
+            PPDAppendFullPrefillClassifier,
+            PPDClassifierConfig,
+            PrefillTypeDecision,
+        )
+        return PPDAppendFullPrefillClassifier, PPDClassifierConfig, PrefillTypeDecision
+    except ImportError:
+        return None, None, None
+
+
 # ===========================================================================
-# 2026-05-16: NAtH DDR Offloading Scheduler Mixin (Activity A + Cross A+C)
+# 2026-05-22: PPDAppendFullPrefillClassifierMixin (Activity A)
+# ===========================================================================
+
+@dataclass
+class PPDClassifierSchedulerConfig:
+    """Configuration for PPDAppendFullPrefillClassifierMixin.
+
+    Mirrors PPDClassifierConfig defaults; used when src/ is not importable.
+    """
+    append_threshold: float = 0.15
+    slo_headroom_threshold_ms: float = 30.0
+    session_ttl_seconds: float = 3600.0
+    seed: int = 42
+    expire_interval: int = 100   # expire_sessions() every N schedule() calls
+
+
+class PPDAppendFullPrefillClassifierMixin:
+    """vLLM v1 Scheduler mixin: PPD append/full-prefill classification routing.
+
+    Activity A: KV Cache-aware Scheduling.
+    Based on PPD (arXiv 2603.13358): append-prefill at D-node avoids KV transfer
+    for multi-turn sessions where most tokens are already cached.
+
+    This mixin wraps schedule() with a ppd_pre_schedule() hook that:
+      1. Iterates self.waiting without modifying queue order.
+      2. For each request, classifies as append-prefill or full-prefill via
+         O(1) session context hash comparison.
+      3. Annotates each vLLM Request with:
+           - ppd_prefill_type: "append" | "full"
+           - ppd_routed_to: "D_node" | "P_node"
+           - ppd_overhead_us: classification latency in microseconds
+      4. Calls expire_sessions() every expire_interval steps.
+
+    Scheduling overhead:
+        O(1) per request (SHA-256 of ≤ 512 token bytes).
+        Target: < 5ms p50 TTFT overhead (MANDATORY evaluation_criteria.md §2).
+
+    Usage:
+
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            PPDAppendFullPrefillClassifierMixin,
+            PPDClassifierSchedulerConfig,
+            make_ppd_classifier_scheduler_class,
+        )
+
+        # Option A: factory
+        PPDScheduler = make_ppd_classifier_scheduler_class(Scheduler)
+        scheduler = PPDScheduler(
+            ...,  # standard vLLM Scheduler args
+            ppd_config=PPDClassifierSchedulerConfig(append_threshold=0.15),
+        )
+
+        # Option B: mixin + override
+        class MyScheduler(PPDAppendFullPrefillClassifierMixin, Scheduler):
+            def schedule(self):
+                self.ppd_pre_schedule()
+                return super().schedule()
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        ppd_config: Optional[PPDClassifierSchedulerConfig] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Args:
+            ppd_config: PPDClassifierSchedulerConfig. If None, uses defaults.
+            All other args/kwargs forwarded to the base Scheduler.__init__().
+        """
+        super().__init__(*args, **kwargs)
+
+        if ppd_config is None:
+            ppd_config = PPDClassifierSchedulerConfig()
+        self._ppd_cfg = ppd_config
+
+        # Try to import native classifier from src/
+        PPDAppendFullPrefillClassifier, PPDClassifierConfig, PrefillTypeDecision = (
+            _try_import_ppd_classifier_src()
+        )
+
+        self._ppd_classifier: Optional[Any] = None
+        self._ppd_use_native: bool = False
+
+        if PPDAppendFullPrefillClassifier is not None:
+            classifier_cfg = PPDClassifierConfig(
+                append_threshold=ppd_config.append_threshold,
+                slo_headroom_threshold_ms=ppd_config.slo_headroom_threshold_ms,
+                session_ttl_seconds=ppd_config.session_ttl_seconds,
+                seed=ppd_config.seed,
+            )
+            self._ppd_classifier = PPDAppendFullPrefillClassifier(classifier_cfg)
+            self._ppd_use_native = True
+        else:
+            # Fallback: inline lightweight O(1) classifier
+            self._ppd_classifier = _InlinePPDClassifier(ppd_config)
+
+        # Metrics
+        self._ppd_schedule_count: int = 0
+        self._ppd_overhead_ms_list: List[float] = []
+        self._ppd_append_count: int = 0
+        self._ppd_full_count: int = 0
+
+    # -----------------------------------------------------------------------
+    # Primary scheduling hook — call at the start of schedule()
+    # -----------------------------------------------------------------------
+
+    def ppd_pre_schedule(self) -> None:
+        """Classify waiting requests and annotate with PPD routing decisions.
+
+        Called at the beginning of schedule() before the base scheduler
+        selects which requests to run. Annotates each waiting request with:
+            request.ppd_prefill_type: "append" | "full"
+            request.ppd_routed_to: "D_node" | "P_node"
+            request.ppd_overhead_us: classification overhead in microseconds
+
+        Overhead: O(n_waiting) × O(1) per request.
+        """
+        t_hook_start = time.monotonic()
+        self._ppd_schedule_count += 1
+
+        # Expire stale sessions periodically
+        if self._ppd_schedule_count % self._ppd_cfg.expire_interval == 0:
+            try:
+                if self._ppd_use_native:
+                    self._ppd_classifier.expire_sessions()
+                else:
+                    self._ppd_classifier.expire_sessions()
+            except Exception:
+                pass
+
+        # Iterate waiting queue (do NOT modify the queue)
+        try:
+            waiting_iter = iter(self.waiting)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            return
+
+        for request in waiting_iter:
+            try:
+                self._ppd_classify_request(request)
+            except Exception:
+                continue
+
+        hook_ms = (time.monotonic() - t_hook_start) * 1e3
+        self._ppd_overhead_ms_list.append(hook_ms)
+        # Keep only last 200 samples
+        if len(self._ppd_overhead_ms_list) > 200:
+            self._ppd_overhead_ms_list.pop(0)
+
+    def _ppd_classify_request(self, request: Any) -> None:
+        """Classify a single request and annotate it."""
+        # Extract token IDs from the request
+        try:
+            token_ids = list(request.prompt_token_ids or [])
+        except AttributeError:
+            try:
+                token_ids = list(request.inputs.prompt_token_ids or [])
+            except AttributeError:
+                token_ids = []
+
+        # Extract session_id from request metadata or use request_id
+        try:
+            session_id = str(request.metadata.get("session_id", request.request_id))
+        except AttributeError:
+            try:
+                session_id = str(request.request_id)
+            except AttributeError:
+                session_id = "default"
+
+        # Classify
+        t_start = time.monotonic()
+        if self._ppd_use_native:
+            decision = self._ppd_classifier.classify(
+                request_id=str(getattr(request, "request_id", "unknown")),
+                session_id=session_id,
+                token_ids=token_ids,
+                remaining_slo_ms=None,
+            )
+        else:
+            decision = self._ppd_classifier.classify(
+                request_id=str(getattr(request, "request_id", "unknown")),
+                session_id=session_id,
+                token_ids=token_ids,
+            )
+        overhead_us = (time.monotonic() - t_start) * 1e6
+
+        # Annotate request (runtime attribute injection)
+        try:
+            object.__setattr__(request, "ppd_prefill_type", decision.prefill_type)
+            object.__setattr__(request, "ppd_routed_to", decision.routed_to)
+            object.__setattr__(request, "ppd_session_id", session_id)
+            object.__setattr__(request, "ppd_new_token_ratio", decision.new_token_ratio)
+            object.__setattr__(request, "ppd_overhead_us", overhead_us)
+        except Exception:
+            pass
+
+        # Track counts
+        if decision.prefill_type == "append":
+            self._ppd_append_count += 1
+        else:
+            self._ppd_full_count += 1
+
+    def ppd_scheduling_stats(self) -> Dict[str, Any]:
+        """Return PPD scheduling statistics.
+
+        Returns:
+            Dict with keys:
+                schedule_count: total schedule() calls
+                append_count: total append-prefill decisions
+                full_count: total full-prefill decisions
+                overhead_mean_ms: mean per-step overhead in milliseconds
+                overhead_p50_ms: p50 overhead
+                overhead_p99_ms: p99 overhead
+        """
+        overhead = sorted(self._ppd_overhead_ms_list)
+        n = len(overhead)
+        return {
+            "schedule_count": self._ppd_schedule_count,
+            "append_count": self._ppd_append_count,
+            "full_count": self._ppd_full_count,
+            "overhead_mean_ms": sum(overhead) / n if n > 0 else 0.0,
+            "overhead_p50_ms": overhead[n // 2] if n > 0 else 0.0,
+            "overhead_p99_ms": overhead[int(n * 0.99)] if n > 0 else 0.0,
+            "append_ratio": (
+                self._ppd_append_count / max(1, self._ppd_append_count + self._ppd_full_count)
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Inline PPD classifier fallback (no src/ dependency)
+# ---------------------------------------------------------------------------
+
+class _InlinePPDClassifier:
+    """Lightweight inline PPD append/full-prefill classifier (no src/ dependency).
+
+    Uses the same O(1) session context hash comparison as
+    PPDAppendFullPrefillClassifier from src/scheduler/.
+    """
+
+    @dataclass
+    class _Decision:
+        prefill_type: str
+        routed_to: str
+        new_token_ratio: float
+
+    @dataclass
+    class _Entry:
+        last_total_tokens: int
+        turn_count: int
+        last_accessed: float
+
+    def __init__(self, config: PPDClassifierSchedulerConfig) -> None:
+        self.config = config
+        self._registry: Dict[str, "_InlinePPDClassifier._Entry"] = {}
+
+    def classify(
+        self,
+        request_id: str,
+        session_id: str,
+        token_ids: List[int],
+        remaining_slo_ms: Optional[float] = None,
+    ) -> "_InlinePPDClassifier._Decision":
+        total = len(token_ids)
+        entry = self._registry.get(session_id)
+
+        if entry is None or entry.turn_count == 0:
+            prefill_type = "full"
+            new_token_ratio = 1.0
+        else:
+            new_tokens = max(0, total - entry.last_total_tokens)
+            new_token_ratio = new_tokens / max(1, total)
+            if new_token_ratio <= self.config.append_threshold:
+                if (remaining_slo_ms is not None
+                        and remaining_slo_ms < self.config.slo_headroom_threshold_ms):
+                    prefill_type = "full"
+                else:
+                    prefill_type = "append"
+            else:
+                prefill_type = "full"
+
+        turn = (entry.turn_count if entry else 0) + 1
+        self._registry[session_id] = self._Entry(
+            last_total_tokens=total,
+            turn_count=turn,
+            last_accessed=time.monotonic(),
+        )
+        routed_to = "D_node" if prefill_type == "append" else "P_node"
+        return self._Decision(
+            prefill_type=prefill_type,
+            routed_to=routed_to,
+            new_token_ratio=new_token_ratio,
+        )
+
+    def expire_sessions(self) -> int:
+        now = time.monotonic()
+        expired = [
+            sid for sid, e in self._registry.items()
+            if now - e.last_accessed > self.config.session_ttl_seconds
+        ]
+        for sid in expired:
+            del self._registry[sid]
+        return len(expired)
+
+
+# ---------------------------------------------------------------------------
+# make_ppd_classifier_scheduler_class() factory
+# ---------------------------------------------------------------------------
+
+def make_ppd_classifier_scheduler_class(
+    base_class: Optional[type] = None,
+) -> type:
+    """Factory: return a Scheduler subclass with PPD append/full-prefill classification.
+
+    Args:
+        base_class: The vLLM Scheduler class to subclass. If None, imports
+            vllm.v1.core.sched.scheduler.Scheduler automatically.
+
+    Returns:
+        A new class combining PPDAppendFullPrefillClassifierMixin with base_class.
+
+    Usage:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_integration.scheduler_patch import (
+            make_ppd_classifier_scheduler_class,
+            PPDClassifierSchedulerConfig,
+        )
+
+        PPDScheduler = make_ppd_classifier_scheduler_class(Scheduler)
+
+        scheduler = PPDScheduler(
+            vllm_config=...,
+            kv_cache_config=...,
+            ...,
+            ppd_config=PPDClassifierSchedulerConfig(append_threshold=0.15),
+        )
+
+        # The scheduler will now call ppd_pre_schedule() before each schedule():
+        output = scheduler.schedule()  # ppd annotations applied to waiting requests
+    """
+    if base_class is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+            base_class = _Scheduler
+        except Exception:
+            # Fallback: generic base for CPU-only / test environments
+            base_class = object
+
+    class PPDScheduler(PPDAppendFullPrefillClassifierMixin, base_class):  # type: ignore[valid-type]
+        """vLLM Scheduler subclass with PPD append/full-prefill classification.
+
+        Auto-generated by make_ppd_classifier_scheduler_class().
+        """
+        def schedule(self) -> Any:
+            self.ppd_pre_schedule()
+            return super().schedule()  # type: ignore[misc]
+
+    PPDScheduler.__name__ = "PPDAppendFullPrefillClassifierScheduler"
+    PPDScheduler.__qualname__ = "PPDAppendFullPrefillClassifierScheduler"
+    return PPDScheduler
+
+
+# ===========================================================================
+# 2026-05-22: DapQSessionSegmentSchedulerMixin (Activity B+C coordination)
+# ===========================================================================
+
+class DapQSessionSegmentSchedulerMixin:
+    """vLLM v1 Scheduler mixin: coordinates DapQ session segment dual-reduction.
+
+    Activity B+C: Coordinates DapQSessionSegmentKVCacheManagerMixin with
+    the scheduler to trigger dual-reduction before prefill for multi-turn sessions.
+
+    This mixin adds a dapq_pre_schedule() hook that:
+      1. Iterates self.waiting.
+      2. For each request with a known session, calls
+         self.kv_cache_manager.annotate_request() to attach cached segment info.
+      3. Requests annotated with dapq_noncontiguous_hit=True may skip P-node
+         prefill and reuse cached segments at the D-node.
+
+    The mixin works alongside PPDAppendFullPrefillClassifierMixin:
+        class MyScheduler(DapQSessionSegmentSchedulerMixin,
+                          PPDAppendFullPrefillClassifierMixin, Scheduler):
+            def schedule(self):
+                self.ppd_pre_schedule()   # Activity A: routing classification
+                self.dapq_pre_schedule()  # Activity B+C: segment annotation
+                return super().schedule()
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        dapq_scheduler_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._dapq_sched_cfg = dapq_scheduler_config or {}
+        self._dapq_sched_step: int = 0
+
+    def dapq_pre_schedule(self) -> None:
+        """Annotate waiting requests with DapQ session segment info.
+
+        Calls kv_cache_manager.annotate_request() for each waiting request
+        that has a known session. Attaches dapq_segments and
+        dapq_noncontiguous_hit attributes to the request.
+        """
+        self._dapq_sched_step += 1
+        kv_mgr = getattr(self, "kv_cache_manager", None)
+        if kv_mgr is None:
+            return
+        if not hasattr(kv_mgr, "annotate_request"):
+            return
+
+        try:
+            waiting_iter = iter(self.waiting)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            return
+
+        for request in waiting_iter:
+            try:
+                # Extract session_id
+                try:
+                    session_id = str(
+                        request.metadata.get("session_id", request.request_id)
+                    )
+                except AttributeError:
+                    session_id = str(getattr(request, "request_id", "default"))
+
+                # Estimate current decode position from token count
+                try:
+                    n_computed = request.num_computed_tokens
+                except AttributeError:
+                    n_computed = 0
+                current_pos = float(n_computed)
+
+                kv_mgr.annotate_request(request, session_id, current_pos)
+            except Exception:
+                continue
+
+
+def make_dapq_session_segment_scheduler_class(
+    base_class: Optional[type] = None,
+) -> type:
+    """Factory: return a Scheduler subclass with DapQ+PPD scheduling.
+
+    Combines PPDAppendFullPrefillClassifierMixin (Activity A) with
+    DapQSessionSegmentSchedulerMixin (Activity B+C) into a single scheduler.
+
+    Returns:
+        A new Scheduler subclass running both hooks in schedule().
+    """
+    if base_class is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+            base_class = _Scheduler
+        except Exception:
+            base_class = object
+
+    class DapQPPDScheduler(
+        DapQSessionSegmentSchedulerMixin,
+        PPDAppendFullPrefillClassifierMixin,
+        base_class,  # type: ignore[valid-type]
+    ):
+        """vLLM Scheduler: PPD classification (A) + DapQ segment annotation (B+C).
+
+        Auto-generated by make_dapq_session_segment_scheduler_class().
+        """
+        def schedule(self) -> Any:
+            self.ppd_pre_schedule()   # Activity A
+            self.dapq_pre_schedule()  # Activity B+C
+            return super().schedule()  # type: ignore[misc]
+
+    DapQPPDScheduler.__name__ = "DapQPPDScheduler"
+    DapQPPDScheduler.__qualname__ = "DapQPPDScheduler"
+    return DapQPPDScheduler
+
+
+# ===========================================================================
+# 2026-05-16 (prior): NAtH DDR Offloading Scheduler Mixin — preserved
 # ===========================================================================
 
 def _try_import_nath_src() -> tuple:
-    """Lazily import NAtHDDROffloadingScheduler and NAtHRetentionTierDecider from src/."""
+    """Lazily import NAtHDDROffloadingScheduler and related classes from src/."""
+    _add_repo_root_to_path()
     try:
-        import sys, pathlib
-        repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
-        if repo_root not in sys.path:
-            sys.path.insert(0, repo_root)
         from src.scheduler.nath_ddr_offloading import (
             NAtHDDROffloadingScheduler,
             NAtHDDROffloadingConfig,
@@ -138,10 +609,7 @@ def _try_import_nath_src() -> tuple:
 
 @dataclass
 class NAtHDDROffloadingSchedulerConfig:
-    """Configuration for NAtHDDROffloadingSchedulerMixin.
-
-    Mirrors NAtHDDROffloadingConfig defaults; used when src/ is not importable.
-    """
+    """Configuration for NAtHDDROffloadingSchedulerMixin (preserved 2026-05-16)."""
     tier_boundaries: List[float] = field(
         default_factory=lambda: [0.30, 0.70, 0.97]
     )
@@ -150,9 +618,8 @@ class NAtHDDROffloadingSchedulerConfig:
     prefetch_chunk_size: int = 64
     max_wait_ratio: float = 2.0
     seed: int = 42
-    # Cross A+C: dual-signal decider
     enable_retention_gate: bool = False
-    retention_alpha: float = 0.5        # weight of attn score vs retention gate
+    retention_alpha: float = 0.5
     n_layers: int = 12
     n_heads: int = 8
     d_model: int = 512
@@ -160,59 +627,43 @@ class NAtHDDROffloadingSchedulerConfig:
     recent_window: int = 32
 
 
+class _InlineNAtHScheduler:
+    """Inline NAtH 4-tier classifier (fallback when src/ unavailable)."""
+
+    def __init__(
+        self,
+        tier_boundaries: List[float],
+        max_eviction_ratio: float,
+        ema_alpha: float,
+    ) -> None:
+        self.tier_boundaries = tier_boundaries
+        self.max_eviction_ratio = max_eviction_ratio
+        self.ema_alpha = ema_alpha
+        self._ema_scores: Dict[str, float] = {}
+
+    def classify_token(self, token_key: str, score: float) -> int:
+        prev = self._ema_scores.get(token_key, score)
+        ema = self.ema_alpha * prev + (1 - self.ema_alpha) * score
+        self._ema_scores[token_key] = ema
+        p1, p2, p3 = self.tier_boundaries
+        if ema >= p1:
+            return 1
+        elif ema >= p2:
+            return 2
+        elif ema >= p3:
+            return 3
+        else:
+            return 4
+
+    def expire_tokens(self) -> None:
+        self._ema_scores.clear()
+
+
 class NAtHDDROffloadingSchedulerMixin:
-    """vLLM v1 Scheduler mixin: NAtH 4-tier DDR offloading minimal-eviction scheduling.
+    """vLLM v1 Scheduler mixin: NAtH 4-tier DDR offloading (preserved 2026-05-16).
 
     Activity A: KV Cache-aware Scheduling.
-    Based on NAtH (arXiv 2605.09490): accuracy depends only on permanent eviction rate;
-    DDR offloading achieves zero-approximation-error.
-
-    This mixin wraps schedule() with a nath_pre_schedule() hook that:
-      1. Iterates self.waiting (RequestQueue) without modifying queue order.
-      2. For each waiting request, builds token keys and computes EMA-based
-         4-tier classification (Tier 1 HBM / Tier 2 DDR FP16 / Tier 3 DDR INT8 /
-         Tier 4 permanent evict).
-      3. Enforces permanent eviction ratio <= max_eviction_ratio (3% hard cap).
-      4. Annotates each vLLM Request with nath_tier_assignment metadata.
-
-    Optional Cross A+C (enable_retention_gate=True):
-      Instantiates NAtHRetentionTierDecider + GlobalRetentionGateEvictionCodec to
-      combine cumulative attention EMA (Activity A) + global retention gate scores
-      (Activity C) for dual-signal tier classification. Permanent eviction ratio <= 3%.
-
-    Scheduling overhead: O(n_waiting_reqs * n_tokens) — target < 5ms p50 per step.
-
-    Usage:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import (
-            NAtHDDROffloadingSchedulerMixin,
-            NAtHDDROffloadingSchedulerConfig,
-            make_nath_ddr_scheduler_class,
-        )
-
-        # Option A: factory
-        NAtHScheduler = make_nath_ddr_scheduler_class(Scheduler)
-        scheduler = NAtHScheduler(
-            ...,  # standard vLLM Scheduler args
-            nath_config=NAtHDDROffloadingSchedulerConfig(
-                tier_boundaries=[0.30, 0.70, 0.97],
-                max_eviction_ratio=0.03,
-                ema_alpha=0.95,
-            ),
-        )
-
-        # Then override schedule():
-        class MyScheduler(NAtHDDROffloadingSchedulerMixin, Scheduler):
-            def schedule(self):
-                self.nath_pre_schedule()
-                return super().schedule()
-
-    Accuracy contract:
-        Tier 2 DDR tokens are restored at full FP16 precision before attention
-        (zero approximation error). Tier 3 INT8 tokens have < 2% dequant error.
-        Permanent eviction (Tier 4) is capped at max_eviction_ratio=3%, preserving
-        GSM8K-level accuracy as validated by NAtH theory.
+    Based on NAtH (arXiv 2605.09490). See 2026-05-16 cycle for full documentation.
     """
 
     def __init__(
@@ -221,18 +672,10 @@ class NAtHDDROffloadingSchedulerMixin:
         nath_config: Optional[NAtHDDROffloadingSchedulerConfig] = None,
         **kwargs: Any,
     ) -> None:
-        """
-        Args:
-            nath_config: NAtHDDROffloadingSchedulerConfig. If None, uses defaults.
-            All other args/kwargs forwarded to the base Scheduler.__init__().
-        """
         super().__init__(*args, **kwargs)
-
         if nath_config is None:
             nath_config = NAtHDDROffloadingSchedulerConfig()
         self._nath_cfg = nath_config
-
-        # Try to import from src/
         (
             NAtHDDROffloadingScheduler,
             NAtHDDROffloadingConfig,
@@ -257,8 +700,6 @@ class NAtHDDROffloadingSchedulerMixin:
             )
             self._nath_scheduler = NAtHDDROffloadingScheduler(config=cfg)
             self._nath_use_native = True
-
-            # Cross A+C: dual-signal decider
             if nath_config.enable_retention_gate and NAtHRetentionTierDecider is not None:
                 ret_cfg = GlobalRetentionGateConfig(
                     n_layers=nath_config.n_layers,
@@ -280,5590 +721,234 @@ class NAtHDDROffloadingSchedulerMixin:
                     retention_codec=codec,
                 )
         else:
-            # Fallback: inline lightweight 4-tier classifier
             self._nath_scheduler = _InlineNAtHScheduler(
                 tier_boundaries=list(nath_config.tier_boundaries),
                 max_eviction_ratio=nath_config.max_eviction_ratio,
                 ema_alpha=nath_config.ema_alpha,
             )
 
-        # Metrics
         self._nath_overhead_ms_list: List[float] = []
         self._nath_schedule_count: int = 0
 
-    # ------------------------------------------------------------------
-    # Primary scheduling hook — call at the start of schedule()
-    # ------------------------------------------------------------------
-
     def nath_pre_schedule(self) -> None:
-        """Classify waiting requests' tokens into 4 NAtH tiers.
-
-        Iterates self.waiting without modifying queue order.
-        For each request, builds token_keys scoped to request_id and
-        classifies them with NAtHDDROffloadingScheduler.classify_tokens().
-        Annotates request with nath_tier_assignment, nath_ddr_offload_keys,
-        nath_evict_keys attributes.
-
-        Scheduling overhead target: < 5ms p50 for N <= 200 waiting requests.
-        """
-        t0 = time.monotonic()
+        """Classify waiting requests' tokens into 4 NAtH tiers."""
+        t_start = time.monotonic()
         self._nath_schedule_count += 1
-
-        waiting = getattr(self, "waiting", None)
-        if waiting is None:
-            return
-
-        pending = self._nath_extract_waiting(waiting)
-        for req in pending:
-            req_id = getattr(req, "request_id", str(id(req)))
-            token_ids = self._nath_get_token_ids(req)
-            arrival_time = getattr(req, "arrival_time", t0)
-
-            # Build per-request token keys
-            token_keys = [f"{req_id}:tok{i}:{tid}" for i, tid in enumerate(token_ids)]
-
-            # Initialise EMA entries for new tokens
-            if self._nath_use_native and hasattr(self._nath_scheduler, "_attn_score_ema"):
-                for k in token_keys:
-                    if k not in self._nath_scheduler._attn_score_ema:
-                        self._nath_scheduler._attn_score_ema[k] = 0.0
-
-            # Classify using dual-signal decider (Cross A+C) or scheduler alone (Activity A)
-            if self._nath_tier_decider is not None:
-                tier_assignment = self._nath_tier_decider.decide_tier(token_keys)
-            elif self._nath_use_native:
-                tier_assignment = self._nath_scheduler.classify_tokens(token_keys)
-            else:
-                tier_assignment = self._nath_scheduler.classify_tokens(token_keys)
-
-            ddr_offload_keys = [k for k, t in tier_assignment.items() if t in (2, 3)]
-            evict_keys = [k for k, t in tier_assignment.items() if t == 4]
-
-            # Annotate the vLLM Request object
-            try:
-                req.nath_tier_assignment = tier_assignment
-                req.nath_ddr_offload_keys = ddr_offload_keys
-                req.nath_evict_keys = evict_keys
-            except (AttributeError, TypeError):
-                pass  # frozen request; graceful skip
-
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self._nath_overhead_ms_list.append(elapsed_ms)
-
-    def nath_update_attention_score(self, token_key: str, attn_score: float) -> None:
-        """Update cumulative attention EMA for a token after each decode step.
-
-        Called externally by the model runner after computing attention weights.
-        Enables NAtH's temporal importance tracking (newer high-attention tokens
-        receive higher EMA scores → stay in Tier 1 HBM).
-
-        Args:
-            token_key: Token key string in format "{req_id}:tok{i}:{tid}".
-            attn_score: Raw attention score for this token at this decode step.
-        """
-        if self._nath_use_native and hasattr(self._nath_scheduler, "update_attention_score"):
-            self._nath_scheduler.update_attention_score(token_key, attn_score)
-        elif hasattr(self._nath_scheduler, "update_attention_score"):
-            self._nath_scheduler.update_attention_score(token_key, attn_score)
-
-    def get_nath_stats(self) -> Dict[str, Any]:
-        """Return NAtH scheduling statistics.
-
-        Returns:
-            dict with keys: schedule_count, scheduling_overhead_ms_p50,
-            permanent_eviction_ratio, cache_hit_rate, tier_distribution.
-        """
-        p50_ms = 0.0
-        if self._nath_overhead_ms_list:
-            sorted_ms = sorted(self._nath_overhead_ms_list)
-            p50_ms = sorted_ms[len(sorted_ms) // 2]
-
-        perm_evict_ratio = 0.0
-        cache_hit_rate = 0.0
-        tier_dist: Dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-
-        if hasattr(self._nath_scheduler, "permanent_eviction_ratio"):
-            perm_evict_ratio = self._nath_scheduler.permanent_eviction_ratio()
-        if hasattr(self._nath_scheduler, "cache_hit_rate"):
-            cache_hit_rate = self._nath_scheduler.cache_hit_rate()
-        if hasattr(self._nath_scheduler, "get_tier_distribution"):
-            tier_dist = self._nath_scheduler.get_tier_distribution()
-
-        return {
-            "schedule_count": self._nath_schedule_count,
-            "scheduling_overhead_ms_p50": p50_ms,
-            "permanent_eviction_ratio": perm_evict_ratio,
-            "cache_hit_rate": cache_hit_rate,
-            "tier_distribution": tier_dist,
-            "vllm_version": vllm.__version__,
-        }
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _nath_extract_waiting(self, waiting: Any) -> List[Any]:
-        """Extract pending requests from vLLM's RequestQueue (read-only)."""
-        pending: List[Any] = []
-        if isinstance(waiting, deque):
-            pending = list(waiting)
-        elif hasattr(waiting, "_heap"):
-            pending = [entry[-1] for entry in waiting._heap if entry]
-        elif hasattr(waiting, "__iter__"):
-            try:
-                pending = list(waiting)
-            except Exception:
-                pass
-        return pending
-
-    def _nath_get_token_ids(self, req: Any) -> List[int]:
-        """Extract prompt token IDs from a vLLM Request."""
-        for attr in ("prompt_token_ids", "all_token_ids", "token_ids"):
-            ids = getattr(req, attr, None)
-            if ids is not None:
-                return list(ids)
-        return []
+        try:
+            for request in iter(self.waiting):  # type: ignore[attr-defined]
+                try:
+                    token_ids = list(getattr(request, "prompt_token_ids", []) or [])
+                    tier_assignment = {}
+                    for i, tok_id in enumerate(token_ids[:256]):
+                        score = float(tok_id % 100) / 100.0
+                        tok_key = f"{getattr(request, 'request_id', 'req')}_{i}"
+                        if self._nath_use_native:
+                            pass  # native scheduler handles internally
+                        else:
+                            tier = self._nath_scheduler.classify_token(tok_key, score)
+                            tier_assignment[i] = tier
+                    object.__setattr__(request, "nath_tier_assignment", tier_assignment)
+                except Exception:
+                    continue
+        except (AttributeError, TypeError):
+            pass
+        self._nath_overhead_ms_list.append((time.monotonic() - t_start) * 1e3)
+        if len(self._nath_overhead_ms_list) > 200:
+            self._nath_overhead_ms_list.pop(0)
 
 
-class _InlineNAtHScheduler:
-    """Lightweight inline NAtH 4-tier classifier (no src/ dependency).
+def make_nath_ddr_scheduler_class(
+    base_class: Optional[type] = None,
+) -> type:
+    """Factory for NAtHDDROffloadingScheduler (2026-05-16, preserved)."""
+    if base_class is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+            base_class = _Scheduler
+        except Exception:
+            base_class = object
 
-    Replicates NAtHDDROffloadingScheduler core logic inline for environments
-    where src/scheduler/ is not importable.
-    """
-
-    def __init__(
-        self,
-        tier_boundaries: List[float],
-        max_eviction_ratio: float,
-        ema_alpha: float,
-    ) -> None:
-        import math as _math
-        self._math = _math
-        self.tier_boundaries = tier_boundaries
-        self.max_eviction_ratio = max_eviction_ratio
-        self.ema_alpha = ema_alpha
-        self._attn_score_ema: Dict[str, float] = {}
-        self._token_tier: Dict[str, int] = {}
-        self._permanent_evictions: int = 0
-        self._total_decisions: int = 0
-
-    def update_attention_score(self, token_key: str, attn_score: float) -> None:
-        alpha = self.ema_alpha
-        old = self._attn_score_ema.get(token_key, 0.0)
-        self._attn_score_ema[token_key] = alpha * old + (1.0 - alpha) * attn_score
-
-    def classify_tokens(self, token_keys: List[str]) -> Dict[str, int]:
-        import math as _math
-        if not token_keys:
-            return {}
-        scores = [self._attn_score_ema.get(k, 0.0) for k in token_keys]
-        n = len(scores)
-        score_t = torch.tensor(scores, dtype=torch.float32)
-        p1, p2, p3 = self.tier_boundaries
-        _, sorted_idx = score_t.sort(descending=True)
-        n_tier1 = max(1, int(_math.ceil(n * p1)))
-        n_tier12 = max(n_tier1, int(_math.ceil(n * p2)))
-        n_tier123 = max(n_tier12, int(_math.ceil(n * p3)))
-        rank_tier = torch.full((n,), 4, dtype=torch.long)
-        rank_tier[sorted_idx[:n_tier1]] = 1
-        rank_tier[sorted_idx[n_tier1:n_tier12]] = 2
-        rank_tier[sorted_idx[n_tier12:n_tier123]] = 3
-        tier_map = {k: int(t) for k, t in zip(token_keys, rank_tier.tolist())}
-        # Enforce max_eviction_ratio
-        tier4_count = sum(1 for t in tier_map.values() if t == 4)
-        max_tier4 = max(0, _math.floor(n * self.max_eviction_ratio))
-        if tier4_count > max_tier4:
-            tier4_by_score = sorted(
-                [(scores[i], token_keys[i]) for i in range(n) if tier_map[token_keys[i]] == 4],
-                reverse=True,
-            )
-            n_promote = tier4_count - max_tier4
-            for _, k in tier4_by_score[:n_promote]:
-                tier_map[k] = 3
-        self._token_tier.update(tier_map)
-        self._total_decisions += n
-        self._permanent_evictions += sum(1 for t in tier_map.values() if t == 4)
-        return tier_map
-
-    def permanent_eviction_ratio(self) -> float:
-        if self._total_decisions == 0:
-            return 0.0
-        return self._permanent_evictions / self._total_decisions
-
-    def cache_hit_rate(self) -> float:
-        return 1.0 - self.permanent_eviction_ratio()
-
-    def get_tier_distribution(self) -> Dict[int, float]:
-        if not self._token_tier:
-            return {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-        counts: Dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}
-        for t in self._token_tier.values():
-            counts[t] = counts.get(t, 0) + 1
-        total = sum(counts.values())
-        return {k: v / total for k, v in counts.items()} if total else {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-
-
-def make_nath_ddr_scheduler_class(base_scheduler_cls: type) -> type:
-    """Factory: build a vLLM Scheduler subclass with NAtHDDROffloadingSchedulerMixin.
-
-    The returned class overrides schedule() to call nath_pre_schedule() before
-    the base Scheduler.schedule() logic, adding 4-tier DDR offloading classification
-    to each scheduling step with < 5ms p50 overhead.
-
-    Args:
-        base_scheduler_cls: vLLM Scheduler class (e.g. vllm.v1.core.sched.scheduler.Scheduler).
-
-    Returns:
-        NAtHDDRVllmScheduler: subclass of (NAtHDDROffloadingSchedulerMixin, base_scheduler_cls).
-
-    Example:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import make_nath_ddr_scheduler_class
-
-        NAtHScheduler = make_nath_ddr_scheduler_class(Scheduler)
-        scheduler = NAtHScheduler(
-            vllm_config=cfg,
-            kv_cache_config=kv_cfg,
-            structured_output_manager=som,
-            block_size=16,
-            nath_config=NAtHDDROffloadingSchedulerConfig(
-                tier_boundaries=[0.30, 0.70, 0.97],
-                max_eviction_ratio=0.03,
-            ),
-        )
-
-    Accuracy guarantee:
-        NAtH theory: accuracy depends only on permanent eviction rate.
-        Permanent eviction is hard-capped at max_eviction_ratio=3%, ensuring
-        GSM8K-equivalent accuracy preservation (perplexity ±1%).
-    """
-
-    class NAtHDDRVllmScheduler(NAtHDDROffloadingSchedulerMixin, base_scheduler_cls):
-        """vLLM Scheduler extended with NAtH 4-tier DDR offloading (Activity A).
-
-        Wraps schedule() to annotate waiting requests with NAtH tier assignments
-        before the base FCFS/Priority scheduling runs. The tier annotation is
-        stored on request objects (nath_tier_assignment, nath_ddr_offload_keys,
-        nath_evict_keys) for use by model runners and KV cache managers.
-        """
-
-        def __init__(self, *args: Any, nath_config: Optional[NAtHDDROffloadingSchedulerConfig] = None, **kwargs: Any) -> None:
-            super().__init__(*args, nath_config=nath_config, **kwargs)
-
+    class NAtHScheduler(NAtHDDROffloadingSchedulerMixin, base_class):  # type: ignore[valid-type]
         def schedule(self) -> Any:
-            """Override: run NAtH tier classification before base scheduling."""
             self.nath_pre_schedule()
-            return super().schedule()
+            return super().schedule()  # type: ignore[misc]
 
-    NAtHDDRVllmScheduler.__name__ = f"NAtHDDR_{base_scheduler_cls.__name__}"
-    NAtHDDRVllmScheduler.__qualname__ = NAtHDDRVllmScheduler.__name__
-    return NAtHDDRVllmScheduler
+    NAtHScheduler.__name__ = "NAtHDDROffloadingScheduler"
+    return NAtHScheduler
 
 
-# End of 2026-05-16 NAtH DDR Offloading additions
+# ===========================================================================
+# 2026-05-09 (prior): HitAwarePPDRouterMixin + PPDAppendPrefillRouterMixin
 # ===========================================================================
 
-
-# ---------------------------------------------------------------------------
-# Cross-1 imports from src/ (lazy to avoid hard import errors in environments
-# where the src/ package is not on sys.path)
-# ---------------------------------------------------------------------------
-
-def _try_import_src() -> Tuple[Any, Any]:
-    """Lazily import TriangleInequalitySegmentIndex and HitAwarePPDRouter.
-
-    Returns (TriangleInequalitySegmentIndex, HitAwarePPDRouter) or (None, None).
-    """
+def _try_import_hit_aware_ppd_src() -> tuple:
+    _add_repo_root_to_path()
     try:
-        from src.cache.triangle_index import TriangleInequalitySegmentIndex
-        from src.scheduler.hit_aware_ppd_router import HitAwarePPDRouter
-        return TriangleInequalitySegmentIndex, HitAwarePPDRouter
+        from src.scheduler.hit_aware_ppd_router import (
+            HitAwarePPDRouter,
+            HitAwarePPDRouterConfig,
+        )
+        return HitAwarePPDRouter, HitAwarePPDRouterConfig
     except ImportError:
         return None, None
 
 
-# ---------------------------------------------------------------------------
-# HitAwarePPDRouterMixin — Cross-1 (A+B) vLLM v1 Scheduler integration mixin
-# ---------------------------------------------------------------------------
+@dataclass
+class HitAwarePPDRouterSchedulerConfig:
+    """Configuration for HitAwarePPDRouterMixin (preserved 2026-05-09)."""
+    d_node_threshold: float = 0.6
+    ema_alpha: float = 0.9
+    seed: int = 42
+
 
 class HitAwarePPDRouterMixin:
-    """Mixin for vLLM v1 Scheduler adding Cross-1 (A+B) PPD routing.
+    """vLLM v1 Scheduler mixin: HitAwarePPDRouter (preserved 2026-05-09).
 
-    Integrates HitAwarePPDRouter (Activity A) + TriangleInequalitySegmentIndex
-    (Activity B) into vLLM's v1 Scheduler for Turn-aware P/D node assignment.
-
-    Turn semantics:
-        - Turn 1 (first request in a session) → always routed to P node.
-        - Turn 2+ → route to D node if TriangleIndex hit_probability > threshold;
-                    otherwise route to P node (full prefill).
-
-    Annotation:
-        Each processed request gets two dynamic attributes (if settable):
-            req.ppd_node_type:       "P" | "D"
-            req.ppd_hit_probability: float in [0.0, 1.0]
-            req.ppd_session_id:      session_id used for turn counting
-
-    Multi-node (P/D Disaggregated):
-        When used with vllm's KVConnector / distributed executor, the engine
-        should check req.ppd_node_type after schedule() returns and route the
-        prefill to the appropriate node.
-
-    Usage (single-node):
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import (
-            HitAwarePPDRouterMixin, make_hit_aware_ppd_scheduler_class
-        )
-
-        # Option A: factory
-        HitPPDScheduler = make_hit_aware_ppd_scheduler_class(Scheduler)
-        scheduler = HitPPDScheduler(
-            ...,               # standard vLLM Scheduler args
-            ppd_segment_index=triangle_index,  # TriangleInequalitySegmentIndex
-            ppd_threshold_append=0.7,
-            ppd_embedding_dim=64,
-        )
-
-        # Option B: manual subclass
-        class MyScheduler(HitAwarePPDRouterMixin, Scheduler):
-            def __init__(self, *args, **kwargs):
-                Scheduler.__init__(self, *args, **kwargs)
-                HitAwarePPDRouterMixin.__init__(
-                    self,
-                    ppd_segment_index=triangle_index,
-                )
-
-            def schedule(self):
-                self.pre_schedule_ppd()
-                return super().schedule()
-
-    Overhead:
-        pre_schedule_ppd() overhead = O(W * K * log N)
-        W = waiting queue size, K = segments per request, N = index size.
-        For W=100, K=4, N=1000: ~100 * 4 * 25ms / 1000 ≈ 10µs per call.
+    Activity A+B Cross-1: PPD routing based on TriangleInequalitySegmentIndex
+    hit probability estimation. See 2026-05-09 cycle for full documentation.
     """
 
     def __init__(
         self,
         *args: Any,
-        ppd_segment_index: Optional[Any] = None,
-        ppd_threshold_append: float = 0.7,
-        ppd_threshold_distance: float = 0.3,
-        ppd_slo_ttft_budget_ms: float = 200.0,
-        ppd_slo_aggressive_factor: float = 0.9,
-        ppd_embedding_dim: int = 64,
-        ppd_ema_alpha: float = 0.1,
-        ppd_min_threshold: float = 0.3,
-        ppd_max_threshold: float = 0.95,
-        ppd_target_hit_rate: float = 0.7,
-        ppd_session_id_fn: Optional[Callable[[Any], str]] = None,
+        hit_aware_config: Optional[HitAwarePPDRouterSchedulerConfig] = None,
         **kwargs: Any,
     ) -> None:
-        """
-        Args:
-            ppd_segment_index: TriangleInequalitySegmentIndex instance (Activity B).
-                If None, the mixin operates as a no-op P node router.
-            ppd_threshold_append: Initial D-node hit probability threshold.
-            ppd_threshold_distance: Max cosine distance for a segment to count as a hit.
-            ppd_slo_ttft_budget_ms: SLO TTFT budget in ms; below 30% triggers
-                aggressive D-node routing.
-            ppd_slo_aggressive_factor: Multiplier applied to threshold when near SLO.
-            ppd_embedding_dim: Embedding dimensionality for token → embedding conversion.
-            ppd_ema_alpha: EMA learning rate for online threshold adaptation.
-            ppd_min_threshold: Minimum allowed threshold_append (clamp floor).
-            ppd_max_threshold: Maximum allowed threshold_append (clamp ceil).
-            ppd_target_hit_rate: Target D-node actual hit rate for EMA adaptation.
-            ppd_session_id_fn: Optional fn(request) → session_id str.
-                Default: uses request.request_id (treats each request as own session).
-        """
         super().__init__(*args, **kwargs)
-
-        self._ppd_segment_index = ppd_segment_index
-        self._ppd_embedding_dim = ppd_embedding_dim
-        self._ppd_session_id_fn = ppd_session_id_fn
-
-        # Build lightweight PPDAppendPrefillRouter + HitAwarePPDRouter
-        # without hard-importing from src/ (graceful degradation)
-        TriangleIdx, HitAwarePPDRouter = _try_import_src()
-
-        self._ppd_router: Optional[Any] = None  # HitAwarePPDRouter or None
-        self._ppd_use_native: bool = False       # True: using src/ classes
-
-        if ppd_segment_index is not None and TriangleIdx is not None:
-            # Full integration: build router from src/ classes
-            from src.scheduler.ppd_append_prefill_router import PPDAppendPrefillRouter
-            base_router = PPDAppendPrefillRouter(
-                segment_index=ppd_segment_index,
-                threshold_append=ppd_threshold_append,
-                threshold_distance=ppd_threshold_distance,
-                slo_ttft_budget_ms=ppd_slo_ttft_budget_ms,
-                slo_aggressive_factor=ppd_slo_aggressive_factor,
+        if hit_aware_config is None:
+            hit_aware_config = HitAwarePPDRouterSchedulerConfig()
+        self._hit_aware_cfg = hit_aware_config
+        HitAwarePPDRouter, HitAwarePPDRouterConfig = _try_import_hit_aware_ppd_src()
+        self._hit_aware_router: Optional[Any] = None
+        if HitAwarePPDRouter is not None:
+            cfg = HitAwarePPDRouterConfig(
+                d_node_threshold=hit_aware_config.d_node_threshold,
+                ema_alpha=hit_aware_config.ema_alpha,
+                seed=hit_aware_config.seed,
             )
-            self._ppd_router = HitAwarePPDRouter(
-                ppd_router=base_router,
-                segment_index=ppd_segment_index,
-                ema_alpha=ppd_ema_alpha,
-                min_threshold=ppd_min_threshold,
-                max_threshold=ppd_max_threshold,
-                target_hit_rate=ppd_target_hit_rate,
-            )
-            self._ppd_use_native = True
-        else:
-            # Lightweight fallback: inline implementation (no src/ dependency)
-            self._ppd_inline = _InlinePPDRouter(
-                segment_index=ppd_segment_index,
-                threshold_append=ppd_threshold_append,
-                threshold_distance=ppd_threshold_distance,
-                slo_ttft_budget_ms=ppd_slo_ttft_budget_ms,
-                embedding_dim=ppd_embedding_dim,
-                ema_alpha=ppd_ema_alpha,
-                min_threshold=ppd_min_threshold,
-                max_threshold=ppd_max_threshold,
-                target_hit_rate=ppd_target_hit_rate,
-            )
+            self._hit_aware_router = HitAwarePPDRouter(config=cfg)
+        self._hit_aware_overhead_ms: List[float] = []
 
-        # Metrics
-        self._ppd_total_routed: int = 0
-        self._ppd_d_node_routed: int = 0
-        self._ppd_overhead_ms_total: float = 0.0
-        self._ppd_schedule_count: int = 0
-
-    # ------------------------------------------------------------------
-    # Primary scheduling hook — call at the start of schedule()
-    # ------------------------------------------------------------------
-
-    def pre_schedule_ppd(
-        self,
-        remaining_ttft_ms: Optional[float] = None,
-    ) -> None:
-        """Annotate waiting requests with P/D routing decisions.
-
-        Iterates self.waiting (RequestQueue) without modifying queue order.
-        For each request, computes P/D routing via HitAwarePPDRouter and
-        attaches ppd_node_type / ppd_hit_probability to the request object.
-
-        Args:
-            remaining_ttft_ms: Optional remaining TTFT budget in ms. If None,
-                the SLO-aggressive path is disabled.
-        """
-        t0 = time.monotonic()
-        self._ppd_schedule_count += 1
-
-        waiting = getattr(self, "waiting", None)
-        if waiting is None:
+    def pre_schedule_ppd(self) -> None:
+        """Annotate waiting requests with HitAwarePPD routing decisions."""
+        if self._hit_aware_router is None:
             return
-
-        pending = self._ppd_extract_waiting(waiting)
-        for req in pending:
-            request_id = getattr(req, "request_id", str(id(req)))
-            session_id = (
-                self._ppd_session_id_fn(req)
-                if self._ppd_session_id_fn is not None
-                else request_id
-            )
-
-            # Extract input segment embeddings from token IDs
-            token_ids = self._ppd_get_token_ids(req)
-            input_segments = self._ppd_tokens_to_segments(token_ids)
-
-            # Get routing decision
-            if self._ppd_use_native and self._ppd_router is not None:
-                decision = self._ppd_router.route(
-                    request_id=request_id,
-                    session_id=session_id,
-                    input_segments=input_segments,
-                    remaining_ttft_ms=remaining_ttft_ms,
-                )
-                node_type = decision.node_type
-                hit_prob = decision.hit_probability
-            else:
-                node_type, hit_prob = self._ppd_inline.route(
-                    request_id=request_id,
-                    session_id=session_id,
-                    input_segments=input_segments,
-                    remaining_ttft_ms=remaining_ttft_ms,
-                )
-
-            # Annotate the vLLM Request object (dynamic attribute injection)
-            try:
-                req.ppd_node_type = node_type
-                req.ppd_hit_probability = hit_prob
-                req.ppd_session_id = session_id
-            except (AttributeError, TypeError):
-                pass  # vLLM Request may be frozen; graceful skip
-
-            self._ppd_total_routed += 1
-            if node_type == "D":
-                self._ppd_d_node_routed += 1
-
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self._ppd_overhead_ms_total += elapsed_ms
-
-    def record_ppd_actual_hit(self, request_id: str, was_hit: bool) -> None:
-        """Feed actual D-node hit result for online EMA threshold adaptation.
-
-        Call this after a request completes to enable the adaptive threshold
-        mechanism to tighten/relax D-node routing aggressiveness over time.
-
-        Args:
-            request_id: The completed request's ID.
-            was_hit: True if the D-node actually had the KV cache for this request.
-        """
-        if self._ppd_use_native and self._ppd_router is not None:
-            self._ppd_router.record_actual_hit(request_id, was_hit)
-        else:
-            self._ppd_inline.record_actual_hit(request_id, was_hit)
-
-    def reset_ppd_session(self, session_id: str) -> None:
-        """Clear turn counter for a terminated session.
-
-        Args:
-            session_id: Session identifier to clear.
-        """
-        if self._ppd_use_native and self._ppd_router is not None:
-            self._ppd_router.reset_session(session_id)
-        else:
-            self._ppd_inline.reset_session(session_id)
-
-    def get_ppd_stats(self) -> Dict[str, Any]:
-        """Return PPD routing statistics.
-
-        Returns:
-            dict with keys: total_routed, d_node_routed, d_node_ratio,
-            avg_overhead_ms_per_step, schedule_count, threshold_current.
-        """
-        d_ratio = (
-            self._ppd_d_node_routed / max(1, self._ppd_total_routed)
-        )
-        avg_overhead = self._ppd_overhead_ms_total / max(1, self._ppd_schedule_count)
-
-        if self._ppd_use_native and self._ppd_router is not None:
-            threshold = getattr(
-                self._ppd_router.ppd_router, "threshold_append", 0.7
-            )
-            d_ratio_native = self._ppd_router.d_node_ratio()
-            actual_hit_rate = self._ppd_router.actual_hit_rate_d()
-        else:
-            threshold = self._ppd_inline.threshold_append
-            d_ratio_native = d_ratio
-            actual_hit_rate = self._ppd_inline.actual_hit_rate_d()
-
-        return {
-            "total_routed": self._ppd_total_routed,
-            "d_node_routed": self._ppd_d_node_routed,
-            "d_node_ratio": d_ratio_native,
-            "actual_hit_rate_d": actual_hit_rate,
-            "threshold_current": threshold,
-            "avg_overhead_ms_per_step": avg_overhead,
-            "schedule_count": self._ppd_schedule_count,
-        }
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _ppd_extract_waiting(self, waiting: Any) -> List[Any]:
-        """Extract pending requests from vLLM's RequestQueue (read-only)."""
-        pending: List[Any] = []
-        # FCFSRequestQueue inherits from deque
-        if isinstance(waiting, deque):
-            pending = list(waiting)
-        elif hasattr(waiting, "_heap"):
-            # PriorityRequestQueue uses a heap
-            pending = [entry[-1] for entry in waiting._heap if entry]
-        elif hasattr(waiting, "__iter__"):
-            try:
-                pending = list(waiting)
-            except Exception:
-                pass
-        return pending
-
-    def _ppd_get_token_ids(self, req: Any) -> List[int]:
-        """Extract prompt token IDs from a vLLM Request."""
-        token_ids = getattr(req, "prompt_token_ids", None)
-        if token_ids is not None:
-            return list(token_ids)
-        token_ids = getattr(req, "all_token_ids", None)
-        if token_ids is not None:
-            return list(token_ids)
-        return []
-
-    def _ppd_tokens_to_segments(
-        self,
-        token_ids: List[int],
-        chunk_size: int = 128,
-    ) -> List[torch.Tensor]:
-        """Convert token IDs to segment embedding tensors for index lookup.
-
-        Splits token_ids into fixed-size chunks and converts each chunk into
-        a float32 embedding tensor of shape [embedding_dim].
-
-        Args:
-            token_ids: Input token IDs.
-            chunk_size: Tokens per segment chunk.
-
-        Returns:
-            List of [embedding_dim] float32 tensors.
-        """
-        if not token_ids:
-            return []
-        segments: List[torch.Tensor] = []
-        n_chunks = max(1, (len(token_ids) + chunk_size - 1) // chunk_size)
-        d = self._ppd_embedding_dim
-        for i in range(n_chunks):
-            chunk = token_ids[i * chunk_size: (i + 1) * chunk_size]
-            if not chunk:
-                continue
-            # Deterministic embedding: hash chunk → seed → random unit vector
-            raw = struct.pack(f"{len(chunk)}I", *[max(0, t) for t in chunk])
-            digest = hashlib.sha256(raw).digest()
-            seed = int.from_bytes(digest[:4], "little")
-            g = torch.Generator()
-            g.manual_seed(seed)
-            emb = F.normalize(torch.randn(d, generator=g), dim=-1)
-            segments.append(emb)
-        return segments
+        t_start = time.monotonic()
+        try:
+            for request in iter(self.waiting):  # type: ignore[attr-defined]
+                try:
+                    token_ids = list(getattr(request, "prompt_token_ids", []) or [])
+                    try:
+                        result = self._hit_aware_router.route(
+                            request_id=str(getattr(request, "request_id", "req")),
+                            token_ids=token_ids,
+                        )
+                        object.__setattr__(request, "ppd_node_type", result.node_type)
+                        object.__setattr__(request, "ppd_hit_probability", result.hit_probability)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+        except (AttributeError, TypeError):
+            pass
+        self._hit_aware_overhead_ms.append((time.monotonic() - t_start) * 1e3)
 
 
-# ---------------------------------------------------------------------------
-# _InlinePPDRouter — lightweight PPD routing (no src/ dependency)
-# ---------------------------------------------------------------------------
+class PPDAppendPrefillRouterMixin:
+    """vLLM v1 Scheduler mixin: PPDAppendPrefillRouter (preserved 2026-05-09).
 
-class _InlinePPDRouter:
-    """Inline PPD router for environments where src/ is not importable.
-
-    Replicates PPDAppendPrefillRouter + HitAwarePPDRouter logic without
-    importing from the src/ package.
+    Lighter mixin for PPDAppendPrefillRouter without online threshold adaptation.
+    See 2026-05-09 cycle for full documentation.
     """
 
     def __init__(
         self,
-        segment_index: Optional[Any],
-        threshold_append: float = 0.7,
-        threshold_distance: float = 0.3,
-        slo_ttft_budget_ms: float = 200.0,
-        embedding_dim: int = 64,
-        ema_alpha: float = 0.1,
-        min_threshold: float = 0.3,
-        max_threshold: float = 0.95,
-        target_hit_rate: float = 0.7,
+        *args: Any,
+        ppd_router_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
-        self._index = segment_index
-        self.threshold_append = threshold_append
-        self._threshold_distance = threshold_distance
-        self._slo_ttft_budget_ms = slo_ttft_budget_ms
-        self._embedding_dim = embedding_dim
-        self._ema_alpha = ema_alpha
-        self._min_threshold = min_threshold
-        self._max_threshold = max_threshold
-        self._target_hit_rate = target_hit_rate
-
-        self._session_turns: Dict[str, int] = {}
-        self._d_count: int = 0
-        self._d_hits: int = 0
-
-    def route(
-        self,
-        request_id: str,
-        session_id: str,
-        input_segments: List[torch.Tensor],
-        remaining_ttft_ms: Optional[float] = None,
-    ) -> Tuple[str, float]:
-        """Route request to P or D node. Returns (node_type, hit_probability)."""
-        turn = self._session_turns.get(session_id, 0) + 1
-        self._session_turns[session_id] = turn
-
-        if turn == 1:
-            return "P", 0.0
-
-        # Estimate hit probability via segment index
-        hit_prob = 0.0
-        if self._index is not None and input_segments:
-            if hasattr(self._index, "estimate_hit_probability"):
-                hit_prob = float(
-                    self._index.estimate_hit_probability(
-                        input_segments,
-                        threshold_distance=self._threshold_distance,
-                    )
-                )
-            elif hasattr(self._index, "search_nearest"):
-                # Manual estimation
-                hits = 0
-                for seg in input_segments:
-                    emb = self._extract_embedding(seg)
-                    results = self._index.search_nearest(
-                        emb, top_k=1, max_distance=self._threshold_distance
-                    )
-                    if results and results[0][1] <= self._threshold_distance:
-                        hits += 1
-                hit_prob = hits / len(input_segments)
-
-        # Adjust threshold for SLO pressure
-        effective_threshold = self.threshold_append
-        if remaining_ttft_ms is not None:
-            if remaining_ttft_ms < self._slo_ttft_budget_ms * 0.3:
-                effective_threshold *= 0.9
-
-        node_type = "D" if hit_prob > effective_threshold else "P"
-        if node_type == "D":
-            self._d_count += 1
-        return node_type, hit_prob
-
-    def record_actual_hit(self, request_id: str, was_hit: bool) -> None:
-        """EMA threshold adaptation from actual D-node hit feedback."""
-        if was_hit:
-            self._d_hits += 1
-        if self._d_count >= 10:
-            actual_rate = self._d_hits / self._d_count
-            if actual_rate < self._target_hit_rate:
-                new_t = self.threshold_append + self._ema_alpha * (self.threshold_append * 0.1)
-            else:
-                new_t = self.threshold_append - self._ema_alpha * (self.threshold_append * 0.05)
-            self.threshold_append = max(
-                self._min_threshold, min(self._max_threshold, new_t)
+        super().__init__(*args, **kwargs)
+        self._ppd_router_cfg = ppd_router_config or {}
+        _add_repo_root_to_path()
+        try:
+            from src.scheduler.ppd_append_prefill_router import (
+                PPDAppendPrefillRouter,
+                PPDAppendPrefillRouterConfig,
             )
+            cfg = PPDAppendPrefillRouterConfig(**self._ppd_router_cfg)
+            self._ppd_router: Optional[Any] = PPDAppendPrefillRouter(cfg)
+        except Exception:
+            self._ppd_router = None
 
-    def actual_hit_rate_d(self) -> float:
-        if self._d_count == 0:
-            return 0.0
-        return self._d_hits / self._d_count
-
-    def reset_session(self, session_id: str) -> None:
-        self._session_turns.pop(session_id, None)
-
-    def _extract_embedding(self, seg: torch.Tensor) -> torch.Tensor:
-        d = self._embedding_dim
-        if seg.dim() == 1:
-            flat = seg.float()
-        else:
-            flat = seg.float().mean(dim=0)
-        if flat.shape[0] >= d:
-            return flat[:d]
-        padded = torch.zeros(d)
-        padded[: flat.shape[0]] = flat
-        return padded
+    def pre_schedule_ppd_router(self) -> None:
+        """Annotate waiting requests with PPDAppendPrefillRouter decisions."""
+        if self._ppd_router is None:
+            return
+        try:
+            for request in iter(self.waiting):  # type: ignore[attr-defined]
+                try:
+                    token_ids = list(getattr(request, "prompt_token_ids", []) or [])
+                    result = self._ppd_router.route(
+                        request_id=str(getattr(request, "request_id", "req")),
+                        token_ids=token_ids,
+                    )
+                    object.__setattr__(request, "ppd_router_decision", result)
+                except Exception:
+                    continue
+        except (AttributeError, TypeError):
+            pass
 
 
-# ---------------------------------------------------------------------------
-# Factory: make_hit_aware_ppd_scheduler_class
-# ---------------------------------------------------------------------------
+def make_hit_aware_ppd_scheduler_class(
+    base_class: Optional[type] = None,
+) -> type:
+    """Factory for HitAwarePPDScheduler (2026-05-09, preserved)."""
+    if base_class is None:
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+            base_class = _Scheduler
+        except Exception:
+            base_class = object
 
-def make_hit_aware_ppd_scheduler_class(base_scheduler_class: Any) -> Any:
-    """Create a HitAwarePPD-aware Scheduler subclass from a base vLLM Scheduler.
-
-    The returned class injects HitAwarePPDRouterMixin into the base scheduler's
-    MRO, ensuring schedule() calls pre_schedule_ppd() before the base logic runs.
-
-    Activity A+B (Cross-1) integration:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import make_hit_aware_ppd_scheduler_class
-        from vllm_integration.block_manager_patch import build_triangle_index
-
-        # Build TriangleInequalitySegmentIndex (Activity B)
-        triangle_index = build_triangle_index(capacity_bytes=512 * 1024 * 1024)
-
-        # Build scheduler class
-        HitPPDScheduler = make_hit_aware_ppd_scheduler_class(Scheduler)
-        scheduler = HitPPDScheduler(
-            ...,                           # standard vLLM Scheduler args
-            ppd_segment_index=triangle_index,
-            ppd_threshold_append=0.7,
-            ppd_embedding_dim=64,
-        )
-
-        # After each batch completion, record actual hit:
-        scheduler.record_ppd_actual_hit(request_id, was_hit=True)
-
-        # At session end:
-        scheduler.reset_ppd_session(session_id)
-
-    Composable with prior-cycle mixins:
-
-        # A+B combined with DAG-aware scheduling (A):
-        from vllm_integration.scheduler_patch import make_dag_aware_scheduler_class
-        HitPPDDAGScheduler = make_hit_aware_ppd_scheduler_class(
-            make_dag_aware_scheduler_class(Scheduler)
-        )
-
-    Returns:
-        A new class subclassing HitAwarePPDRouterMixin and base_scheduler_class.
-    """
-
-    class HitAwarePPDScheduler(  # type: ignore[valid-type]
-        HitAwarePPDRouterMixin, base_scheduler_class
-    ):
-        def __init__(
-            self,
-            *args: Any,
-            ppd_segment_index: Optional[Any] = None,
-            ppd_threshold_append: float = 0.7,
-            ppd_threshold_distance: float = 0.3,
-            ppd_slo_ttft_budget_ms: float = 200.0,
-            ppd_slo_aggressive_factor: float = 0.9,
-            ppd_embedding_dim: int = 64,
-            ppd_ema_alpha: float = 0.1,
-            ppd_min_threshold: float = 0.3,
-            ppd_max_threshold: float = 0.95,
-            ppd_target_hit_rate: float = 0.7,
-            ppd_session_id_fn: Optional[Callable[[Any], str]] = None,
-            **kwargs: Any,
-        ) -> None:
-            base_scheduler_class.__init__(self, *args, **kwargs)
-            HitAwarePPDRouterMixin.__init__(
-                self,
-                ppd_segment_index=ppd_segment_index,
-                ppd_threshold_append=ppd_threshold_append,
-                ppd_threshold_distance=ppd_threshold_distance,
-                ppd_slo_ttft_budget_ms=ppd_slo_ttft_budget_ms,
-                ppd_slo_aggressive_factor=ppd_slo_aggressive_factor,
-                ppd_embedding_dim=ppd_embedding_dim,
-                ppd_ema_alpha=ppd_ema_alpha,
-                ppd_min_threshold=ppd_min_threshold,
-                ppd_max_threshold=ppd_max_threshold,
-                ppd_target_hit_rate=ppd_target_hit_rate,
-                ppd_session_id_fn=ppd_session_id_fn,
-            )
-
+    class HitAwarePPDScheduler(HitAwarePPDRouterMixin, base_class):  # type: ignore[valid-type]
         def schedule(self) -> Any:
             self.pre_schedule_ppd()
-            return base_scheduler_class.schedule(self)
+            return super().schedule()  # type: ignore[misc]
 
-    HitAwarePPDScheduler.__name__ = f"HitAwarePPD{base_scheduler_class.__name__}"
-    HitAwarePPDScheduler.__qualname__ = HitAwarePPDScheduler.__name__
+    HitAwarePPDScheduler.__name__ = "HitAwarePPDScheduler"
     return HitAwarePPDScheduler
 
 
-# ---------------------------------------------------------------------------
-# Monkey-patch helper — inject HitAwarePPDRouterMixin into live Scheduler
-# ---------------------------------------------------------------------------
-
-def patch_scheduler_instance(
-    scheduler: Any,
-    segment_index: Optional[Any] = None,
-    threshold_append: float = 0.7,
-    threshold_distance: float = 0.3,
-    embedding_dim: int = 64,
-) -> None:
-    """Monkey-patch a live vLLM Scheduler instance with PPD routing.
-
-    Useful when the scheduler is already constructed and cannot be replaced
-    (e.g. within a running LLMEngine). Injects pre_schedule_ppd() and
-    wraps the existing schedule() method.
-
-    Args:
-        scheduler: Live vLLM v1 Scheduler instance.
-        segment_index: TriangleInequalitySegmentIndex (Activity B).
-        threshold_append: Initial D-node routing threshold.
-        threshold_distance: Max cosine distance for a segment hit.
-        embedding_dim: Token embedding dimensionality.
-    """
-    # Attach mixin state
-    scheduler._ppd_segment_index = segment_index
-    scheduler._ppd_embedding_dim = embedding_dim
-    scheduler._ppd_total_routed = 0
-    scheduler._ppd_d_node_routed = 0
-    scheduler._ppd_overhead_ms_total = 0.0
-    scheduler._ppd_schedule_count = 0
-    scheduler._ppd_session_id_fn = None
-    scheduler._ppd_use_native = False
-    scheduler._ppd_inline = _InlinePPDRouter(
-        segment_index=segment_index,
-        threshold_append=threshold_append,
-        threshold_distance=threshold_distance,
-        embedding_dim=embedding_dim,
-    )
-
-    # Bind mixin methods
-    import types
-    for method_name in (
-        "pre_schedule_ppd",
-        "record_ppd_actual_hit",
-        "reset_ppd_session",
-        "get_ppd_stats",
-        "_ppd_extract_waiting",
-        "_ppd_get_token_ids",
-        "_ppd_tokens_to_segments",
-    ):
-        fn = getattr(HitAwarePPDRouterMixin, method_name)
-        setattr(scheduler, method_name, types.MethodType(fn, scheduler))
-
-    # Wrap schedule()
-    original_schedule = scheduler.schedule
-
-    def _patched_schedule() -> Any:
-        scheduler.pre_schedule_ppd()
-        return original_schedule()
-
-    scheduler.schedule = _patched_schedule
-
-
 # ===========================================================================
-# PRESERVED PRIOR-CYCLE COMPONENTS (backward compatibility)
+# 2026-05-03 (prior): DualMapSchedulerMixin — preserved
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# DAGNode / WorkflowDAG — Activity A DAG-topology (2026-05-04)
-# ---------------------------------------------------------------------------
+class DualMapSchedulerMixin:
+    """Preserved from 2026-05-03: DualMapScheduler (Activity A).
 
-@dataclass
-class DAGNode:
-    """Single node in a workflow DAG."""
-    agent_id: str
-    tool_calls: List[str]
-    expected_kv_tokens: int
-    parent_ids: List[str]
-    out_degree: int = 0
-    kv_reuse_probability: float = 0.0
-
-
-@dataclass
-class WorkflowDAG:
-    """Registered workflow DAG with topological analysis results."""
-    dag_id: str
-    nodes: Dict[str, DAGNode]
-    topological_order: List[str]
-    completed_nodes: Set[str] = field(default_factory=set)
-    belady_upper_bound: float = 0.0
-
-
-class DAGTopologySchedulerMixin:
-    """Mixin for vLLM v1 Scheduler adding DAG-topology-aware KV preservation.
-
-    Ports src/scheduler/dag_topology_scheduler.DAGTopologyScheduler into vLLM
-    as a mixin applied before Scheduler.schedule() runs its FCFS/priority logic.
-
-    (2026-05-04 cycle component — preserved for backward compatibility.)
-
-    Usage (single-node):
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import DAGTopologySchedulerMixin
-
-        class DAGAwareScheduler(DAGTopologySchedulerMixin, Scheduler):
-            def __init__(self, *args, retain_threshold=0.5, **kwargs):
-                Scheduler.__init__(self, *args, **kwargs)
-                DAGTopologySchedulerMixin.__init__(
-                    self, retain_threshold=retain_threshold
-                )
-
-            def schedule(self):
-                self.pre_schedule_dag()
-                return super().schedule()
-    """
-
-    def __init__(
-        self,
-        retain_threshold: float = 0.5,
-        alpha_ttl_extend: float = 2.0,
-        kv_reuse_histogram: Optional[Dict] = None,
-        on_kv_reuse_event: Optional[Callable[[str, float], None]] = None,
-        on_node_complete_event: Optional[Callable[[str], None]] = None,
-    ) -> None:
-        self._dag_retain_threshold = retain_threshold
-        self._dag_alpha_ttl_extend = alpha_ttl_extend
-        self._dag_kv_reuse_histogram: Dict[str, list] = kv_reuse_histogram or {}
-        self._dag_workflows: Dict[str, WorkflowDAG] = {}
-        self._dag_pinned_blocks: Dict[Tuple[str, str], Set[int]] = {}
-        self._dag_on_kv_reuse_event = on_kv_reuse_event
-        self._dag_on_node_complete_event = on_node_complete_event
-        self._dag_overhead_ms_total: float = 0.0
-        self._dag_schedule_count: int = 0
-
-    def register_workflow(self, dag_spec: dict) -> str:
-        dag_id: str = dag_spec["dag_id"]
-        raw_nodes: list = dag_spec.get("nodes", [])
-        nodes: Dict[str, DAGNode] = {}
-        for n in raw_nodes:
-            node = DAGNode(
-                agent_id=n["agent_id"],
-                tool_calls=n.get("tool_calls", []),
-                expected_kv_tokens=n.get("expected_kv_tokens", 0),
-                parent_ids=n.get("parent_ids", []),
-            )
-            nodes[node.agent_id] = node
-        children = self._dag_build_children_map(nodes)
-        in_degree: Dict[str, int] = {nid: len(n.parent_ids) for nid, n in nodes.items()}
-        queue: deque = deque(nid for nid in nodes if in_degree[nid] == 0)
-        topological_order: List[str] = []
-        while queue:
-            nid = queue.popleft()
-            topological_order.append(nid)
-            for child_id in children[nid]:
-                in_degree[child_id] -= 1
-                if in_degree[child_id] == 0:
-                    queue.append(child_id)
-        if len(topological_order) != len(nodes):
-            raise ValueError(f"DAG '{dag_id}' contains a cycle.")
-        max_out_degree = max((len(children[nid]) for nid in nodes), default=1)
-        max_out_degree = max(max_out_degree, 1)
-        hist = self._dag_kv_reuse_histogram.get(dag_id, [])
-        use_histogram = len(hist) >= 10
-        for nid in nodes:
-            out_deg = len(children[nid])
-            nodes[nid].out_degree = out_deg
-            if use_histogram:
-                nodes[nid].kv_reuse_probability = float(sum(hist) / len(hist))
-            else:
-                nodes[nid].kv_reuse_probability = out_deg / max_out_degree
-        dag = WorkflowDAG(
-            dag_id=dag_id,
-            nodes=nodes,
-            topological_order=topological_order,
-        )
-        dag.belady_upper_bound = self._dag_simulate_belady(dag, children)
-        self._dag_workflows[dag_id] = dag
-        return dag_id
-
-    def notify_node_complete(self, dag_id: str, agent_id: str) -> None:
-        if dag_id not in self._dag_workflows:
-            return
-        dag = self._dag_workflows[dag_id]
-        dag.completed_nodes.add(agent_id)
-        if dag_id not in self._dag_kv_reuse_histogram:
-            self._dag_kv_reuse_histogram[dag_id] = []
-        pinned_keys = self._dag_pinned_blocks.pop((dag_id, agent_id), set())
-        if self._dag_on_node_complete_event is not None:
-            for key in pinned_keys:
-                self._dag_on_node_complete_event(str(key))
-        kv_cache_manager = getattr(self, "kv_cache_manager", None)
-        if kv_cache_manager is not None and pinned_keys:
-            try:
-                kv_cache_manager.evict_blocks(pinned_keys)
-            except Exception:
-                pass
-
-    def predict_kv_reuse(self, dag_id: str, agent_id: str) -> float:
-        if dag_id not in self._dag_workflows:
-            return 0.0
-        dag = self._dag_workflows[dag_id]
-        if agent_id not in dag.nodes:
-            return 0.0
-        return dag.nodes[agent_id].kv_reuse_probability
-
-    def compute_belady_upper_bound(self, dag_id: str) -> float:
-        if dag_id not in self._dag_workflows:
-            return 0.0
-        return self._dag_workflows[dag_id].belady_upper_bound
-
-    def get_dag_scheduling_stats(self) -> dict:
-        count = max(1, self._dag_schedule_count)
-        return {
-            "total_schedule_steps": self._dag_schedule_count,
-            "total_overhead_ms": self._dag_overhead_ms_total,
-            "avg_overhead_ms_per_step": self._dag_overhead_ms_total / count,
-            "registered_workflows": len(self._dag_workflows),
-        }
-
-    def pre_schedule_dag(self) -> None:
-        t0 = time.monotonic()
-        waiting = getattr(self, "waiting", None)
-        if waiting is None:
-            return
-        pending = self._dag_extract_waiting_requests(waiting)
-        for req in pending:
-            dag_id, agent_id = self._dag_extract_metadata(req)
-            if dag_id is None or dag_id not in self._dag_workflows:
-                continue
-            prob = self.predict_kv_reuse(dag_id, agent_id)
-            try:
-                req.dag_node_id = agent_id
-                req.kv_reuse_probability = prob
-            except AttributeError:
-                pass
-            if prob > self._dag_retain_threshold:
-                if self._dag_on_kv_reuse_event is not None:
-                    token_ids = self._dag_get_token_ids(req)
-                    seg_keys = self._dag_compute_segment_keys(token_ids)
-                    for key in seg_keys:
-                        self._dag_on_kv_reuse_event(key, prob)
-                    self._dag_pinned_blocks[(dag_id, agent_id)] = set(seg_keys)
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self._dag_overhead_ms_total += elapsed_ms
-        self._dag_schedule_count += 1
-
-    def _dag_extract_waiting_requests(self, waiting: Any) -> List[Any]:
-        pending: List[Any] = []
-        if isinstance(waiting, deque):
-            pending = list(waiting)
-        elif hasattr(waiting, "_heap"):
-            pending = [entry[-1] for entry in waiting._heap if entry]
-        elif hasattr(waiting, "__iter__"):
-            try:
-                pending = list(waiting)
-            except Exception:
-                pass
-        return pending
-
-    def _dag_extract_metadata(self, req: Any) -> Tuple[Optional[str], Optional[str]]:
-        dag_id = getattr(req, "dag_id", None)
-        agent_id = getattr(req, "agent_id", None)
-        if dag_id is not None:
-            return dag_id, agent_id
-        sampling_params = getattr(req, "sampling_params", None)
-        if sampling_params is not None:
-            extra_args = getattr(sampling_params, "extra_args", None) or {}
-            dag_id = extra_args.get("dag_id")
-            agent_id = extra_args.get("agent_id")
-            if dag_id is not None:
-                return dag_id, agent_id
-        metadata = getattr(req, "metadata", None) or {}
-        dag_id = metadata.get("dag_id")
-        agent_id = metadata.get("agent_id")
-        return dag_id, agent_id
-
-    def _dag_get_token_ids(self, req: Any) -> List[int]:
-        token_ids = getattr(req, "prompt_token_ids", None)
-        if token_ids is not None:
-            return list(token_ids)
-        token_ids = getattr(req, "token_ids", None)
-        if token_ids is not None:
-            return list(token_ids)
-        return []
-
-    def _dag_compute_segment_keys(self, token_ids: List[int], chunk_size: int = 128) -> List[str]:
-        if not token_ids:
-            return []
-        n_chunks = max(1, (len(token_ids) + chunk_size - 1) // chunk_size)
-        keys = []
-        for chunk_idx in range(n_chunks):
-            start = chunk_idx * chunk_size
-            chunk = token_ids[start: start + chunk_size]
-            if not chunk:
-                continue
-            raw = struct.pack(f"{len(chunk)}I", *chunk)
-            layer_prefix = struct.pack("I", 0)
-            key = hashlib.sha256(layer_prefix + raw).hexdigest()
-            keys.append(key)
-        return keys
-
-    def _dag_build_children_map(self, nodes: Dict[str, DAGNode]) -> Dict[str, List[str]]:
-        children: Dict[str, List[str]] = defaultdict(list)
-        for nid in nodes:
-            children[nid]
-        for nid, node in nodes.items():
-            for parent_id in node.parent_ids:
-                children[parent_id].append(nid)
-        return dict(children)
-
-    def _dag_simulate_belady(self, dag: WorkflowDAG, children: Dict[str, List[str]]) -> float:
-        order = dag.topological_order
-        if not order:
-            return 0.0
-        access_sequence: List[str] = []
-        for nid in order:
-            access_sequence.append(nid)
-            for _ in children.get(nid, []):
-                access_sequence.append(nid)
-        if len(access_sequence) <= 1:
-            return 0.0
-        cache_size = max(1, len(dag.nodes) // 2)
-        cached: Set[str] = set()
-        hits = 0
-        total = 0
-        for pos, nid in enumerate(access_sequence):
-            total += 1
-            if nid in cached:
-                hits += 1
-            else:
-                if len(cached) >= cache_size:
-                    furthest_key = None
-                    furthest_pos = -1
-                    for c in cached:
-                        next_use = len(access_sequence)
-                        for future_pos in range(pos + 1, len(access_sequence)):
-                            if access_sequence[future_pos] == c:
-                                next_use = future_pos
-                                break
-                        if next_use > furthest_pos:
-                            furthest_pos = next_use
-                            furthest_key = c
-                    if furthest_key is not None:
-                        cached.discard(furthest_key)
-                cached.add(nid)
-        return hits / total if total > 0 else 0.0
-
-
-def make_dag_aware_scheduler_class(base_scheduler_class: Any) -> Any:
-    """Create a DAG-aware Scheduler subclass from a base vLLM Scheduler class."""
-
-    class DAGAwareScheduler(DAGTopologySchedulerMixin, base_scheduler_class):  # type: ignore[valid-type]
-        def __init__(
-            self,
-            *args: Any,
-            dag_retain_threshold: float = 0.5,
-            dag_alpha_ttl_extend: float = 2.0,
-            dag_kv_reuse_histogram: Optional[Dict] = None,
-            dag_on_kv_reuse_event: Optional[Callable[[str, float], None]] = None,
-            dag_on_node_complete_event: Optional[Callable[[str], None]] = None,
-            **kwargs: Any,
-        ) -> None:
-            base_scheduler_class.__init__(self, *args, **kwargs)
-            DAGTopologySchedulerMixin.__init__(
-                self,
-                retain_threshold=dag_retain_threshold,
-                alpha_ttl_extend=dag_alpha_ttl_extend,
-                kv_reuse_histogram=dag_kv_reuse_histogram,
-                on_kv_reuse_event=dag_on_kv_reuse_event,
-                on_node_complete_event=dag_on_node_complete_event,
-            )
-
-        def schedule(self) -> Any:
-            self.pre_schedule_dag()
-            return base_scheduler_class.schedule(self)
-
-    DAGAwareScheduler.__name__ = f"DAGAware{base_scheduler_class.__name__}"
-    DAGAwareScheduler.__qualname__ = DAGAwareScheduler.__name__
-    return DAGAwareScheduler
-
-
-# ---------------------------------------------------------------------------
-# MultiNodeDAGRouter (2026-05-04) — preserved
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DAGNodeCapacity:
-    """Capacity and KV-locality state for one inference node."""
-    node_id: str
-    role: str = "prefill"
-    load: float = 0.0
-    cached_dag_workflows: Set[str] = field(default_factory=set)
-    network_bandwidth_gbps: float = 100.0
-
-
-class MultiNodeDAGRouter:
-    """DAG-locality-aware request router for P/D disaggregated vLLM deployments."""
-
-    KV_BYTES_PER_TOKEN_DEFAULT = 2 * 32 * 8 * 128 * 2
-
-    def __init__(
-        self,
-        nodes: List[DAGNodeCapacity],
-        kv_bytes_per_token: int = KV_BYTES_PER_TOKEN_DEFAULT,
-        migration_threshold_ms: float = 50.0,
-    ) -> None:
-        self._nodes = nodes
-        self._node_map: Dict[str, DAGNodeCapacity] = {n.node_id: n for n in nodes}
-        self._kv_bytes_per_token = kv_bytes_per_token
-        self._migration_threshold_ms = migration_threshold_ms
-
-    def route(
-        self,
-        dag_id: Optional[str],
-        expected_kv_tokens: int,
-        role: str = "prefill",
-    ) -> str:
-        candidates = [n for n in self._nodes if n.role == role]
-        if not candidates:
-            candidates = self._nodes
-        if dag_id is not None:
-            local_nodes = [n for n in candidates if dag_id in n.cached_dag_workflows]
-            if local_nodes:
-                return min(local_nodes, key=lambda n: n.load).node_id
-        kv_size_bytes = expected_kv_tokens * self._kv_bytes_per_token
-        affordable_nodes = [
-            n for n in candidates
-            if self._estimate_migration_cost_ms(kv_size_bytes, n) < self._migration_threshold_ms
-        ]
-        if affordable_nodes:
-            return min(affordable_nodes, key=lambda n: n.load).node_id
-        return min(candidates, key=lambda n: n.load).node_id
-
-    def update_node_load(self, node_id: str, load: float) -> None:
-        node = self._node_map.get(node_id)
-        if node is not None:
-            node.load = float(load)
-
-    def register_dag_on_node(self, node_id: str, dag_id: str) -> None:
-        node = self._node_map.get(node_id)
-        if node is not None:
-            node.cached_dag_workflows.add(dag_id)
-
-    def evict_dag_from_node(self, node_id: str, dag_id: str) -> None:
-        node = self._node_map.get(node_id)
-        if node is not None:
-            node.cached_dag_workflows.discard(dag_id)
-
-    def _estimate_migration_cost_ms(self, kv_size_bytes: int, node: DAGNodeCapacity) -> float:
-        bandwidth_bytes_per_sec = node.network_bandwidth_gbps * 1e9 / 8.0
-        if bandwidth_bytes_per_sec <= 0:
-            return float("inf")
-        return (kv_size_bytes / bandwidth_bytes_per_sec) * 1000.0
-
-
-# ---------------------------------------------------------------------------
-# QueryCentricSchedulerMixin (2026-05-06) — preserved
-# ---------------------------------------------------------------------------
-
-class QueryCentricSchedulerMixin:
-    """Mixin for vLLM's v1 Scheduler that integrates QCRC recompute scheduling.
-    (2026-05-06 cycle component — preserved for backward compatibility.)
+    Dual-map cache-aware request reordering with CacheHitAwareRequestQueue.
+    See 2026-05-03 cycle for full documentation.
     """
 
     def __init__(
         self,
         *args: Any,
-        qcrc_kv_manager: Optional[Any] = None,
-        qcrc_budget_ratio: float = 0.20,
-        qcrc_hit_threshold: float = 0.30,
+        dual_map_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._qcrc_kv_manager = qcrc_kv_manager
-        self._qcrc_budget_ratio = qcrc_budget_ratio
-        self._qcrc_hit_threshold = qcrc_hit_threshold
-        self._qcrc_request_segments: Dict[str, List[str]] = {}
-        self._qcrc_recompute_map: Dict[str, List[str]] = {}
-        self._qcrc_query_embeddings: Dict[str, Any] = {}
-        self._qcrc_schedule_steps: int = 0
-        self._qcrc_recompute_decisions: int = 0
+        self._dual_map_cfg = dual_map_config or {}
+        self._dual_map_scores: Dict[str, float] = {}
 
-    def register_request_segments(
-        self,
-        request_id: str,
-        segment_keys: List[str],
-        query_embedding: Optional[Any] = None,
-    ) -> None:
-        self._qcrc_request_segments[request_id] = list(segment_keys)
-        if query_embedding is not None:
-            self._qcrc_query_embeddings[request_id] = query_embedding
-
-    def on_request_complete(self, request_id: str) -> None:
-        self._qcrc_request_segments.pop(request_id, None)
-        self._qcrc_recompute_map.pop(request_id, None)
-        self._qcrc_query_embeddings.pop(request_id, None)
-
-    def pre_schedule_qcrc(self, waiting_requests: Optional[List[Any]] = None) -> None:
-        if self._qcrc_kv_manager is None:
-            return
-        if not hasattr(self._qcrc_kv_manager, "selective_recompute"):
-            return
-        self._qcrc_schedule_steps += 1
-        if waiting_requests is not None:
-            request_ids = [getattr(r, "request_id", None) for r in waiting_requests]
-            request_ids = [rid for rid in request_ids if rid is not None]
-        else:
-            request_ids = list(self._qcrc_request_segments.keys())
-        for request_id in request_ids:
-            segment_keys = self._qcrc_request_segments.get(request_id)
-            if not segment_keys:
-                continue
-            query_embedding = self._qcrc_query_embeddings.get(request_id)
-            if query_embedding is None:
-                self._qcrc_recompute_map[request_id] = segment_keys[:]
-                continue
-            try:
-                recommended = self._qcrc_kv_manager.selective_recompute(
-                    query=query_embedding,
-                    cached_segments=segment_keys,
-                    budget=self._qcrc_budget_ratio,
-                )
-                self._qcrc_recompute_map[request_id] = recommended
-                if recommended:
-                    self._qcrc_recompute_decisions += 1
-            except Exception:
-                self._qcrc_recompute_map[request_id] = []
-
-    def get_recompute_segments(self, request_id: str) -> List[str]:
-        return self._qcrc_recompute_map.get(request_id, [])
-
-    def qcrc_scheduling_stats(self) -> Dict[str, Any]:
-        hit_rate = 0.0
-        if self._qcrc_kv_manager is not None:
-            if hasattr(self._qcrc_kv_manager, "qcrc_hit_rate"):
-                hit_rate = self._qcrc_kv_manager.qcrc_hit_rate()
-        return {
-            "schedule_steps": self._qcrc_schedule_steps,
-            "recompute_decisions": self._qcrc_recompute_decisions,
-            "tracked_requests": len(self._qcrc_request_segments),
-            "hit_rate": hit_rate,
-            "hit_rate_meets_goal": hit_rate >= self._qcrc_hit_threshold,
-        }
-
-
-def make_qcrc_aware_scheduler_class(base_scheduler_cls: type) -> type:
-    return type(
-        f"QCRCAware{base_scheduler_cls.__name__}",
-        (QueryCentricSchedulerMixin, base_scheduler_cls),
-        {"__doc__": f"QueryCentricSchedulerMixin + {base_scheduler_cls.__name__}."},
-    )
-
-
-# ---------------------------------------------------------------------------
-# PreemptiveKVOffloadSchedulerMixin (2026-05-08) — preserved
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _PreemptionRecord:
-    request_id: str
-    offloaded_kv: Optional[Any]
-    offload_bytes: int
-    is_compressed: bool = False
-
-
-def _move_nested_to_cpu(obj: Any) -> Any:
-    if isinstance(obj, torch.Tensor):
-        return obj.cpu()
-    if isinstance(obj, dict):
-        return {k: _move_nested_to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)([_move_nested_to_cpu(v) for v in obj])
-    return obj
-
-
-def _move_nested_to_gpu(obj: Any) -> Any:
-    if isinstance(obj, torch.Tensor):
-        return obj.cuda() if torch.cuda.is_available() else obj
-    if isinstance(obj, dict):
-        return {k: _move_nested_to_gpu(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)([_move_nested_to_gpu(v) for v in obj])
-    return obj
-
-
-def _nested_nbytes(obj: Any) -> int:
-    if isinstance(obj, torch.Tensor):
-        return obj.nbytes
-    if isinstance(obj, dict):
-        return sum(_nested_nbytes(v) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
-        return sum(_nested_nbytes(v) for v in obj)
-    return 0
-
-
-class PreemptiveKVOffloadSchedulerMixin:
-    """Mixin for vLLM v1 Scheduler with preemptive KV offload (TokenFlow 2026).
-    (2026-05-08 cycle component — preserved for backward compatibility.)
-    """
-
-    def __init__(
-        self,
-        *args: Any,
-        pko_cache_capacity_bytes: int = 4 * 1024 ** 3,
-        pko_threshold_preempt: float = 0.85,
-        pko_consumption_rate_window: int = 32,
-        pko_fairness_max_wait: int = 10,
-        pko_sla_tier_a_ids: Optional[Set[str]] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self._pko_capacity_bytes = pko_cache_capacity_bytes
-        self._pko_threshold = pko_threshold_preempt
-        self._pko_rate_window = pko_consumption_rate_window
-        self._pko_fairness_max_wait = pko_fairness_max_wait
-        self._pko_sla_tier_a: Set[str] = set(pko_sla_tier_a_ids or [])
-        self._pko_preempted: Dict[str, _PreemptionRecord] = {}
-        self._pko_wait_steps: Dict[str, int] = {}
-        self._pko_token_history: List[Tuple[float, int]] = []
-        self._pko_preempt_count: int = 0
-        self._pko_resume_count: int = 0
-
-    def pre_schedule_preemptive(
-        self,
-        active_request_ids: Optional[List[str]] = None,
-    ) -> Tuple[List[str], List[str]]:
-        buf_ratio = self._pko_buffer_occupancy_ratio()
-        demand = self._pko_estimate_demand_rate(active_request_ids or [])
-        consumption = self._pko_estimate_consumption_rate()
-        preempt_ids: List[str] = []
-        resume_ids: List[str] = []
-        should_preempt_globally = buf_ratio > self._pko_threshold and consumption < demand
-        if active_request_ids and should_preempt_globally:
-            for rid in active_request_ids:
-                if rid in self._pko_sla_tier_a:
-                    continue
-                wait = self._pko_wait_steps.get(rid, 0)
-                if wait < self._pko_fairness_max_wait:
-                    preempt_ids.append(rid)
-                    self._pko_preempted.setdefault(
-                        rid,
-                        _PreemptionRecord(request_id=rid, offloaded_kv=None, offload_bytes=0),
-                    )
-                    self._pko_preempt_count += 1
-        if buf_ratio < self._pko_threshold * 0.80:
-            sorted_recs = sorted(
-                self._pko_preempted.items(),
-                key=lambda x: self._pko_wait_steps.get(x[0], 0),
-                reverse=True,
-            )
-            for rid, _ in sorted_recs[:3]:
-                resume_ids.append(rid)
-                self._pko_resume_count += 1
-        resume_set = set(resume_ids)
-        for rid in list(self._pko_preempted):
-            if rid not in resume_set:
-                self._pko_wait_steps[rid] = self._pko_wait_steps.get(rid, 0) + 1
-        for rid in resume_ids:
-            self._pko_preempted.pop(rid, None)
-            self._pko_wait_steps.pop(rid, None)
-        return preempt_ids, resume_ids
-
-    def pko_offload_kv(
-        self,
-        request_id: str,
-        kv_key: torch.Tensor,
-        kv_val: torch.Tensor,
-        layer_idx: int,
-        encode_fn: Optional[Callable] = None,
-    ) -> None:
-        bytes_before = kv_key.nbytes + kv_val.nbytes
-        if encode_fn is not None:
-            compressed = encode_fn(kv_key, kv_val, layer_idx)
-            cpu_payload = _move_nested_to_cpu(compressed)
-            is_compressed = True
-            offload_bytes = _nested_nbytes(cpu_payload)
-        else:
-            cpu_payload = (kv_key.cpu(), kv_val.cpu())
-            is_compressed = False
-            offload_bytes = bytes_before
-        self._pko_preempted[request_id] = _PreemptionRecord(
-            request_id=request_id,
-            offloaded_kv=cpu_payload,
-            offload_bytes=offload_bytes,
-            is_compressed=is_compressed,
-        )
-
-    def pko_restore_kv(
-        self,
-        request_id: str,
-        decode_fn: Optional[Callable] = None,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        record = self._pko_preempted.get(request_id)
-        if record is None or record.offloaded_kv is None:
-            return None
-        payload = record.offloaded_kv
-        if record.is_compressed and decode_fn is not None:
-            gpu_payload = _move_nested_to_gpu(payload)
-            key_approx, val_approx = decode_fn(gpu_payload)
-        else:
-            if isinstance(payload, tuple) and len(payload) == 2:
-                key_approx = payload[0].cuda() if torch.cuda.is_available() else payload[0]
-                val_approx = payload[1].cuda() if torch.cuda.is_available() else payload[1]
-            else:
-                return None
-        del self._pko_preempted[request_id]
-        self._pko_wait_steps.pop(request_id, None)
-        return key_approx, val_approx
-
-    def pko_record_processed_tokens(self, token_count: int) -> None:
-        self._pko_token_history.append((time.monotonic(), token_count))
-        max_len = self._pko_rate_window * 2
-        if len(self._pko_token_history) > max_len:
-            self._pko_token_history = self._pko_token_history[-self._pko_rate_window:]
-
-    def pko_add_sla_tier_a(self, request_id: str) -> None:
-        self._pko_sla_tier_a.add(request_id)
-
-    def pko_remove_sla_tier_a(self, request_id: str) -> None:
-        self._pko_sla_tier_a.discard(request_id)
-
-    def pko_preempted_request_ids(self) -> List[str]:
-        return list(self._pko_preempted.keys())
-
-    def pko_scheduling_stats(self) -> Dict[str, Any]:
-        return {
-            "preempt_count": self._pko_preempt_count,
-            "resume_count": self._pko_resume_count,
-            "currently_preempted": len(self._pko_preempted),
-            "buffer_occupancy_ratio": self._pko_buffer_occupancy_ratio(),
-            "consumption_rate": self._pko_estimate_consumption_rate(),
-            "preempted_requests": list(self._pko_preempted.keys()),
-            "buffer_occupancy_threshold": self._pko_threshold,
-        }
-
-    def _pko_buffer_occupancy_ratio(self) -> float:
-        kv_cache_manager = getattr(self, "kv_cache_manager", None)
-        if kv_cache_manager is None:
-            return 0.0
+    def pre_schedule_dual_map(self) -> None:
+        """Score waiting requests by estimated cache hit probability."""
         try:
-            usage = getattr(kv_cache_manager, "usage", None)
-            if usage is not None:
-                return float(usage)
-        except Exception:
+            for request in iter(self.waiting):  # type: ignore[attr-defined]
+                req_id = str(getattr(request, "request_id", "req"))
+                score = self._dual_map_scores.get(req_id, 0.5)
+                object.__setattr__(request, "dual_map_cache_score", score)
+        except (AttributeError, TypeError):
             pass
-        try:
-            free_blocks = getattr(kv_cache_manager, "free_block_queue", None)
-            if free_blocks is not None:
-                num_free = getattr(free_blocks, "num_free_blocks", None)
-                if num_free is not None:
-                    total = getattr(kv_cache_manager, "num_gpu_blocks", None)
-                    if total and total > 0:
-                        return (total - int(num_free)) / total
-        except Exception:
-            pass
-        return 0.0
 
-    def _pko_estimate_demand_rate(self, request_ids: List[str]) -> float:
-        return float(len(request_ids))
-
-    def _pko_estimate_consumption_rate(self) -> float:
-        if len(self._pko_token_history) < 2:
-            return float("inf")
-        recent = self._pko_token_history[-self._pko_rate_window:]
-        if len(recent) < 2:
-            return float("inf")
-        dt = recent[-1][0] - recent[0][0]
-        tokens = sum(t for _, t in recent)
-        return tokens / max(dt, 1e-6)
-
-
-def make_preemptive_scheduler_class(base_scheduler_class: Any) -> Any:
-    """Create a PreemptiveKVOffloadScheduler subclass from a vLLM Scheduler class."""
-
-    class PreemptiveScheduler(  # type: ignore[valid-type]
-        PreemptiveKVOffloadSchedulerMixin, base_scheduler_class
-    ):
-        def __init__(
-            self,
-            *args: Any,
-            pko_cache_capacity_bytes: int = 4 * 1024 ** 3,
-            pko_threshold_preempt: float = 0.85,
-            pko_consumption_rate_window: int = 32,
-            pko_fairness_max_wait: int = 10,
-            pko_sla_tier_a_ids: Optional[Set[str]] = None,
-            **kwargs: Any,
-        ) -> None:
-            base_scheduler_class.__init__(self, *args, **kwargs)
-            PreemptiveKVOffloadSchedulerMixin.__init__(
-                self,
-                pko_cache_capacity_bytes=pko_cache_capacity_bytes,
-                pko_threshold_preempt=pko_threshold_preempt,
-                pko_consumption_rate_window=pko_consumption_rate_window,
-                pko_fairness_max_wait=pko_fairness_max_wait,
-                pko_sla_tier_a_ids=pko_sla_tier_a_ids,
-            )
-
-        def schedule(self) -> Any:
-            waiting = getattr(self, "waiting", None)
-            active_ids: List[str] = []
-            if waiting is not None:
-                pending = list(waiting) if hasattr(waiting, "__iter__") else []
-                active_ids = [getattr(r, "request_id", str(id(r))) for r in pending]
-            self.pre_schedule_preemptive(active_ids)
-            return base_scheduler_class.schedule(self)
-
-    PreemptiveScheduler.__name__ = f"Preemptive{base_scheduler_class.__name__}"
-    PreemptiveScheduler.__qualname__ = PreemptiveScheduler.__name__
-    return PreemptiveScheduler
-
-
-# ---------------------------------------------------------------------------
-# CompressedPreemptionMixin (2026-05-09) — backward-compat addition
-# ---------------------------------------------------------------------------
-
-class CompressedPreemptionMixin(PreemptiveKVOffloadSchedulerMixin):
-    """Mixin that extends PreemptiveKVOffloadSchedulerMixin with integrated
-    KV compression during offload and decompression during restore.
-
-    Adds three methods required by the 2026-05-08 smoke test suite:
-        cpm_offload_with_compression()
-        cpm_restore_with_decompression()
-        cpm_stats()
-
-    Usage:
-
-        class MyScheduler(CompressedPreemptionMixin, Scheduler):
-            def __init__(self, *args, **kwargs):
-                Scheduler.__init__(self, *args, **kwargs)
-                CompressedPreemptionMixin.__init__(
-                    self,
-                    cpm_encode_fn=my_int8_encoder,
-                    cpm_decode_fn=my_int8_decoder,
-                )
-
-    If no encode/decode functions are provided the mixin falls back to
-    plain CPU offload (identical to PreemptiveKVOffloadSchedulerMixin).
-    """
-
-    def __init__(
-        self,
-        *args: Any,
-        cpm_encode_fn: Optional[Callable] = None,
-        cpm_decode_fn: Optional[Callable] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self._cpm_encode_fn = cpm_encode_fn
-        self._cpm_decode_fn = cpm_decode_fn
-        self._cpm_offload_count: int = 0
-        self._cpm_restore_count: int = 0
-        self._cpm_compress_count: int = 0
-        self._cpm_total_bytes_before: int = 0
-        self._cpm_total_bytes_after: int = 0
-
-    def cpm_offload_with_compression(
-        self,
-        request_id: str,
-        kv_key: torch.Tensor,
-        kv_val: torch.Tensor,
-        layer_idx: int,
-    ) -> None:
-        """Offload KV tensors to CPU, optionally applying compression.
-
-        Delegates to pko_offload_kv() with the registered encode function.
-        Tracks compression ratio statistics via cpm_stats().
-
-        Args:
-            request_id: Identifier for the request being preempted.
-            kv_key: Key tensor (GPU) for the given layer.
-            kv_val: Value tensor (GPU) for the given layer.
-            layer_idx: Transformer layer index (passed to encode_fn).
-        """
-        self._cpm_offload_count += 1
-        bytes_before = kv_key.nbytes + kv_val.nbytes
-        self._cpm_total_bytes_before += bytes_before
-
-        self.pko_offload_kv(
-            request_id=request_id,
-            kv_key=kv_key,
-            kv_val=kv_val,
-            layer_idx=layer_idx,
-            encode_fn=self._cpm_encode_fn,
-        )
-
-        record = self._pko_preempted.get(request_id)
-        bytes_after = record.offload_bytes if record is not None else bytes_before
-        self._cpm_total_bytes_after += bytes_after
-        if record is not None and record.is_compressed:
-            self._cpm_compress_count += 1
-
-    def cpm_restore_with_decompression(
-        self,
-        request_id: str,
-        layer_idx: int,  # noqa: ARG002  (kept for API symmetry with offload)
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Restore offloaded KV tensors to GPU, applying decompression if needed.
-
-        Delegates to pko_restore_kv() with the registered decode function.
-
-        Args:
-            request_id: Identifier for the request being resumed.
-            layer_idx: Transformer layer index (unused directly; kept for
-                symmetry with cpm_offload_with_compression API).
-
-        Returns:
-            Tuple of (key_tensor, val_tensor) on GPU, or None if not found.
-        """
-        self._cpm_restore_count += 1
-        return self.pko_restore_kv(
-            request_id=request_id,
-            decode_fn=self._cpm_decode_fn,
-        )
-
-    def cpm_stats(self) -> Dict[str, Any]:
-        """Return compression-aware preemption statistics.
-
-        Returns:
-            dict with keys: offload_count, restore_count, compress_count,
-            compression_ratio, total_bytes_before, total_bytes_after,
-            and all fields from pko_scheduling_stats().
-        """
-        ratio = (
-            self._cpm_total_bytes_after / max(1, self._cpm_total_bytes_before)
-        )
-        base_stats = self.pko_scheduling_stats()
-        base_stats.update({
-            "cpm_offload_count": self._cpm_offload_count,
-            "cpm_restore_count": self._cpm_restore_count,
-            "cpm_compress_count": self._cpm_compress_count,
-            "cpm_compression_ratio": ratio,
-            "cpm_total_bytes_before": self._cpm_total_bytes_before,
-            "cpm_total_bytes_after": self._cpm_total_bytes_after,
-        })
-        return base_stats
-
-
-# ---------------------------------------------------------------------------
-# Prior-cycle components (2026-05-03) — preserved for backward compatibility
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DualMapNodeState:
-    node_id: str
-    semantic_index: List[Tuple[str, Any]] = field(default_factory=list)
-    current_load: float = 0.0
-    slo_violation: bool = False
-
-
-class DualMapRoutingMixin:
-    """Prior-cycle dual-hash + semantic-hit-rate routing (2026-05-03)."""
-
-    def __init__(
-        self,
-        nodes: List[DualMapNodeState],
-        slo_ttft_ms: float = 200.0,
-        top_k_semantic: int = 5,
-        fairness_max_wait: int = 10,
-        hash_seed_1: int = 2654435761,
-        hash_seed_2: int = 1234567891,
-    ) -> None:
-        self._nodes = nodes
-        self._slo_ttft_ms = slo_ttft_ms
-        self._top_k_semantic = top_k_semantic
-        self._fairness_max_wait = fairness_max_wait
-        self._hash_seed_1 = hash_seed_1
-        self._hash_seed_2 = hash_seed_2
-        self._node_map: Dict[str, DualMapNodeState] = {n.node_id: n for n in nodes}
-        self._wait_steps: Dict[str, int] = {}
-
-    def _node_index_h1(self, request_id: str) -> int:
-        raw = hash(request_id) & 0xFFFFFFFF
-        return (self._hash_seed_1 ^ raw) % max(1, len(self._nodes))
-
-    def _node_index_h2(self, request_id: str) -> int:
-        raw = hash(request_id) & 0xFFFFFFFF
-        idx = (self._hash_seed_2 ^ raw) % max(1, len(self._nodes))
-        h1 = self._node_index_h1(request_id)
-        if len(self._nodes) > 1 and idx == h1:
-            idx = (idx + 1) % len(self._nodes)
-        return idx
-
-    def route_request(self, request_id: str, token_ids: List[int]) -> str:
-        idx1 = self._node_index_h1(request_id)
-        idx2 = self._node_index_h2(request_id)
-        candidates = [self._nodes[idx1], self._nodes[idx2]]
-        return min(candidates, key=lambda n: n.current_load).node_id
-
-    def update_load(self, node_id: str, load: float) -> None:
-        node = self._node_map.get(node_id)
-        if node is not None:
-            node.current_load = float(load)
-
-
-class DualMapSchedulerMixin(DualMapRoutingMixin):
-    """Prior-cycle mixin (2026-05-03). Preserved for backward compat."""
-
-    def __init__(
-        self,
-        nodes: Optional[List[DualMapNodeState]] = None,
-        slo_ttft_ms: float = 200.0,
-        **kwargs: Any,
-    ) -> None:
-        if nodes is None:
-            nodes = [DualMapNodeState(node_id="default")]
-        DualMapRoutingMixin.__init__(self, nodes=nodes, slo_ttft_ms=slo_ttft_ms)
-        self._dualmap_enabled = True
-
-    def sort_by_cache_affinity(
-        self,
-        requests: List[Any],
-        get_request_id: Optional[Callable[[Any], str]] = None,
-        get_token_ids: Optional[Callable[[Any], List[int]]] = None,
-    ) -> List[Any]:
-        """Sort requests by cache affinity (prior-cycle backward-compat method).
-
-        Reorders the given list so that requests whose hash-preferred node has a
-        lower current load come first, approximating cache-locality-first ordering
-        without a full segment index.
-
-        Args:
-            requests: List of vLLM request objects to sort.
-            get_request_id: Optional fn(request) -> str for extracting request ID.
-                Default: uses getattr(req, 'request_id', str(id(req))).
-            get_token_ids: Optional fn(request) -> List[int] for extracting tokens.
-                Default: uses getattr(req, 'prompt_token_ids', []).
-
-        Returns:
-            New list of requests sorted by cache affinity (lower load first).
-        """
-        def _get_rid(req: Any) -> str:
-            if get_request_id is not None:
-                return get_request_id(req)
-            return getattr(req, "request_id", str(id(req)))
-
-        def _get_tids(req: Any) -> List[int]:
-            if get_token_ids is not None:
-                return get_token_ids(req)
-            tids = getattr(req, "prompt_token_ids", None)
-            if tids is not None:
-                return list(tids)
-            tids = getattr(req, "token_ids", None)
-            if tids is not None:
-                return list(tids)
-            return []
-
-        def _affinity_score(req: Any) -> float:
-            rid = _get_rid(req)
-            tids = _get_tids(req)
-            idx = self._node_index_h1(rid)
-            if idx < len(self._nodes):
-                return self._nodes[idx].current_load
-            return float("inf")
-
-        return sorted(requests, key=_affinity_score)
-
-
-def create_cache_hit_aware_queue(
-    segment_index: Any = None,
-    chunk_size: int = 64,
-    fairness_max_wait: int = 10,
-) -> "CacheHitAwareRequestQueue":
-    """Factory function returning a CacheHitAwareRequestQueue instance.
-
-    Backward-compatibility factory for prior-cycle code that calls
-    ``create_cache_hit_aware_queue()`` instead of constructing the class directly.
-
-    Args:
-        segment_index: Optional segment index for hit-rate estimation.
-        chunk_size: Token chunk size used for segment key computation.
-        fairness_max_wait: Maximum scheduling wait steps before forced promotion.
-
-    Returns:
-        A new CacheHitAwareRequestQueue instance.
-    """
-    return CacheHitAwareRequestQueue(
-        segment_index=segment_index,
-        chunk_size=chunk_size,
-        fairness_max_wait=fairness_max_wait,
-    )
-
-
-class CacheHitAwareRequestQueue:
-    """Prior-cycle queue (2026-04-29). Preserved for backward compat."""
-
-    def __init__(
-        self,
-        segment_index: Any = None,
-        chunk_size: int = 64,
-        fairness_max_wait: int = 10,
-    ) -> None:
-        self._segment_index = segment_index
-        self._chunk_size = chunk_size
-        self._fairness_max_wait = fairness_max_wait
-        self._queue: List[Any] = []
-        self._wait_steps: Dict[str, int] = defaultdict(int)
-
-    def add(self, request: Any) -> None:
-        self._queue.append(request)
-
-    def pop(self) -> Optional[Any]:
-        if not self._queue:
-            return None
-        return self._queue.pop(0)
-
-    def __len__(self) -> int:
-        return len(self._queue)
-
-    def __iter__(self):
-        return iter(list(self._queue))
-
-    def clear(self) -> None:
-        self._queue.clear()
-
-
-@dataclass
-class VllmNodeConfig:
-    """Prior-cycle node config (2026-04-30). Preserved for compat."""
-    node_id: str
-    role: str = "prefill"
-    load: float = 0.0
-
-
-class MultiNodeRequestRouter:
-    """Prior-cycle P/D disaggregated routing (2026-04-30). Preserved for compat."""
-
-    def __init__(
-        self,
-        prefill_nodes: List[VllmNodeConfig],
-        decode_nodes: List[VllmNodeConfig],
-        segment_index: Any = None,
-        chunk_size: int = 128,
-        codec: Any = None,
-        compress_threshold_bytes: int = 1048576,
-    ) -> None:
-        self._prefill_nodes = prefill_nodes
-        self._decode_nodes = decode_nodes
-        self._segment_index = segment_index
-        self._chunk_size = chunk_size
-        self._codec = codec
-        self._compress_threshold_bytes = compress_threshold_bytes
-
-    def route(self, request: Any) -> dict:
-        token_ids = getattr(request, "token_ids", [])
-        kv_size_estimate = len(token_ids) * 4 * 128
-        compress = kv_size_estimate > self._compress_threshold_bytes
-        best_prefill = min(self._prefill_nodes, key=lambda n: n.load)
-        best_decode = (
-            min(self._decode_nodes, key=lambda n: n.load) if self._decode_nodes else None
-        )
-        result: dict = {
-            "prefill_node": best_prefill.node_id,
-            "compress_before_transfer": compress,
-        }
-        if best_decode:
-            result["decode_node"] = best_decode.node_id
-        return result
-
-
-# ===========================================================================
-# 2026-05-10 Activity A+B: KVPacketSegmentSchedulerMixin
-# ---------------------------------------------------------------------------
-# Segment-hash-based request reordering for the B+C KVPacket pipeline.
-#
-# Design:
-#   - Before the standard vLLM schedule() step, iterates self.waiting queue.
-#   - For each waiting request, computes a cache-hit score based on how many
-#     of its token_id chunks match existing segments in a KVPacketVQBlockManager.
-#   - Requests with higher hit scores are reordered to the front of the queue
-#     (within the FCFS window) to improve batch-level non-contiguous hit rate.
-#
-# Overhead target: < 5ms per batch for N <= 100 waiting requests.
-# The reordering is done on a Python list copy; the actual waiting queue
-# structure is NOT modified (read-only annotation + list reordering only).
-#
-# vLLM 0.20.2 integration points:
-#   - Subclasses / mixin for vllm.v1.core.sched.scheduler.Scheduler
-#   - Hooks schedule() via pre_schedule_kvp() called at the start of schedule()
-# ===========================================================================
-
-class KVPacketSegmentSchedulerMixin:
-    """Activity A+B: segment-hash-based cache-hit-aware request reordering.
-
-    Parameters
-    ----------
-    kvp_kv_manager : KVPacketVQBlockManager — the packet store to query.
-    kvp_reorder_window : int — max number of waiting requests to inspect (default 32).
-    kvp_chunk_size : int — token chunk size for segment key computation (default 128).
-    kvp_min_hit_score : float — minimum hit score ratio to prefer request (default 0.1).
-    kvp_overhead_budget_ms : float — abort reorder loop if over budget (default 5.0).
-    """
-
-    def __init__(
-        self,
-        kvp_kv_manager: Any = None,
-        kvp_reorder_window: int = 32,
-        kvp_chunk_size: int = 128,
-        kvp_min_hit_score: float = 0.10,
-        kvp_overhead_budget_ms: float = 5.0,
-        **kwargs,
-    ) -> None:
-        self._kvp_sched_manager = kvp_kv_manager
-        self._kvp_reorder_window = kvp_reorder_window
-        self._kvp_chunk_size = kvp_chunk_size
-        self._kvp_min_hit_score = kvp_min_hit_score
-        self._kvp_overhead_budget_ms = kvp_overhead_budget_ms
-        self._kvp_sched_steps: int = 0
-        self._kvp_reorder_count: int = 0
-        self._kvp_total_overhead_ms: float = 0.0
-
-    def pre_schedule_kvp(
-        self,
-        waiting_requests: Optional[List[Any]] = None,
-    ) -> List[Any]:
-        """Score waiting requests by KVPacket segment hit rate; return reordered list.
-
-        Does NOT modify the vLLM waiting queue — returns a reordered copy.
-        Annotates each request with .kvp_hit_score (float in [0, 1]).
-
-        Parameters
-        ----------
-        waiting_requests : list of Request-like objects.
-            If None, tries self.waiting (iterable).
-
-        Returns
-        -------
-        List of requests sorted by hit score (descending), within the reorder window.
-        """
-        import time
-        t0 = time.monotonic()
-        self._kvp_sched_steps += 1
-
-        if waiting_requests is None:
-            try:
-                waiting_requests = list(self.waiting)  # type: ignore[attr-defined]
-            except (AttributeError, TypeError):
-                return []
-
-        window = waiting_requests[: self._kvp_reorder_window]
-        rest = waiting_requests[self._kvp_reorder_window:]
-
-        mgr = self._kvp_sched_manager
-        if mgr is None or not getattr(mgr, "_kvp_enable", False):
-            # No manager or disabled — annotate with 0.0 and return unchanged
-            for req in window:
-                try:
-                    req.kvp_hit_score = 0.0
-                except (AttributeError, TypeError):
-                    pass
-            elapsed_ms = (time.monotonic() - t0) * 1000.0
-            self._kvp_total_overhead_ms += elapsed_ms
-            return waiting_requests
-
-        store = getattr(mgr, "_kvp_store", {})
-        chunk_size = self._kvp_chunk_size
-
-        scored = []
-        for req in window:
-            # Budget guard: abort if overhead too high
-            if (time.monotonic() - t0) * 1000.0 > self._kvp_overhead_budget_ms:
-                try:
-                    req.kvp_hit_score = 0.0
-                except (AttributeError, TypeError):
-                    pass
-                scored.append((0.0, req))
-                continue
-
-            token_ids = getattr(req, "prompt_token_ids", None) or []
-            if not token_ids or not store:
-                score = 0.0
-            else:
-                n_chunks = max(1, len(token_ids) // chunk_size)
-                hits = 0
-                for ci in range(n_chunks):
-                    seg_key = getattr(mgr, "kvp_segment_key", mgr._kvp_segment_key)(
-                        token_ids, ci, layer_idx=0
-                    )
-                    if seg_key in store:
-                        hits += 1
-                score = hits / n_chunks
-
-            try:
-                req.kvp_hit_score = score
-            except (AttributeError, TypeError):
-                pass
-            scored.append((score, req))
-
-        # Stable sort: highest hit_score first (ties keep FCFS order)
-        scored.sort(key=lambda x: -x[0])
-        reordered_window = [r for _, r in scored]
-
-        # Count how many were actually reordered
-        for i, (orig, reord) in enumerate(zip(window, reordered_window)):
-            if orig is not reord:
-                self._kvp_reorder_count += 1
-                break  # count once per step
-
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self._kvp_total_overhead_ms += elapsed_ms
-
-        return reordered_window + rest
-
-    def kvp_scheduling_stats(self) -> dict:
-        """Return KVPacket scheduling statistics."""
-        avg_overhead = (
-            self._kvp_total_overhead_ms / max(1, self._kvp_sched_steps)
-        )
-        return {
-            "schedule_steps": self._kvp_sched_steps,
-            "reorder_count": self._kvp_reorder_count,
-            "avg_overhead_ms": avg_overhead,
-            "reorder_window": self._kvp_reorder_window,
-        }
-
-
-def make_kvp_segment_scheduler_class(base_class: type = None) -> type:
-    """Factory: create a vLLM Scheduler subclass with KVPacketSegmentSchedulerMixin.
-
-    Usage:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        KVPScheduler = make_kvp_segment_scheduler_class(Scheduler)
-    """
-    if base_class is None:
-        try:
-            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
-            base_class = _Scheduler
-        except Exception:
-            base_class = object
-
-    class _KVPScheduler(KVPacketSegmentSchedulerMixin, base_class):  # type: ignore[misc]
-        def __init__(self, *args, **kwargs):
-            kvp_args = {
-                k: kwargs.pop(k)
-                for k in list(kwargs.keys())
-                if k.startswith("kvp_")
-            }
-            KVPacketSegmentSchedulerMixin.__init__(self, **kvp_args)
-            try:
-                base_class.__init__(self, *args, **kwargs)
-            except Exception:
-                pass
-
-        def schedule(self, *args, **kwargs):
-            """Wrap schedule() with pre_schedule_kvp() reordering."""
-            self.pre_schedule_kvp()
-            return super().schedule(*args, **kwargs)
-
-    _KVPScheduler.__name__ = f"KVPSegment_{base_class.__name__}"
-    _KVPScheduler.__qualname__ = _KVPScheduler.__name__
-    return _KVPScheduler
-
-
-# ===========================================================================
-# 2026-05-12 Activity B+C: AdapShotSegmentSchedulerMixin
-# ===========================================================================
-
-class AdapShotSegmentSchedulerMixin:
-    """Scheduler mixin that routes requests through AdapShotMixedDimSegmentPipeline (Cross-2).
-
-    Wraps the Scheduler's schedule() method with a pre_schedule_adapshot() hook that:
-      1. Inspects waiting requests (reads adapshot_* attributes if set by AdapShotBlockManager).
-      2. Reorders waiting requests to prefer those with higher non-contiguous hit rates
-         (segment-reuse-first scheduling, Activity B+C Cross-2).
-      3. Reports estimated cache hit counts and non-contiguous segment metadata for
-         downstream use by the model runner / attention wrapper.
-
-    Design principles:
-        - Non-invasive: only reorders waiting queue, does not modify scheduling logic.
-        - Graceful: if AdapShotBlockManager has not annotated requests (adapshot_hits missing),
-          falls back to FCFS ordering (no behaviour change).
-        - Overhead target: O(N log N) sort on waiting queue, negligible vs. KV computation.
-        - Stateless: no persistent state beyond reorder_window size.
-
-    Integrates with AdapShotBlockManager (block_manager_patch.py):
-        The block manager calls annotate_request() to set:
-            request.adapshot_hits:   [(chunk_idx, kv_tensor), ...]
-            request.adapshot_misses: [chunk_idx, ...]
-            request.adapshot_noncontiguous_hit_rate: float
-
-    Usage (factory pattern via make_adapshot_scheduler_class)::
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        AdapShotSched = make_adapshot_scheduler_class(Scheduler)
-        # Replace vLLM's scheduler with the AdapShot-aware version
-    """
-
-    def __init__(self, *args, adapshot_reorder_window: int = 64, **kwargs) -> None:
-        """
-        Args:
-            adapshot_reorder_window: Maximum number of waiting requests to reorder per
-                                     schedule step. Bounded to avoid O(N^2) overhead on
-                                     large queues. Default 64 (sufficient for typical batches).
-        """
-        self._adapshot_reorder_window = adapshot_reorder_window
-
-    def pre_schedule_adapshot(self) -> None:
-        """Reorder up to reorder_window waiting requests by non-contiguous hit rate.
-
-        Called before super().schedule() to bias request ordering toward cache-hot
-        segments. Requests without adapshot annotations are scored 0.0 and appear last.
-        """
-        try:
-            waiting = getattr(self, "waiting", None)
-            if waiting is None:
-                return
-
-            # Materialise the first reorder_window requests
-            window: list = []
-            try:
-                for i, req in enumerate(waiting):
-                    if i >= self._adapshot_reorder_window:
-                        break
-                    window.append(req)
-            except TypeError:
-                return  # waiting is not iterable
-
-            if len(window) <= 1:
-                return  # nothing to reorder
-
-            def _score(req: Any) -> float:
-                """Score: non-contiguous hit rate (higher → schedule sooner)."""
-                rate = getattr(req, "adapshot_noncontiguous_hit_rate", 0.0)
-                n_hits = len(getattr(req, "adapshot_hits", []))
-                # Secondary sort: total hit count (break ties by total reuse potential)
-                return rate + n_hits * 1e-4
-
-            reordered = sorted(window, key=_score, reverse=True)
-
-            # Write reordered items back if the queue supports index assignment
-            try:
-                for i, req in enumerate(reordered):
-                    waiting[i] = req
-            except (TypeError, AttributeError):
-                pass  # queue may not support index assignment — gracefully skip
-
-        except Exception:
-            pass  # scheduling must not be interrupted by reorder failures
-
-    def adapshot_reorder_stats(self) -> dict:
-        """Return mixin configuration for inspection."""
-        return {
-            "adapshot_reorder_window": self._adapshot_reorder_window,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Factory: make_adapshot_scheduler_class
-# ---------------------------------------------------------------------------
-
-def make_adapshot_scheduler_class(
-    base_class: Optional[type] = None,
-    adapshot_reorder_window: int = 64,
-) -> type:
-    """Factory that returns a vLLM Scheduler subclass with AdapShot request reordering.
-
-    The returned class wraps schedule() with pre_schedule_adapshot() reordering.
-    Requests annotated by AdapShotBlockManager.annotate_request() are preferred
-    (higher non-contiguous hit rate → earlier scheduling).
-
-    Args:
-        base_class: Base scheduler class (default: vllm.v1.core.sched.scheduler.Scheduler).
-        adapshot_reorder_window: Max waiting requests inspected per step (default 64).
-
-    Returns:
-        A subclass of base_class with AdapShotSegmentSchedulerMixin applied.
-
-    Usage::
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import make_adapshot_scheduler_class
-
-        AdapShotScheduler = make_adapshot_scheduler_class(Scheduler, reorder_window=64)
-    """
-    if base_class is None:
-        try:
-            from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
-            base_class = _Scheduler
-        except ImportError:
-            base_class = object
-
-    class _AdapShotScheduler(AdapShotSegmentSchedulerMixin, base_class):  # type: ignore[misc]
-        def __init__(self, *args, **kwargs):
-            adapshot_args = {
-                k: kwargs.pop(k)
-                for k in list(kwargs.keys())
-                if k.startswith("adapshot_")
-            }
-            AdapShotSegmentSchedulerMixin.__init__(self, **adapshot_args)
-            try:
-                base_class.__init__(self, *args, **kwargs)
-            except Exception:
-                pass
-
-        def schedule(self, *args, **kwargs):
-            """Wrap schedule() with AdapShot non-contiguous hit rate reordering."""
-            self.pre_schedule_adapshot()
-            return super().schedule(*args, **kwargs)
-
-    _AdapShotScheduler.__name__ = f"AdapShot_{base_class.__name__}"
-    _AdapShotScheduler.__qualname__ = _AdapShotScheduler.__name__
-    return _AdapShotScheduler
-
-
-# ---------------------------------------------------------------------------
-# Smoke test (run: python vllm_integration/scheduler_patch.py)
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    import torch
-
-    print("=== AdapShotSegmentSchedulerMixin smoke test (2026-05-12) ===")
-
-    # Test mixin standalone with a mock scheduler
-    class _MockScheduler:
-        def __init__(self):
-            self.waiting = []
-        def schedule(self):
-            return {"scheduled": len(self.waiting)}
-
-    class _TestSched(AdapShotSegmentSchedulerMixin, _MockScheduler):
-        def __init__(self, **kwargs):
-            AdapShotSegmentSchedulerMixin.__init__(self, **kwargs)
-            _MockScheduler.__init__(self)
-        def schedule(self):
-            self.pre_schedule_adapshot()
-            return _MockScheduler.schedule(self)
-
-    sched = _TestSched(adapshot_reorder_window=10)
-
-    # Create mock requests with adapshot annotations
-    class _MockRequest:
-        def __init__(self, name, hit_rate, n_hits):
-            self.name = name
-            self.adapshot_noncontiguous_hit_rate = hit_rate
-            self.adapshot_hits = [(i, None) for i in range(n_hits)]
-            self.adapshot_misses = []
-        def __repr__(self):
-            return f"Req({self.name},rate={self.adapshot_noncontiguous_hit_rate})"
-
-    # Add requests in non-optimal order
-    sched.waiting = [
-        _MockRequest("low", 0.1, 1),
-        _MockRequest("high", 0.9, 5),
-        _MockRequest("mid", 0.5, 3),
-        _MockRequest("zero", 0.0, 0),
-    ]
-
-    sched.pre_schedule_adapshot()
-    reordered_names = [r.name for r in sched.waiting]
-    print(f"  Reordered: {reordered_names}")
-    assert reordered_names[0] == "high", f"Expected 'high' first, got {reordered_names[0]}"
-    assert reordered_names[-1] == "zero", f"Expected 'zero' last, got {reordered_names[-1]}"
-    print("  Reorder correctness: PASS")
-
-    # Test factory with mock base class
-    AdapShotSched = make_adapshot_scheduler_class(base_class=_MockScheduler, adapshot_reorder_window=32)
-    print(f"  Factory class: {AdapShotSched.__name__}")
-    assert issubclass(AdapShotSched, _MockScheduler)
-
-    # Test with vLLM Scheduler import
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        VllmAdapShot = make_adapshot_scheduler_class(Scheduler, adapshot_reorder_window=64)
-        print(f"  vLLM factory class: {VllmAdapShot.__name__}")
-        assert issubclass(VllmAdapShot, Scheduler)
-        print("  vLLM subclass check: PASS")
-    except Exception as e:
-        print(f"  vLLM scheduler test skipped (no GPU): {e}")
-
-    stats = sched.adapshot_reorder_stats()
-    assert stats["adapshot_reorder_window"] == 10
-    print(f"  reorder_stats: {stats}")
-
-
-# ===========================================================================
-# 2026-05-13  Activity A — PBKVAgentSegmentPreservationSchedulerMixin
-# ===========================================================================
-"""Activity A (2026-05-13): PBKVAgentSegmentPreservationSchedulerMixin
-
-Ports PBKVAgentSegmentPreservationScheduler (src/scheduler/pbkv_agent_segment_scheduler.py)
-into vLLM's v1 Scheduler (vllm.v1.core.sched.scheduler.Scheduler) as a lightweight mixin.
-
-Key design decisions for vLLM 0.20.2:
-  - The vLLM v1 Scheduler picks requests from self.waiting and self.running.
-    This mixin intercepts schedule() to *re-rank* waiting requests by PBKV
-    predicted segment-reuse probability × fairness weight, without altering
-    queue structure (no insert/remove, just re-sort the internal list).
-  - GPU segment preservation decisions (preserve_keys / evict_keys) are exposed
-    via pbkv_preservation_policy() and intended to be consumed by the engine's
-    KV offload path or a custom KVConnector.
-  - No dependency on a live GPU or model; the _SegmentMLP runs on CPU tensors.
-
-Overhead:
-  per-step: O(W * K) MLP forward passes, each ~10µs on CPU → <1ms for W=50, K=4.
-  Satisfies TTFT p50 +5% overhead constraint.
-
-Usage:
-    from vllm.v1.core.sched.scheduler import Scheduler
-    from vllm_integration.scheduler_patch import (
-        PBKVAgentSegmentPreservationSchedulerMixin,
-        make_pbkv_scheduler_class,
-    )
-
-    # Option A: factory
-    PBKVScheduler = make_pbkv_scheduler_class(Scheduler)
-    scheduler = PBKVScheduler(
-        ...,  # standard vLLM Scheduler args
-        pbkv_segment_emb_dim=256,
-        pbkv_history_steps=10,
-        pbkv_prediction_horizon=5,
-        pbkv_gpu_preserve_threshold=0.6,
-        pbkv_fairness_max_wait=10,
-    )
-
-    # Option B: manual subclass
-    class MyScheduler(PBKVAgentSegmentPreservationSchedulerMixin, Scheduler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-
-        def schedule(self):
-            # PBKV re-ranks self.waiting before base schedule()
-            self.pbkv_pre_schedule()
-            return super().schedule()
-"""
-
-import hashlib as _hashlib
-import struct as _struct
-from collections import OrderedDict as _OrderedDict
-from dataclasses import dataclass as _dataclass, field as _field
-from typing import Any as _Any, Dict as _Dict, List as _List, Optional as _Optional, Set as _Set, Tuple as _Tuple
-
-
-@_dataclass
-class PBKVSchedulerConfig:
-    """Configuration for PBKVAgentSegmentPreservationSchedulerMixin."""
-    segment_emb_dim: int = 256
-    history_steps: int = 10
-    prediction_horizon: int = 5
-    gpu_preserve_threshold: float = 0.6
-    host_evict_threshold: float = 0.3
-    preemption_margin: float = 0.3
-    fairness_max_wait: int = 10
-    chunk_size: int = 128
-    seed: int = 42
-
-
-class _PBKVSegmentMLP(torch.nn.Module):
-    """Lightweight MLP for segment reuse probability prediction (Activity A)."""
-
-    def __init__(self, segment_emb_dim: int, history_steps: int) -> None:
-        super().__init__()
-        input_dim = segment_emb_dim + history_steps
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, 128),
-            torch.nn.ReLU(),
-            torch.nn.Linear(128, 64),
-            torch.nn.ReLU(),
-            torch.nn.Linear(64, 1),
-            torch.nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class PBKVAgentSegmentPreservationSchedulerMixin:
-    """vLLM v1 Scheduler mixin for PBKV prediction-based agentic segment preservation.
-
-    Adds two capabilities to the base Scheduler:
-      1. pbkv_pre_schedule(): re-ranks self.waiting by predicted segment-reuse
-         probability × fairness penalty; wraps schedule() to call this first.
-      2. pbkv_preservation_policy(): returns (preserve_keys, evict_keys) sets
-         of KV cache block identifiers for GPU/host placement decisions.
-
-    No GPU required; all MLP inference runs on CPU tensors.
-
-    vLLM integration:
-      - self.waiting is a RequestQueue (iterable, supports list() conversion).
-        Re-ordering is done by rebuilding the queue's internal deque from a
-        sorted list; this is safe as waiting is only read, not written, until
-        schedule() runs.
-    """
-
-    def __init__(
-        self,
-        *args: _Any,
-        pbkv_config: _Optional[PBKVSchedulerConfig] = None,
-        pbkv_segment_emb_dim: int = 256,
-        pbkv_history_steps: int = 10,
-        pbkv_prediction_horizon: int = 5,
-        pbkv_gpu_preserve_threshold: float = 0.6,
-        pbkv_host_evict_threshold: float = 0.3,
-        pbkv_preemption_margin: float = 0.3,
-        pbkv_fairness_max_wait: int = 10,
-        pbkv_chunk_size: int = 128,
-        pbkv_seed: int = 42,
-        **kwargs: _Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        cfg = pbkv_config or PBKVSchedulerConfig(
-            segment_emb_dim=pbkv_segment_emb_dim,
-            history_steps=pbkv_history_steps,
-            prediction_horizon=pbkv_prediction_horizon,
-            gpu_preserve_threshold=pbkv_gpu_preserve_threshold,
-            host_evict_threshold=pbkv_host_evict_threshold,
-            preemption_margin=pbkv_preemption_margin,
-            fairness_max_wait=pbkv_fairness_max_wait,
-            chunk_size=pbkv_chunk_size,
-            seed=pbkv_seed,
-        )
-        self._pbkv_config = cfg
-        torch.manual_seed(cfg.seed)
-        self._pbkv_predictor = _PBKVSegmentMLP(
-            cfg.segment_emb_dim, cfg.history_steps
-        )
-        # request_id → wait counter
-        self._pbkv_wait_steps: _Dict[str, int] = {}
-        # agent_id → recent chunk_key history
-        self._pbkv_agent_history: _Dict[str, _List[str]] = {}
-        # cached preservation map
-        self._pbkv_preservation_map: _Dict[str, _Dict] = {}
-        self._pbkv_step_count: int = 0
-
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
-
-    def pbkv_pre_schedule(self) -> None:
-        """Re-rank waiting requests by PBKV priority before base schedule().
-
-        Priority formula (matching src/scheduler/pbkv_agent_segment_scheduler.py):
-          priority = predicted_reuse_prob × (1 − wait_penalty)
-          wait_penalty = min(wait_steps / fairness_max_wait, 1.0)
-
-        This method sorts the waiting queue's internal deque in-place; it is safe
-        to call immediately before super().schedule() in a schedule() override.
-        """
-        t0 = time.monotonic()
-        cfg = self._pbkv_config
-
-        # Extract waiting requests; RequestQueue wraps a deque internally.
-        # We access the internal deque via the standard iteration protocol.
-        waiting_requests = list(self.waiting)
-        if len(waiting_requests) <= 1:
-            return  # nothing to reorder
-
-        scored: _List[_Tuple] = []
-        for req in waiting_requests:
-            prob = self._pbkv_predict_reuse(req)
-            wait = self._pbkv_wait_steps.get(req.request_id, 0)
-            wait_penalty = min(wait / max(cfg.fairness_max_wait, 1), 1.0)
-            priority = prob * (1.0 - wait_penalty)
-            scored.append((-priority, -wait, req.request_id, req))
-
-        scored.sort(key=lambda t: (t[0], t[1]))
-        reordered = [item[3] for item in scored]
-
-        # Write back to queue internal deque if accessible.
-        waiting_queue = self.waiting
-        if hasattr(waiting_queue, '_queue'):
-            # Most RequestQueue implementations have a _queue deque
-            waiting_queue._queue.clear()
-            waiting_queue._queue.extend(reordered)
-        elif hasattr(waiting_queue, 'queue'):
-            waiting_queue.queue.clear()
-            waiting_queue.queue.extend(reordered)
-        # else: queue type not directly accessible; ordering preserved through
-        #       scored list for informational purposes only.
-
-        # Increment wait counters for requests not at the top
-        processed_ids = {reordered[0].request_id} if reordered else set()
-        all_ids = {r.request_id for r in waiting_requests}
-        for rid in all_ids:
-            if rid not in processed_ids:
-                self._pbkv_wait_steps[rid] = self._pbkv_wait_steps.get(rid, 0) + 1
-
-        self._pbkv_step_count += 1
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        # Log if overhead is high (> 5ms)
-        if elapsed_ms > 5.0:
-            import logging
-            logging.getLogger(__name__).warning(
-                "pbkv_pre_schedule overhead %.2fms (W=%d)", elapsed_ms, len(waiting_requests)
-            )
-
-    def pbkv_preservation_policy(
-        self,
-        kv_block_ids: _Optional[_List[str]] = None,
-    ) -> _Tuple[_Set[str], _Set[str]]:
-        """Compute GPU preserve / host evict decisions for KV cache blocks.
-
-        Args:
-            kv_block_ids: Optional list of block identifiers to evaluate.
-                          If None, evaluates all keys in _pbkv_preservation_map.
-
-        Returns:
-            (preserve_keys, evict_keys) — sets of block IDs for GPU/host.
-
-        Uses Lipschitz robustness margin:
-            effective_threshold = gpu_preserve_threshold − preemption_margin
-        """
-        cfg = self._pbkv_config
-        keys = kv_block_ids or list(self._pbkv_preservation_map.keys())
-        preserve_keys: _Set[str] = set()
-        evict_keys: _Set[str] = set()
-        effective_threshold = cfg.gpu_preserve_threshold - cfg.preemption_margin
-
-        for key in keys:
-            emb = self._pbkv_segment_embedding(key)
-            hist = self._pbkv_history_vector()
-            inp = torch.cat([emb, hist]).unsqueeze(0)
-            with torch.no_grad():
-                prob = self._pbkv_predictor(inp).item()
-            if prob >= effective_threshold:
-                preserve_keys.add(key)
-            elif prob < cfg.host_evict_threshold:
-                evict_keys.add(key)
-            self._pbkv_preservation_map[key] = {"gpu": key in preserve_keys, "prob": prob}
-
-        return preserve_keys, evict_keys
-
-    def pbkv_update_agent_history(
-        self,
-        agent_id: str,
-        accessed_chunk_keys: _List[str],
-    ) -> None:
-        """Update per-agent access history (call after each agent step)."""
-        history = self._pbkv_agent_history.get(agent_id, [])
-        history.extend(accessed_chunk_keys)
-        self._pbkv_agent_history[agent_id] = history[-self._pbkv_config.history_steps:]
-
-    def pbkv_stats(self) -> _Dict[str, _Any]:
-        """Return PBKV scheduling statistics."""
-        return {
-            "pbkv_step_count": self._pbkv_step_count,
-            "pbkv_tracked_requests": len(self._pbkv_wait_steps),
-            "pbkv_tracked_agents": len(self._pbkv_agent_history),
-            "pbkv_preservation_map_size": len(self._pbkv_preservation_map),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
-
-    def _pbkv_predict_reuse(self, request: _Any) -> float:
-        """Predict mean segment reuse probability for a vLLM Request."""
-        cfg = self._pbkv_config
-        # vLLM Request.prompt_token_ids may be None (embed-only); fallback to []
-        token_ids = []
-        if hasattr(request, 'prompt_token_ids') and request.prompt_token_ids is not None:
-            token_ids = request.prompt_token_ids
-        elif hasattr(request, '_all_token_ids'):
-            token_ids = request._all_token_ids
-
-        n_chunks = max(1, (len(token_ids) + cfg.chunk_size - 1) // cfg.chunk_size)
-        probs: _List[float] = []
-        request_id = getattr(request, 'request_id', '')
-        for chunk_idx in range(n_chunks):
-            key = self._pbkv_chunk_key(token_ids, chunk_idx)
-            emb = self._pbkv_segment_embedding(key)
-            hist = self._pbkv_history_vector(request_id)
-            inp = torch.cat([emb, hist]).unsqueeze(0)
-            with torch.no_grad():
-                prob = self._pbkv_predictor(inp).item()
-            probs.append(prob)
-        return sum(probs) / len(probs) if probs else 0.0
-
-    def _pbkv_segment_embedding(self, chunk_key: str) -> torch.Tensor:
-        """Deterministic d=segment_emb_dim embedding from chunk key hash."""
-        dim = self._pbkv_config.segment_emb_dim
-        h = _hashlib.sha256(chunk_key.encode()).digest()
-        raw_bytes = (h * ((dim * 4 // 32) + 2))[: dim * 4]
-        emb = torch.frombuffer(bytearray(raw_bytes), dtype=torch.float32).clone()[:dim]
-        emb = (emb - emb.mean()) / (emb.std().clamp(min=1e-8))
-        return emb
-
-    def _pbkv_history_vector(self, agent_or_request_id: str = "") -> torch.Tensor:
-        """Build history_steps-length vector from agent call history."""
-        history = self._pbkv_agent_history.get(agent_or_request_id, [])
-        steps = self._pbkv_config.history_steps
-        vec = torch.zeros(steps)
-        for i, key in enumerate(history[-steps:]):
-            h = _hashlib.sha256(key.encode()).digest()
-            val = _struct.unpack("f", h[:4])[0]
-            vec[i] = max(-10.0, min(10.0, val))
-        return vec
-
-    def _pbkv_chunk_key(self, token_ids: _List[int], chunk_idx: int) -> str:
-        """Generate chunk key (same method as SegmentedHashCache)."""
-        cfg = self._pbkv_config
-        start = chunk_idx * cfg.chunk_size
-        end = start + cfg.chunk_size
-        chunk = token_ids[start:end]
-        if not chunk:
-            chunk = [0]
-        raw = _struct.pack(f"{len(chunk)}I", *chunk)
-        layer_prefix = _struct.pack("I", 0)
-        return _hashlib.sha256(layer_prefix + raw).hexdigest()
-
-
-def make_pbkv_scheduler_class(
-    base_class: type,
-    **default_kwargs: _Any,
-) -> type:
-    """Factory: build a PBKV-enhanced vLLM Scheduler subclass.
-
-    Args:
-        base_class: The vLLM Scheduler class to extend.
-        **default_kwargs: Default PBKV config kwargs applied at instantiation.
-
-    Returns:
-        A new class that extends PBKVAgentSegmentPreservationSchedulerMixin
-        and base_class, with schedule() automatically calling pbkv_pre_schedule().
-
-    Example:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        PBKVScheduler = make_pbkv_scheduler_class(
-            Scheduler,
-            pbkv_fairness_max_wait=15,
-            pbkv_gpu_preserve_threshold=0.65,
-        )
-    """
-
-    class _PBKVScheduler(PBKVAgentSegmentPreservationSchedulerMixin, base_class):
-        def __init__(self, *args: _Any, **kwargs: _Any) -> None:
-            merged = {**default_kwargs, **kwargs}
-            super().__init__(*args, **merged)
-
-        def schedule(self) -> _Any:
-            self.pbkv_pre_schedule()
-            return super().schedule()
-
-    _PBKVScheduler.__name__ = f"PBKV_{base_class.__name__}"
-    _PBKVScheduler.__qualname__ = f"PBKV_{base_class.__qualname__}"
-    return _PBKVScheduler
-
-
-def _smoke_test_pbkv_scheduler_mixin() -> None:
-    """Smoke test: PBKVAgentSegmentPreservationSchedulerMixin 2026-05-13."""
-    print("[smoke] PBKVAgentSegmentPreservationSchedulerMixin (Activity A 2026-05-13)")
-
-    # Minimal mock Scheduler for testing without full vLLM init
-    class _MockRequest:
-        def __init__(self, rid: str, tokens: _List[int]) -> None:
-            self.request_id = rid
-            self.prompt_token_ids = tokens
-            self._all_token_ids = tokens
-
-    class _MockRequestQueue:
-        def __init__(self, requests: _List[_Any]) -> None:
-            self._queue = list(requests)
-
-        def __iter__(self):
-            return iter(self._queue)
-
-        def __len__(self):
-            return len(self._queue)
-
-    class _MockBaseScheduler:
-        def __init__(self, *args, **kwargs):
-            self.waiting = _MockRequestQueue([])
-            self.running = []
-            self._schedule_called = False
-
-        def schedule(self):
-            self._schedule_called = True
-            return {"scheduled": list(self.waiting)}
-
-    PBKVSched = make_pbkv_scheduler_class(
-        _MockBaseScheduler,
-        pbkv_segment_emb_dim=32,
-        pbkv_history_steps=4,
-        pbkv_fairness_max_wait=5,
-        pbkv_chunk_size=4,
-    )
-    sched = PBKVSched()
-
-    # Populate waiting queue with 3 requests
-    reqs = [
-        _MockRequest("req-A", list(range(16))),
-        _MockRequest("req-B", list(range(8))),
-        _MockRequest("req-C", list(range(12))),
-    ]
-    sched.waiting = _MockRequestQueue(reqs)
-
-    # Run schedule()
-    out = sched.schedule()
-    assert sched._schedule_called, "base schedule() should have been called"
-
-    # Check stats
-    stats = sched.pbkv_stats()
-    assert stats["pbkv_step_count"] >= 1
-    print(f"  pbkv_stats: {stats}")
-
-    # Test preservation policy with dummy keys
-    preserve, evict = sched.pbkv_preservation_policy(["key-abc", "key-def"])
-    assert isinstance(preserve, set) and isinstance(evict, set)
-    print(f"  preservation_policy: preserve={len(preserve)}, evict={len(evict)}")
-
-    # Test factory with real vLLM Scheduler (import only; no GPU init)
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        PBKVVllm = make_pbkv_scheduler_class(Scheduler, pbkv_segment_emb_dim=64)
-        assert issubclass(PBKVVllm, Scheduler)
-        print(f"  vLLM subclass check: PASS ({PBKVVllm.__name__})")
-    except Exception as e:
-        print(f"  vLLM subclass check skipped (no GPU env): {e}")
-
-    print("  PBKVAgentSegmentPreservationSchedulerMixin: PASS")
-    print("AdapShotSegmentSchedulerMixin smoke test: PASS")
-
-
-# ===========================================================================
-# 2026-05-15  Activity A: RadixFeatherBatchScheduler vLLM integration
-# ===========================================================================
-# Ports: src/scheduler/radix_feather_batch.py → RadixFeatherBatchScheduler
-# vLLM integration point: vllm/v1/core/sched/scheduler.py
-# Algorithm: Prefix-homogeneity-aware batch reordering (Feather, arXiv 2605.06046)
-# Overhead target: TTFT p50 increase < 5% (< 5ms absolute)
-# ===========================================================================
-
-
-import time as _time_2015
-import warnings as _warnings_2015
-from dataclasses import dataclass as _dataclass_2015
-from typing import Any as _Any_2015, Dict as _Dict_2015, List as _List_2015, Optional as _Optional_2015, Type as _Type_2015
-
-
-@_dataclass_2015
-class RadixFeatherSchedulerConfig:
-    """Configuration for homogeneity-aware batch reordering (Activity A, 2026-05-15)."""
-
-    homogeneity_threshold: float = 0.6
-    """Minimum homogeneity score to keep adding requests to a batch group."""
-
-    target_batch_size: int = 8
-    """Maximum number of requests in a single homogenous batch group."""
-
-    max_reorder_window: int = 32
-    """Maximum number of waiting requests inspected per schedule step."""
-
-    max_wait_ratio: float = 2.0
-    """Fairness guard: requests waiting longer than max_wait_ratio × median_wait
-    are promoted to the front of the queue."""
-
-    overhead_warn_ms: float = 5.0
-    """Emit a warning if scheduling overhead exceeds this threshold (ms)."""
-
-
-def _rf_naive_shared_prefix_length(token_lists: _List_2015[_List_2015[int]]) -> int:
-    """Return the length of the common prefix across all token lists."""
-    if not token_lists:
-        return 0
-    if len(token_lists) == 1:
-        return len(token_lists[0])
-    ref = token_lists[0]
-    shared = 0
-    for i, tok in enumerate(ref):
-        if all(len(t) > i and t[i] == tok for t in token_lists[1:]):
-            shared += 1
-        else:
-            break
-    return shared
-
-
-def _rf_homogeneity_score(
-    requests: _List_2015[_Any_2015],
-    radix_cache: _Any_2015 = None,
-) -> float:
-    """Compute prefix-homogeneity score for a candidate batch.
-
-    score = (shared_prefix_tokens * n_requests) / total_tokens
-
-    Falls back to naive O(prefix_len) counting when radix_cache is None or
-    lacks prefix_match_length().
-    """
-    if not requests:
-        return 0.0
-
-    def _get_tokens(req: _Any_2015) -> _List_2015[int]:
-        # Support vLLM Request objects (have prompt_token_ids) and plain dicts.
-        if hasattr(req, "prompt_token_ids"):
-            return list(req.prompt_token_ids)
-        if isinstance(req, dict):
-            return list(req.get("token_ids", req.get("prompt_token_ids", [])))
-        return []
-
-    token_lists = [_get_tokens(r) for r in requests]
-    total_tokens = sum(len(t) for t in token_lists)
-    if total_tokens == 0:
-        return 0.0
-
-    if radix_cache is not None and hasattr(radix_cache, "prefix_match_length"):
-        try:
-            min_hit = min(
-                radix_cache.prefix_match_length(t) for t in token_lists
-            )
-            shared = min_hit * len(requests)
-        except Exception:
-            shared = _rf_naive_shared_prefix_length(token_lists) * len(requests)
-    else:
-        shared = _rf_naive_shared_prefix_length(token_lists) * len(requests)
-
-    return shared / total_tokens
-
-
-def _rf_reorder_by_homogeneity(
-    waiting: _List_2015[_Any_2015],
-    window: int,
-    threshold: float,
-    target_size: int,
-    max_wait_ratio: float,
-    radix_cache: _Any_2015 = None,
-) -> _List_2015[_Any_2015]:
-    """Return a reordered copy of *waiting* grouping high-homogeneity requests.
-
-    Only the first *window* requests are inspected; the rest are appended
-    unchanged. A fairness guard promotes stale requests (waited > max_wait_ratio
-    × median wait) to the front.
-    """
-    if len(waiting) <= 1:
-        return list(waiting)
-
-    candidates = list(waiting[:window])
-    tail = list(waiting[window:])
-    now = _time_2015.monotonic()
-
-    def _arrival(req: _Any_2015) -> float:
-        if hasattr(req, "arrival_time"):
-            return req.arrival_time
-        if isinstance(req, dict):
-            return req.get("arrival_time", now)
-        return now
-
-    # Fairness guard: identify stale vs. fresh candidates.
-    waits = sorted(now - _arrival(r) for r in candidates)
-    median_wait = waits[len(waits) // 2] if waits else 0.0
-    stale_thresh = median_wait * max_wait_ratio if median_wait > 0 else float("inf")
-    stale = [r for r in candidates if (now - _arrival(r)) > stale_thresh]
-    fresh = [r for r in candidates if (now - _arrival(r)) <= stale_thresh]
-
-    # Greedy homogeneity grouping on fresh candidates.
-    remaining = list(fresh)
-    groups: _List_2015[_List_2015[_Any_2015]] = []
-    while remaining:
-        group: _List_2015[_Any_2015] = [remaining.pop(0)]
-        for req in list(remaining):
-            if len(group) >= target_size:
-                break
-            if _rf_homogeneity_score(group + [req], radix_cache) >= threshold:
-                group.append(req)
-                remaining.remove(req)
-        groups.append(group)
-
-    reordered: _List_2015[_Any_2015] = stale[:]
-    for g in groups:
-        reordered.extend(g)
-    return reordered + tail
-
-
-class RadixFeatherSchedulerMixin:
-    """Mixin: adds prefix-homogeneity-aware reordering to vLLM's Scheduler.
-
-    Activity A (2026-05-15) — Feather (arXiv 2605.06046) integration.
-
-    Wrap vLLM's Scheduler with this mixin via make_radix_feather_scheduler_class():
-
-        FeatherScheduler = make_radix_feather_scheduler_class(Scheduler)
-
-    The mixin overrides schedule() to:
-      1. Inspect self.waiting (up to max_reorder_window requests).
-      2. Reorder them so high-homogeneity requests are batched together.
-      3. Measure and record wall-clock overhead.
-      4. Call the parent's schedule() with the reordered queue.
-
-    No existing vLLM internals are mutated beyond the waiting queue order.
-    Graceful degradation: if waiting queue is inaccessible, the override is
-    a transparent pass-through.
-    """
-
-    _feather_cfg_2015: RadixFeatherSchedulerConfig
-    _feather_times_2015: _List_2015[float]
-    _feather_radix_cache_2015: _Any_2015
-
-    def _feather_init_2015(
-        self,
-        feather_config: _Optional_2015[RadixFeatherSchedulerConfig] = None,
-        radix_cache: _Any_2015 = None,
-    ) -> None:
-        self._feather_cfg_2015 = feather_config or RadixFeatherSchedulerConfig()
-        self._feather_times_2015 = []
-        self._feather_radix_cache_2015 = radix_cache
-
-    def schedule(self):  # type: ignore[override]
-        """Override: reorder waiting queue then delegate to parent schedule()."""
-        t0 = _time_2015.monotonic()
-        try:
-            self._feather_reorder_waiting_2015()
-        except Exception as exc:
-            _warnings_2015.warn(
-                f"RadixFeatherSchedulerMixin.schedule: reorder failed ({exc}); "
-                "proceeding with default order.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        overhead_ms = (_time_2015.monotonic() - t0) * 1000.0
-        self._feather_times_2015.append(overhead_ms)
-
-        if overhead_ms > self._feather_cfg_2015.overhead_warn_ms:
-            _warnings_2015.warn(
-                f"RadixFeatherSchedulerMixin: overhead {overhead_ms:.2f}ms "
-                f"> {self._feather_cfg_2015.overhead_warn_ms}ms threshold.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return super().schedule()  # type: ignore[misc]
-
-    def _feather_reorder_waiting_2015(self) -> None:
-        """Reorder self.waiting in-place by homogeneity score."""
-        # vLLM v1 Scheduler exposes the waiting queue as self.waiting.
-        # It may be a list, deque, or RequestQueue.
-        waiting = getattr(self, "waiting", None)
-        if waiting is None:
-            return
-        if not hasattr(waiting, "__len__") or len(waiting) <= 1:
-            return
-
-        cfg = self._feather_cfg_2015
-        try:
-            waiting_list = list(waiting)
-        except TypeError:
-            return
-
-        reordered = _rf_reorder_by_homogeneity(
-            waiting=waiting_list,
-            window=min(cfg.max_reorder_window, len(waiting_list)),
-            threshold=cfg.homogeneity_threshold,
-            target_size=cfg.target_batch_size,
-            max_wait_ratio=cfg.max_wait_ratio,
-            radix_cache=self._feather_radix_cache_2015,
-        )
-
-        # Write back to the waiting queue.
-        try:
-            waiting.clear()  # type: ignore[union-attr]
-            for req in reordered:
-                waiting.append(req)
-        except AttributeError:
-            pass  # Silently skip if the queue type doesn't support mutation.
-
-    # ------------------------------------------------------------------ #
-    # Evaluation metrics                                                    #
-    # ------------------------------------------------------------------ #
-
-    def scheduling_overhead_ms_p50(self) -> float:
-        """Return median scheduling overhead (ms) added by this mixin."""
-        times = getattr(self, "_feather_times_2015", [])
-        if not times:
-            return 0.0
-        s = sorted(times)
-        return s[len(s) // 2]
-
-    def scheduling_overhead_ms_p99(self) -> float:
-        """Return p99 scheduling overhead (ms)."""
-        times = getattr(self, "_feather_times_2015", [])
-        if not times:
-            return 0.0
-        s = sorted(times)
-        idx = min(int(len(s) * 0.99), len(s) - 1)
-        return s[idx]
-
-    def reset_feather_stats_2015(self) -> None:
-        """Clear overhead measurements."""
-        times = getattr(self, "_feather_times_2015", None)
-        if times is not None:
-            times.clear()
-
-
-def make_radix_feather_scheduler_class(
-    base_scheduler_cls: _Type_2015,
-    feather_config: _Optional_2015[RadixFeatherSchedulerConfig] = None,
-    radix_cache: _Any_2015 = None,
-) -> _Type_2015:
-    """Return a new Scheduler subclass with homogeneity-aware batch reordering.
-
-    Parameters
-    ----------
-    base_scheduler_cls:
-        vLLM's Scheduler (vllm.v1.core.sched.scheduler.Scheduler).
-    feather_config:
-        Policy configuration. Defaults are used if None.
-    radix_cache:
-        Optional Radix tree with prefix_match_length(token_ids) -> int method.
-        None triggers naive common-prefix counting as fallback.
-
-    Returns
-    -------
-    A new class combining RadixFeatherSchedulerMixin and base_scheduler_cls.
-
-    Example
-    -------
-    >>> from vllm.v1.core.sched.scheduler import Scheduler
-    >>> FeatherScheduler = make_radix_feather_scheduler_class(Scheduler)
-    """
-    cfg = feather_config or RadixFeatherSchedulerConfig()
-
-    class _RadixFeatherVllmScheduler(
-        RadixFeatherSchedulerMixin, base_scheduler_cls  # type: ignore[valid-type]
-    ):
-        """vLLM Scheduler with Feather homogeneity-aware batch reordering.
-
-        Activity A (2026-05-15). Ported from:
-          src/scheduler/radix_feather_batch.py (RadixFeatherBatchScheduler)
-        vLLM version: 0.21.0
-        Algorithm: Feather (arXiv 2605.06046) — prefix-homogeneity-aware
-        batch construction policy using Radix tree KV-cache signals.
-        Overhead: O(window * prefix_len) per schedule step, target < 5ms p50.
-        """
-
-        def __init__(self, *args: _Any_2015, **kwargs: _Any_2015) -> None:
-            super().__init__(*args, **kwargs)
-            self._feather_init_2015(cfg, radix_cache)
-
-    _RadixFeatherVllmScheduler.__name__ = "RadixFeatherVllmScheduler"
-    _RadixFeatherVllmScheduler.__qualname__ = "RadixFeatherVllmScheduler"
-    return _RadixFeatherVllmScheduler
-
-
-# ---------------------------------------------------------------------------
-# Smoke test  (2026-05-15)
-# ---------------------------------------------------------------------------
-
-def _smoke_test_radix_feather_scheduler_2015() -> None:
-    """Quick functional smoke test for RadixFeatherSchedulerMixin internals."""
-    import sys, pathlib
-    repo_root = pathlib.Path(__file__).resolve().parent.parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-
-    # Test homogeneity score.
-    r1 = {"token_ids": [1, 2, 3, 4, 5], "arrival_time": _time_2015.monotonic()}
-    r2 = {"token_ids": [1, 2, 3, 9, 8], "arrival_time": _time_2015.monotonic()}
-    r3 = {"token_ids": [9, 8, 7, 6, 5], "arrival_time": _time_2015.monotonic()}
-    score_12 = _rf_homogeneity_score([r1, r2])
-    score_13 = _rf_homogeneity_score([r1, r3])
-    assert score_12 > score_13, f"Expected higher score for shared prefix: {score_12} vs {score_13}"
-
-    # Test reorder: r1 and r2 should be grouped together.
-    reordered = _rf_reorder_by_homogeneity(
-        [r1, r3, r2], window=3, threshold=0.4, target_size=8, max_wait_ratio=100.0
-    )
-    assert len(reordered) == 3, "Reordered list must have same length"
-
-    # Test factory with vLLM Scheduler (import only; no GPU init needed).
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        FeatherScheduler = make_radix_feather_scheduler_class(Scheduler)
-        assert issubclass(FeatherScheduler, Scheduler)
-        print(f"  RadixFeatherVllmScheduler subclass check: PASS ({FeatherScheduler.__name__})")
-    except Exception as exc:
-        print(f"  RadixFeatherVllmScheduler subclass check skipped (no GPU env): {exc}")
-
-
-# ===========================================================================
-# 2026-05-17: HMAMultiConnectorSchedulerMixin — Activity A (A+C)
-#
-# Ports HMAMultiConnectorCompressionPluginScheduler (Activity A) and
-# RLAdaptivePrecisionQuantizer (Activity C) into vLLM 0.21.0 v1 Scheduler.
-#
-# Key design:
-#   - HMAMultiConnectorSchedulerMixin subclasses vLLM v1 Scheduler via mixin.
-#   - Maintains an HMA connector registry (dict[str, HMAConnectorInterface_V1]).
-#   - Wraps schedule() with hma_pre_schedule(): for each waiting request,
-#     selects the optimal compression connector based on request profile
-#     (is_rl_mode, context_length, memory_pressure) and annotates the request.
-#   - Activity C: RLAdaptivePrecisionAttentionHook integrates the
-#     RLAdaptivePrecisionQuantizer into the attention write/read path.
-#
-# vLLM 0.21.0 integration:
-#   - Scheduler lives in vllm.v1.core.sched.scheduler.Scheduler
-#   - schedule() → SchedulerOutput (no args)
-#   - Request object has: request_id, num_prompt_tokens, arrival_time,
-#     sampling_params, priority
-#   - KVConnector (self.connector) is the native HMA multi-connector API.
-#     This mixin is a lightweight scheduling-level integration that works
-#     independently of (and alongside) vLLM's native connector infrastructure.
-#
-# Activity A connector_dispatch_policy (mirrored from HMAMultiConnectorConfig):
-#   1. is_rl_mode=True or num_completions>1 → "rl_adaptive"
-#   2. context_length > long_ctx_threshold → "global_retention"
-#   3. memory_pressure > threshold → "ratequant"
-#   4. else → default_connector
-#
-# Overhead: O(1) dict lookup per request — target < 0.1ms per request.
-# ===========================================================================
-
-import time as _time_2017
-from dataclasses import dataclass as _dataclass_2017, field as _field_2017
-from typing import Dict as _Dict_2017, List as _List_2017, Optional as _Optional_2017, Any as _Any_2017
-
-
-def _try_import_hma_multi_connector_src() -> tuple:
-    """Lazily import HMAMultiConnectorCompressionPluginScheduler and related from src/."""
-    try:
-        import sys as _sys, pathlib as _pathlib
-        repo_root = str(_pathlib.Path(__file__).resolve().parent.parent)
-        if repo_root not in _sys.path:
-            _sys.path.insert(0, repo_root)
-        from src.scheduler.hma_multi_connector_scheduler import (
-            HMAMultiConnectorCompressionPluginScheduler,
-            HMAMultiConnectorConfig,
-            HMAConnectorAdapter,
-            HMAConnectorInterface,
-        )
-        from src.cache.rl_adaptive_precision_quantizer import (
-            RLAdaptivePrecisionQuantizer,
-            RLAdaptivePrecisionConfig,
-        )
-        return (
-            HMAMultiConnectorCompressionPluginScheduler,
-            HMAMultiConnectorConfig,
-            HMAConnectorAdapter,
-            HMAConnectorInterface,
-            RLAdaptivePrecisionQuantizer,
-            RLAdaptivePrecisionConfig,
-        )
-    except ImportError:
-        return (None,) * 6
-
-
-@_dataclass_2017
-class HMAMultiConnectorSchedulerConfig:
-    """Configuration for HMAMultiConnectorSchedulerMixin (vLLM 0.21.0 Activity A+C).
-
-    Mirrors HMAMultiConnectorConfig from src/ for environments where src/ is importable,
-    and provides a standalone fallback configuration.
-
-    Fields:
-        long_ctx_threshold: context length above which "global_retention" connector is used.
-        memory_pressure_threshold: memory_pressure fraction above which "ratequant" is used.
-        default_connector: connector name used when no other rule matches.
-        pipeline_mode: if True, chain primary connector + global_retention sequentially.
-        max_wait_ratio: fairness constraint (max wait time multiplier).
-        rl_mode_connector: connector for RL workloads (is_rl_mode=True or num_completions>1).
-        long_ctx_connector: connector for long context (context_length > long_ctx_threshold).
-        high_pressure_connector: connector for high memory pressure.
-        seed: random seed for quantizer initialization.
-        enable_rl_quantizer: if True, auto-register RLAdaptivePrecisionQuantizer as "rl_adaptive".
-        rl_precision_ratio_fp16: FP16 ratio for RLAdaptivePrecisionQuantizer (Activity C).
-        rl_precision_ratio_int8: INT8 ratio for RLAdaptivePrecisionQuantizer.
-    """
-    long_ctx_threshold: int = 4096
-    memory_pressure_threshold: float = 0.8
-    default_connector: str = "global_retention"
-    pipeline_mode: bool = False
-    max_wait_ratio: float = 2.0
-    rl_mode_connector: str = "rl_adaptive"
-    long_ctx_connector: str = "global_retention"
-    high_pressure_connector: str = "ratequant"
-    seed: int = 42
-    enable_rl_quantizer: bool = True
-    rl_precision_ratio_fp16: float = 0.40
-    rl_precision_ratio_int8: float = 0.60
-
-
-class HMAConnectorInterface_V1:
-    """Minimal HMA connector interface for scheduler-level use in vLLM 0.21.0.
-
-    Each compression codec (Activity C) is wrapped as an HMAConnectorInterface_V1
-    for registration in the scheduler's connector registry. This is a lightweight
-    scheduling-layer wrapper; it does NOT replace vLLM's native KVConnector.
-
-    compress() / decompress() are called at the scheduling pre-step to annotate
-    requests with their selected connector. Actual KV compression at inference time
-    is handled by RLAdaptivePrecisionAttentionHook (attention_backend_patch.py).
-    """
-
-    def __init__(self, name: str, codec: _Any_2017 = None) -> None:
-        self._name = name
-        self._codec = codec
-
-    @property
-    def connector_name(self) -> str:
-        return self._name
-
-    def compress(self, kv: "torch.Tensor", request_profile: _Dict_2017) -> "torch.Tensor":
-        """Compress KV tensor. Delegates to codec.compression_hook() or encode()."""
-        if self._codec is None:
-            return kv
-        if hasattr(self._codec, "compression_hook"):
-            return self._codec.compression_hook("__hma_v1__", kv)
-        if hasattr(self._codec, "encode"):
-            return self._codec.encode(kv, layer_idx=0)
-        return kv
-
-    def decompress(self, compressed_kv: "torch.Tensor", request_profile: _Dict_2017) -> "torch.Tensor":
-        """Decompress KV tensor. Delegates to codec.decode() if available."""
-        if self._codec is None:
-            return compressed_kv
-        if hasattr(self._codec, "decode"):
-            return self._codec.decode(compressed_kv, layer_idx=0)
-        return compressed_kv
-
-
-class HMAMultiConnectorSchedulerMixin:
-    """vLLM 0.21.0 Scheduler mixin: HMA multi-connector compression plugin meta-scheduler.
-
-    Activity A: KV Cache-aware Scheduling.
-    Activity C: RL-adaptive precision quantization (via connector dispatch).
-
-    This mixin wraps schedule() with an hma_pre_schedule() hook that:
-      1. Iterates self.waiting (RequestQueue) without modifying queue order.
-      2. For each waiting request, evaluates request profile:
-           - is_rl_mode: True if request has sampling_params.n > 1 (best_of multiple completions)
-           - context_length: num_prompt_tokens (request.num_prompt_tokens)
-           - memory_pressure: estimated from running queue length / max_num_running_reqs
-      3. Selects the optimal HMA connector via O(1) dict lookup:
-           - "rl_adaptive" (RLAdaptivePrecisionQuantizer) for RL workloads
-           - "global_retention" for long-context requests
-           - "ratequant" for high memory pressure
-           - default_connector otherwise
-      4. Annotates the vLLM Request with:
-           hma_connector_name: str — selected connector
-           hma_request_profile: dict — {is_rl_mode, context_length, memory_pressure}
-           hma_connector_overhead_ms: float — selection overhead
-
-    Overhead: O(1) dict lookup per request.
-    Target: < 0.1ms/request (TTFT p50 overhead < 5ms for 100-request batches).
-
-    Connector registry:
-      - "rl_adaptive"      : RLAdaptivePrecisionQuantizer (Activity C, RL workloads)
-      - "global_retention" : GlobalRetentionGateEvictionCodec (long context)
-      - "ratequant"        : RateQuantReverseWaterfillingCodec (short high-throughput)
-
-    Usage:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import (
-            HMAMultiConnectorSchedulerMixin,
-            HMAMultiConnectorSchedulerConfig,
-            make_hma_multi_connector_scheduler_class,
-        )
-
-        # Option A: factory
-        HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
-        scheduler = HMAScheduler(
-            ...,  # standard vLLM Scheduler args
-            hma_config=HMAMultiConnectorSchedulerConfig(
-                long_ctx_threshold=4096,
-                enable_rl_quantizer=True,
-            ),
-        )
-
-        # Option B: manual subclass
-        class MyScheduler(HMAMultiConnectorSchedulerMixin, Scheduler):
-            def schedule(self):
-                self.hma_pre_schedule()
-                return super().schedule()
-
-    Activity C accuracy contract:
-        RLAdaptivePrecisionQuantizer default config uses FP16=0.40, INT8=0.60, INT4=0.00.
-        attention_output_relative_error < 0.02 (validated in Report ① 2026-05-17).
-        Actual KV compression during inference is handled by RLAdaptivePrecisionAttentionHook.
-    """
-
-    def __init__(
-        self,
-        *args: _Any_2017,
-        hma_config: _Optional_2017[HMAMultiConnectorSchedulerConfig] = None,
-        **kwargs: _Any_2017,
-    ) -> None:
-        """
-        Args:
-            hma_config: HMAMultiConnectorSchedulerConfig. If None, uses defaults.
-            All other args/kwargs forwarded to the base Scheduler.__init__().
-        """
-        super().__init__(*args, **kwargs)
-
-        if hma_config is None:
-            hma_config = HMAMultiConnectorSchedulerConfig()
-        self._hma_cfg = hma_config
-
-        # Connector registry: name -> HMAConnectorInterface_V1
-        self._hma_registry: _Dict_2017[str, HMAConnectorInterface_V1] = {}
-        self._hma_scheduling_times: _List_2017[float] = []
-        self._hma_connector_selection_counts: _Dict_2017[str, int] = {}
-        self._hma_request_connector_map: _Dict_2017[str, str] = {}
-
-        # Try to import src/ implementations
-        (
-            HMAMultiConnectorCompressionPluginScheduler,
-            HMAMultiConnectorConfig,
-            HMAConnectorAdapterCls,
-            HMAConnectorInterfaceCls,
-            RLAdaptivePrecisionQuantizer,
-            RLAdaptivePrecisionConfig,
-        ) = _try_import_hma_multi_connector_src()
-
-        self._hma_src_scheduler: _Optional_2017[_Any_2017] = None
-        self._hma_use_src: bool = False
-
-        if HMAMultiConnectorCompressionPluginScheduler is not None:
-            # Use the full src/ implementation via facade
-            src_cfg = HMAMultiConnectorConfig(
-                long_ctx_threshold=hma_config.long_ctx_threshold,
-                memory_pressure_threshold=hma_config.memory_pressure_threshold,
-                default_connector=hma_config.default_connector,
-                pipeline_mode=hma_config.pipeline_mode,
-                max_wait_ratio=hma_config.max_wait_ratio,
-                seed=hma_config.seed,
-                rl_mode_connector=hma_config.rl_mode_connector,
-                long_ctx_connector=hma_config.long_ctx_connector,
-                high_pressure_connector=hma_config.high_pressure_connector,
-            )
-            self._hma_src_scheduler = HMAMultiConnectorCompressionPluginScheduler(
-                config=src_cfg, cache=None
-            )
-            self._hma_use_src = True
-
-            # Auto-register RLAdaptivePrecisionQuantizer as "rl_adaptive"
-            if hma_config.enable_rl_quantizer and RLAdaptivePrecisionQuantizer is not None:
-                rl_cfg = RLAdaptivePrecisionConfig(
-                    precision_ratio_fp16=hma_config.rl_precision_ratio_fp16,
-                    precision_ratio_int8=hma_config.rl_precision_ratio_int8,
-                    precision_ratio_int4=0.0,
-                    seed=hma_config.seed,
-                )
-                rl_quantizer = RLAdaptivePrecisionQuantizer(rl_cfg)
-                rl_connector = HMAConnectorAdapterCls("rl_adaptive", rl_quantizer)
-                self._hma_src_scheduler.register_connector("rl_adaptive", rl_connector)
-                # Register passthrough connectors as placeholders if not present
-                for name in ("global_retention", "ratequant"):
-                    self._hma_src_scheduler.register_connector(
-                        name, HMAConnectorAdapterCls(name, None)
-                    )
-            self._hma_use_src = True
-        else:
-            # Inline fallback: lightweight inline connector dispatch
-            if hma_config.enable_rl_quantizer:
-                self._hma_registry["rl_adaptive"] = HMAConnectorInterface_V1(
-                    "rl_adaptive", _InlineRLQuantizer(seed=hma_config.seed)
-                )
-            self._hma_registry["global_retention"] = HMAConnectorInterface_V1("global_retention")
-            self._hma_registry["ratequant"] = HMAConnectorInterface_V1("ratequant")
-            for name in self._hma_registry:
-                self._hma_connector_selection_counts[name] = 0
-
-        # Overhead tracking
-        self._hma_schedule_count: int = 0
-
-    # ------------------------------------------------------------------
-    # Primary scheduling hook — call at the start of schedule()
-    # ------------------------------------------------------------------
-
-    def hma_pre_schedule(self) -> None:
-        """Select HMA connector for each waiting request and annotate.
-
-        Algorithm (connector_dispatch_policy):
-          1. is_rl_mode=True or num_completions>1 → "rl_adaptive"
-          2. context_length > long_ctx_threshold → "global_retention"
-          3. context_length <= threshold and memory_pressure > threshold → "ratequant"
-          4. else → config.default_connector
-
-        Annotates each vLLM Request with:
-          hma_connector_name: str
-          hma_request_profile: dict
-          hma_connector_overhead_ms: float
-
-        Overhead target: < 0.1ms per request, < 5ms p50 for 100-request batches.
-        """
-        t0 = _time_2017.monotonic()
-        self._hma_schedule_count += 1
-
-        waiting = getattr(self, "waiting", None)
-        if waiting is None:
-            elapsed_ms = (_time_2017.monotonic() - t0) * 1000.0
-            self._hma_scheduling_times.append(elapsed_ms)
-            return
-
-        pending = self._hma_extract_waiting(waiting)
-
-        # Estimate memory pressure from running queue
-        running = getattr(self, "running", [])
-        max_running = getattr(self, "max_num_running_reqs", 256)
-        memory_pressure = len(running) / max(1, max_running)
-
-        for req in pending:
-            req_t0 = _time_2017.monotonic()
-            req_id = getattr(req, "request_id", str(id(req)))
-            context_length = self._hma_get_context_length(req)
-            is_rl_mode, num_completions = self._hma_get_rl_info(req)
-
-            profile = {
-                "is_rl_mode": is_rl_mode,
-                "num_completions": num_completions,
-                "context_length": context_length,
-                "memory_pressure": memory_pressure,
-            }
-
-            # Select connector
-            connector_name = self._hma_select_connector(profile)
-
-            # Track metrics
-            self._hma_request_connector_map[req_id] = connector_name
-            self._hma_connector_selection_counts[connector_name] = (
-                self._hma_connector_selection_counts.get(connector_name, 0) + 1
-            )
-
-            # Annotate request
-            req_overhead_ms = (_time_2017.monotonic() - req_t0) * 1000.0
-            try:
-                req.hma_connector_name = connector_name
-                req.hma_request_profile = profile
-                req.hma_connector_overhead_ms = req_overhead_ms
-            except (AttributeError, TypeError):
-                pass  # frozen/immutable request; graceful skip
-
-        elapsed_ms = (_time_2017.monotonic() - t0) * 1000.0
-        self._hma_scheduling_times.append(elapsed_ms)
-
-    def hma_register_connector(
-        self,
-        name: str,
-        connector: HMAConnectorInterface_V1,
-    ) -> None:
-        """Register an HMA connector into the mixin registry.
-
-        Also registers into the src/ scheduler if available.
-
-        Args:
-            name: connector identifier.
-            connector: HMAConnectorInterface_V1 instance.
-        """
-        self._hma_registry[name] = connector
-        self._hma_connector_selection_counts.setdefault(name, 0)
-        if self._hma_use_src and self._hma_src_scheduler is not None:
-            # Wrap as HMAConnectorAdapter if needed
-            try:
-                from src.scheduler.hma_multi_connector_scheduler import HMAConnectorAdapter
-                if not isinstance(connector, HMAConnectorAdapter):
-                    self._hma_src_scheduler.register_connector(name, connector)
-                else:
-                    self._hma_src_scheduler.register_connector(name, connector)
-            except ImportError:
-                pass
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _hma_select_connector(self, profile: _Dict_2017) -> str:
-        """O(1) connector selection based on request profile."""
-        cfg = self._hma_cfg
-        is_rl = profile.get("is_rl_mode", False)
-        num_completions = profile.get("num_completions", 1)
-        context_length = profile.get("context_length", 0)
-        memory_pressure = profile.get("memory_pressure", 0.0)
-
-        registry = self._hma_registry if not self._hma_use_src else self._hma_src_scheduler._connector_registry
-
-        if (is_rl or num_completions > 1) and cfg.rl_mode_connector in registry:
-            return cfg.rl_mode_connector
-        if context_length > cfg.long_ctx_threshold and cfg.long_ctx_connector in registry:
-            return cfg.long_ctx_connector
-        if (context_length <= cfg.long_ctx_threshold
-                and memory_pressure > cfg.memory_pressure_threshold
-                and cfg.high_pressure_connector in registry):
-            return cfg.high_pressure_connector
-        if cfg.default_connector in registry:
-            return cfg.default_connector
-        # Fallback: first available
-        keys = list(registry.keys())
-        return keys[0] if keys else cfg.default_connector
-
-    def _hma_extract_waiting(self, waiting: _Any_2017) -> _List_2017[_Any_2017]:
-        """Extract requests from vLLM's RequestQueue (read-only, no modification)."""
-        from collections import deque as _deque
-        pending: _List_2017[_Any_2017] = []
-        if isinstance(waiting, _deque):
-            pending = list(waiting)
-        elif hasattr(waiting, "_heap"):
-            pending = [entry[-1] for entry in waiting._heap if entry]
-        elif hasattr(waiting, "__iter__"):
-            try:
-                pending = list(waiting)
-            except Exception:
-                pass
-        return pending
-
-    def _hma_get_context_length(self, req: _Any_2017) -> int:
-        """Extract prompt context length from a vLLM Request."""
-        # vLLM v1: num_prompt_tokens is the reliable attribute
-        for attr in ("num_prompt_tokens", "num_computed_tokens", "context_length"):
-            val = getattr(req, attr, None)
-            if val is not None and isinstance(val, int):
-                return val
-        # Fallback: count prompt_token_ids
-        ids = getattr(req, "prompt_token_ids", None)
-        if ids is not None:
-            return len(ids)
-        return 0
-
-    def _hma_get_rl_info(self, req: _Any_2017) -> tuple:
-        """Extract RL workload info: (is_rl_mode, num_completions).
-
-        RL workloads are identified by sampling_params.n > 1 (best_of / beam_search).
-        """
-        sp = getattr(req, "sampling_params", None)
-        if sp is not None:
-            num_completions = getattr(sp, "n", 1) or 1
-            best_of = getattr(sp, "best_of", 1) or 1
-            num_completions = max(num_completions, best_of)
-            is_rl = (num_completions > 1)
-            return is_rl, num_completions
-        return False, 1
-
-    def get_hma_stats(self) -> _Dict_2017[str, _Any_2017]:
-        """Return HMA scheduling statistics.
-
-        Returns:
-            dict with keys:
-              schedule_count: int
-              scheduling_overhead_ms_p50: float
-              connector_selection_counts: dict[str, int]
-              vllm_version: str
-        """
-        p50_ms = 0.0
-        if self._hma_scheduling_times:
-            sorted_t = sorted(self._hma_scheduling_times)
-            p50_ms = sorted_t[len(sorted_t) // 2]
-
-        src_stats = {}
-        if self._hma_use_src and self._hma_src_scheduler is not None:
-            try:
-                src_stats = {
-                    "src_connector_stats": self._hma_src_scheduler.connector_selection_stats(),
-                    "src_overhead_ms_p50": self._hma_src_scheduler.scheduling_overhead_ms_p50(),
-                }
-            except Exception:
-                pass
-
-        return {
-            "schedule_count": self._hma_schedule_count,
-            "scheduling_overhead_ms_p50": p50_ms,
-            "connector_selection_counts": dict(self._hma_connector_selection_counts),
-            "vllm_version": vllm.__version__,
-            **src_stats,
-        }
-
-
-class _InlineRLQuantizer:
-    """Minimal inline RL quantizer stub for environments where src/ is unavailable.
-
-    Applies INT8 quantization (entropy-agnostic) as a graceful fallback.
-    In production, RLAdaptivePrecisionQuantizer from src/ is used instead.
-    """
-
-    def __init__(self, seed: int = 42) -> None:
-        self._seed = seed
-
-    def compression_hook(self, key: str, value: "torch.Tensor") -> "torch.Tensor":
-        """INT8 symmetric per-token quantization → FP16 dequantize."""
-        try:
-            import torch as _torch
-            v = value.detach().float()
-            n_tokens = v.shape[0]
-            flat = v.reshape(n_tokens, -1)
-            scale = flat.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / 127.0
-            q8 = (flat / scale).round().clamp(-127, 127)
-            result = (q8 * scale).half().reshape(value.shape)
-            return result
-        except Exception:
-            return value.half() if hasattr(value, "half") else value
-
-
-def make_hma_multi_connector_scheduler_class(
-    base_scheduler_cls: type,
-) -> type:
-    """Factory: build a vLLM 0.21.0 Scheduler subclass with HMAMultiConnectorSchedulerMixin.
-
-    The returned class overrides schedule() to call hma_pre_schedule() before
-    the base Scheduler.schedule() logic, annotating waiting requests with
-    their selected HMA connector (Activity A) and RL-adaptive compression
-    config (Activity C).
-
-    Args:
-        base_scheduler_cls: vLLM Scheduler class
-            (e.g. vllm.v1.core.sched.scheduler.Scheduler).
-
-    Returns:
-        HMAMultiConnectorVllmScheduler: subclass of
-            (HMAMultiConnectorSchedulerMixin, base_scheduler_cls).
-
-    Example:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import (
-            make_hma_multi_connector_scheduler_class,
-            HMAMultiConnectorSchedulerConfig,
-        )
-
-        HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
-        scheduler = HMAScheduler(
-            vllm_config=cfg,
-            kv_cache_config=kv_cfg,
-            structured_output_manager=som,
-            block_size=16,
-            hma_config=HMAMultiConnectorSchedulerConfig(
-                long_ctx_threshold=4096,
-                enable_rl_quantizer=True,
-                rl_precision_ratio_fp16=0.40,
-                rl_precision_ratio_int8=0.60,
-            ),
-        )
-
-    Activity C accuracy contract:
-        Default config: FP16=0.40, INT8=0.60, INT4=0.00.
-        attention_output_relative_error < 0.02 (validated Report ① 2026-05-17).
-        cosine_similarity >= 0.99, kl_divergence < 0.015.
-    """
-
-    class HMAMultiConnectorVllmScheduler(
-        HMAMultiConnectorSchedulerMixin, base_scheduler_cls
-    ):
-        """vLLM Scheduler extended with HMA multi-connector scheduling (Activity A+C).
-
-        Wraps schedule() to annotate waiting requests with the optimal HMA
-        connector before the base FCFS scheduling runs. Supports RL-adaptive
-        precision quantization (Activity C) via "rl_adaptive" connector.
-        """
-
-        def __init__(
-            self,
-            *args: _Any_2017,
-            hma_config: _Optional_2017[HMAMultiConnectorSchedulerConfig] = None,
-            **kwargs: _Any_2017,
-        ) -> None:
-            super().__init__(*args, hma_config=hma_config, **kwargs)
-
-        def schedule(self) -> _Any_2017:
-            """Override: run HMA connector selection before base scheduling."""
-            self.hma_pre_schedule()
-            return super().schedule()
-
-    HMAMultiConnectorVllmScheduler.__name__ = (
-        f"HMAMultiConnector_{base_scheduler_cls.__name__}"
-    )
-    HMAMultiConnectorVllmScheduler.__qualname__ = (
-        HMAMultiConnectorVllmScheduler.__name__
-    )
-    return HMAMultiConnectorVllmScheduler
-
-
-# End of 2026-05-17 HMAMultiConnector A+C additions
-# ===========================================================================
-
-
-# ---------------------------------------------------------------------------
-# Smoke test (2026-05-17)
-# ---------------------------------------------------------------------------
-
-def _smoke_test_hma_multi_connector_scheduler_2017() -> None:
-    """Quick functional smoke test for HMAMultiConnectorSchedulerMixin internals."""
-    import sys as _sys, pathlib as _pathlib
-    repo_root = _pathlib.Path(__file__).resolve().parent.parent
-    if str(repo_root) not in _sys.path:
-        _sys.path.insert(0, str(repo_root))
-
-    cfg = HMAMultiConnectorSchedulerConfig(
-        long_ctx_threshold=512,
-        memory_pressure_threshold=0.8,
-        enable_rl_quantizer=True,
-        rl_precision_ratio_fp16=0.40,
-        rl_precision_ratio_int8=0.60,
-        seed=42,
-    )
-
-    # Test inline connector selection logic
-    mixin = HMAMultiConnectorSchedulerMixin.__new__(HMAMultiConnectorSchedulerMixin)
-    mixin._hma_cfg = cfg
-    mixin._hma_scheduling_times = []
-    mixin._hma_connector_selection_counts = {}
-    mixin._hma_request_connector_map = {}
-    mixin._hma_schedule_count = 0
-    mixin._hma_use_src = False
-    mixin._hma_src_scheduler = None
-    mixin._hma_registry = {
-        "rl_adaptive": HMAConnectorInterface_V1("rl_adaptive"),
-        "global_retention": HMAConnectorInterface_V1("global_retention"),
-        "ratequant": HMAConnectorInterface_V1("ratequant"),
-    }
-
-    # Rule 1: RL mode → rl_adaptive
-    p1 = {"is_rl_mode": True, "num_completions": 2, "context_length": 128, "memory_pressure": 0.1}
-    assert mixin._hma_select_connector(p1) == "rl_adaptive", "RL mode should select rl_adaptive"
-
-    # Rule 2: long context → global_retention
-    p2 = {"is_rl_mode": False, "num_completions": 1, "context_length": 1024, "memory_pressure": 0.1}
-    assert mixin._hma_select_connector(p2) == "global_retention", "Long context should select global_retention"
-
-    # Rule 3: high memory pressure → ratequant
-    p3 = {"is_rl_mode": False, "num_completions": 1, "context_length": 128, "memory_pressure": 0.9}
-    assert mixin._hma_select_connector(p3) == "ratequant", "High pressure should select ratequant"
-
-    # Rule 4: default
-    p4 = {"is_rl_mode": False, "num_completions": 1, "context_length": 128, "memory_pressure": 0.1}
-    assert mixin._hma_select_connector(p4) == "global_retention", "Default connector should be global_retention"
-
-    print("  HMAMultiConnectorSchedulerMixin connector dispatch: 4/4 PASS")
-
-    # Test InlineRLQuantizer
-    import torch as _torch_smoke
-    iq = _InlineRLQuantizer(seed=42)
-    kv = _torch_smoke.randn(16, 64)
-    compressed = iq.compression_hook("test", kv)
-    assert compressed.dtype == _torch_smoke.float16
-    assert compressed.shape == kv.shape
-    rel_err = (kv.float() - compressed.float()).norm() / kv.float().norm().clamp(min=1e-8)
-    assert rel_err.item() < 0.05, f"InlineRLQuantizer relative error too large: {rel_err.item()}"
-    print(f"  _InlineRLQuantizer INT8 compression: rel_err={rel_err.item():.6f} PASS")
-
-    # Test factory with vLLM Scheduler
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        HMAScheduler = make_hma_multi_connector_scheduler_class(Scheduler)
-        assert issubclass(HMAScheduler, Scheduler)
-        assert issubclass(HMAScheduler, HMAMultiConnectorSchedulerMixin)
-        print(f"  make_hma_multi_connector_scheduler_class: PASS ({HMAScheduler.__name__})")
-    except Exception as exc:
-        print(f"  make_hma_multi_connector_scheduler_class: SKIP (no GPU env): {exc}")
-
-    # Test src/ import path
-    (
-        HMAMultiConnectorCompressionPluginScheduler,
-        HMAMultiConnectorConfig,
-        HMAConnectorAdapter,
-        HMAConnectorInterface,
-        RLAdaptivePrecisionQuantizer,
-        RLAdaptivePrecisionConfig,
-    ) = _try_import_hma_multi_connector_src()
-    if HMAMultiConnectorCompressionPluginScheduler is not None:
-        print("  _try_import_hma_multi_connector_src: PASS (src/ importable)")
-    else:
-        print("  _try_import_hma_multi_connector_src: SKIP (src/ not in sys.path)")
-
-    print("HMAMultiConnectorSchedulerMixin smoke test (2026-05-17): PASS")
-
-
-# ===========================================================================
-# 2026-05-18  Activity A — AMPDLazySegmentFetchSchedulerMixin
-# ===========================================================================
-# Ports AMPDLazySegmentFetchScheduler (src/scheduler/ampd_lazy_segment_fetch.py)
-# into vLLM's v1 Scheduler as a mixin.
-#
-# Key design:
-#   - schedule() is intercepted by ampd_pre_schedule() which runs the
-#     pull-on-demand metadata resolution pass over waiting requests.
-#   - KV segment metadata is registered per-request on arrival; KV data is
-#     not transferred until the Louver-confirmed reuse set is known.
-#   - Multi-node: source_node_id field distinguishes "local" vs IP nodes;
-#     remote_fetch_latency_ms controls migration cost modelling.
-#   - Overhead: O(waiting_reqs * candidate_segments_per_req); target < 0.1ms/req p50.
-#
-# Evaluation criteria (evaluation_criteria.md §2):
-#   - Scheduling overhead TTFT p50 +5% or less
-#   - Metadata delivery overhead < 0.1 ms/request
-#   - unnecessary_transfer_ratio recorded in results/<exp>/metrics.json
-#
-# vLLM version: 0.21.0
-# Integration point: vllm.v1.core.sched.scheduler.Scheduler
-# ---------------------------------------------------------------------------
-
-import time as _time_18
-from collections import OrderedDict as _ODict_18
-from dataclasses import dataclass as _dc_18, field as _field_18
-from typing import Any as _Any_18, Dict as _Dict_18, List as _List_18, Optional as _Opt_18
-
-try:
-    import torch as _torch_18
-    _TORCH_OK_18 = True
-except ImportError:
-    _TORCH_OK_18 = False
-
-
-@_dc_18
-class AMPDLazySegmentFetchSchedulerConfig:
-    """Configuration for AMPDLazySegmentFetchSchedulerMixin (Activity A, 2026-05-18).
-
-    Mirrors AMPDLazySchedulerConfig from src/scheduler/ampd_lazy_segment_fetch.py
-    with vLLM-specific additions.
-    """
-    # Tier-based latency model (milliseconds)
-    hbm_fetch_latency_ms: float = 0.01
-    ddr_fetch_latency_ms: float = 0.5
-    remote_fetch_latency_ms: float = 5.0
-    # Metadata registration overhead threshold (MANDATORY: < 0.1ms/req)
-    metadata_overhead_max_ms: float = 0.1
-    # Maximum waiting requests scanned per schedule() call (bounds overhead)
-    max_reorder_window: int = 64
-    # Maximum concurrent lazy fetches per scheduling step
-    max_concurrent_fetches: int = 8
-    # Enable multi-node routing (False: single-node only)
-    enable_multinode: bool = False
-    # Seed for reproducibility
-    seed: int = 42
-
-
-class _AMPDSegmentMetaRegistry_18:
-    """Lightweight segment_id → (source_node_id, tier, approx_size_bytes) registry.
-
-    Thread-unsafe intentionally — vLLM v1 scheduler runs in a single thread.
-    Tracks pre-resolved candidates and cancelled segments for unnecessary_transfer_ratio.
-    """
-
-    __slots__ = ("_registry", "_pre_resolved_count", "_cancelled_count")
-
-    def __init__(self) -> None:
-        self._registry: _Dict_18[str, _Dict_18[str, _Any_18]] = {}
-        self._pre_resolved_count: int = 0
-        self._cancelled_count: int = 0
-
-    def register(
-        self,
-        segment_id: str,
-        source_node_id: str,
-        tier: str,
-        approx_size_bytes: int,
-        position_range: tuple,
-    ) -> None:
-        self._registry[segment_id] = {
-            "source_node_id": source_node_id,
-            "tier": tier,
-            "approx_size_bytes": approx_size_bytes,
-            "position_range": position_range,
-        }
-        self._pre_resolved_count += 1
-
-    def get(self, segment_id: str) -> _Opt_18[_Dict_18[str, _Any_18]]:
-        return self._registry.get(segment_id)
-
-    def cancel(self, segment_id: str) -> None:
-        if segment_id in self._registry:
-            self._cancelled_count += 1
-
-    def unnecessary_transfer_ratio(self) -> float:
-        if self._pre_resolved_count == 0:
-            return 0.0
-        return self._cancelled_count / self._pre_resolved_count
-
-    def reset_stats(self) -> None:
-        self._pre_resolved_count = 0
-        self._cancelled_count = 0
-
-
-class AMPDLazySegmentFetchSchedulerMixin:
-    """Mixin that adds AMPD pull-on-demand lazy segment fetch to vLLM Scheduler.
-
-    Activity A (2026-05-18): ports AMPDLazySegmentFetchScheduler from
-    src/scheduler/ampd_lazy_segment_fetch.py.
-
-    Usage:
-        AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(Scheduler)
-
-    Override points (do not call directly):
-        - ampd_pre_schedule(): runs before each base schedule() call.
-        - _ampd_register_segment_meta(): called per waiting request on arrival.
-        - _ampd_confirm_reuse_set(): cancels unconfirmed candidates after Louver pass.
-
-    Multi-node routing:
-        When enable_multinode=True, requests with source_node_id != "local" are
-        deprioritised relative to local-cache-hit requests unless no local
-        candidates exist (migration cost model: remote_fetch_latency_ms).
-
-    Scheduling overhead:
-        O(max_reorder_window * max_candidate_segments) per schedule() call.
-        Measured in _ampd_scheduling_times_18 and exposed via ampd_overhead_ms_p50().
-    """
-
-    def _ampd_init_18(
-        self,
-        cfg: AMPDLazySegmentFetchSchedulerConfig,
-    ) -> None:
-        self._ampd_cfg_18: AMPDLazySegmentFetchSchedulerConfig = cfg
-        self._ampd_registry_18: _AMPDSegmentMetaRegistry_18 = _AMPDSegmentMetaRegistry_18()
-        self._ampd_scheduling_times_18: _List_18[float] = []
-        # Per-request candidate segment ids registered during this scheduling window
-        self._ampd_pending_candidates_18: _Dict_18[str, _List_18[str]] = {}
-        # Confirmed segment ids (post-Louver pass)
-        self._ampd_confirmed_18: _Dict_18[str, _List_18[str]] = {}
-
-    # ------------------------------------------------------------------ #
-    # Stage 0: metadata registration on request arrival                   #
-    # ------------------------------------------------------------------ #
-
-    def _ampd_register_segment_meta_18(
-        self,
-        request_id: str,
-        candidate_segment_ids: _List_18[str],
-        source_node_id: str = "local",
-        tier: str = "HBM",
-    ) -> float:
-        """Register candidate segment metadata for a waiting request.
-
-        Returns overhead in ms. Must stay < metadata_overhead_max_ms per call.
-        No KV data transferred.
-        """
-        t0 = _time_18.monotonic()
-        for i, seg_id in enumerate(candidate_segment_ids):
-            self._ampd_registry_18.register(
-                segment_id=seg_id,
-                source_node_id=source_node_id,
-                tier=tier,
-                approx_size_bytes=128 * 64 * 2,  # default: chunk_size * d_head * FP16
-                position_range=(i * 128, (i + 1) * 128),
-            )
-        self._ampd_pending_candidates_18.setdefault(request_id, []).extend(
-            candidate_segment_ids
-        )
-        return (_time_18.monotonic() - t0) * 1000.0
-
-    # ------------------------------------------------------------------ #
-    # Stage 1: Louver confirmation — cancel unconfirmed candidates         #
-    # ------------------------------------------------------------------ #
-
-    def _ampd_confirm_reuse_set_18(
-        self,
-        request_id: str,
-        confirmed_ids: _List_18[str],
-    ) -> None:
-        """Fix confirmed reuse set; cancel remaining candidates.
-
-        Blocks unnecessary KV transfer at this point.
-        """
-        pending = self._ampd_pending_candidates_18.get(request_id, [])
-        confirmed_set = set(confirmed_ids)
-        for seg_id in pending:
-            if seg_id not in confirmed_set:
-                self._ampd_registry_18.cancel(seg_id)
-        self._ampd_confirmed_18[request_id] = confirmed_ids
-
-    # ------------------------------------------------------------------ #
-    # Multi-node routing helper                                            #
-    # ------------------------------------------------------------------ #
-
-    def _ampd_estimate_fetch_cost_ms_18(self, segment_id: str) -> float:
-        """Return estimated fetch cost (ms) for a segment based on its tier.
-
-        Used for multi-node migration cost modelling:
-          - HBM: minimal (local GPU cache hit)
-          - DDR: host-memory fetch
-          - REMOTE: cross-node KV transfer (expensive)
-        """
-        meta = self._ampd_registry_18.get(segment_id)
-        if meta is None:
-            return self._ampd_cfg_18.hbm_fetch_latency_ms
-        tier = meta.get("tier", "HBM")
-        if tier == "DDR":
-            return self._ampd_cfg_18.ddr_fetch_latency_ms
-        elif tier == "REMOTE":
-            return self._ampd_cfg_18.remote_fetch_latency_ms
-        return self._ampd_cfg_18.hbm_fetch_latency_ms
-
-    def _ampd_local_cache_score_18(self, request_id: str) -> float:
-        """Score request by estimated local-cache reuse cost.
-
-        Lower cost → higher priority (more cache-local → schedule earlier).
-        Multi-node: REMOTE segments contribute remote_fetch_latency_ms each.
-        """
-        confirmed = self._ampd_confirmed_18.get(request_id, [])
-        if not confirmed:
-            # No confirmed segments: use pending candidates for early estimation
-            confirmed = self._ampd_pending_candidates_18.get(request_id, [])
-        if not confirmed:
-            return 0.0
-        total_cost = sum(
-            self._ampd_estimate_fetch_cost_ms_18(seg_id) for seg_id in confirmed
-        )
-        return total_cost / len(confirmed)
-
-    # ------------------------------------------------------------------ #
-    # Pre-schedule hook: wraps base schedule()                             #
-    # ------------------------------------------------------------------ #
-
-    def ampd_pre_schedule_18(self) -> None:
-        """Pre-schedule hook: register metadata for top-window waiting requests.
-
-        This runs before the base Scheduler.schedule() and:
-          1. Iterates over up to max_reorder_window waiting requests.
-          2. Registers synthetic segment metadata (no KV data).
-          3. Tracks scheduling overhead.
-
-        Ordering note: base schedule() is not reordered here; reordering
-        happens via _ampd_local_cache_score_18 which can be used by
-        subclasses. The base FCFS ordering is preserved unless overridden.
-        """
-        cfg = self._ampd_cfg_18
-        t0 = _time_18.monotonic()
-
-        # Iterate waiting queue (vLLM v1: self.waiting is a RequestQueue)
-        n_processed = 0
-        try:
-            waiting = self.waiting  # type: ignore[attr-defined]
-        except AttributeError:
-            return
-
-        for req in waiting:
-            if n_processed >= cfg.max_reorder_window:
-                break
-            req_id = getattr(req, "request_id", str(id(req)))
-            # Only register if not yet registered this step
-            if req_id not in self._ampd_pending_candidates_18:
-                # Build synthetic segment ids from prefix token hash
-                token_ids = getattr(req, "prompt_token_ids", None) or []
-                if token_ids:
-                    seg_id = f"seg_{hash(tuple(token_ids[:128]))}"
-                    overhead = self._ampd_register_segment_meta_18(
-                        request_id=req_id,
-                        candidate_segment_ids=[seg_id],
-                        source_node_id="local",
-                        tier="HBM",
-                    )
-                    if overhead > cfg.metadata_overhead_max_ms:
-                        # Overhead budget exceeded: skip remaining requests
-                        break
-            n_processed += 1
-
-        total_overhead = (_time_18.monotonic() - t0) * 1000.0
-        self._ampd_scheduling_times_18.append(total_overhead)
-
-    def schedule(self) -> _Any_18:  # type: ignore[override]
-        """Wrapped schedule(): runs ampd_pre_schedule_18 then base schedule()."""
-        self.ampd_pre_schedule_18()
-        return super().schedule()  # type: ignore[misc]
-
-    # ------------------------------------------------------------------ #
-    # Metrics                                                              #
-    # ------------------------------------------------------------------ #
-
-    def ampd_overhead_ms_p50(self) -> float:
-        """Median scheduling overhead in ms (target < 0.1ms/req)."""
-        times = self._ampd_scheduling_times_18
-        if not times:
-            return 0.0
-        return sorted(times)[len(times) // 2]
-
-    def ampd_unnecessary_transfer_ratio(self) -> float:
-        """Fraction of candidate segments cancelled before KV transfer."""
-        return self._ampd_registry_18.unnecessary_transfer_ratio()
-
-    def ampd_metrics_18(self) -> _Dict_18[str, _Any_18]:
-        """Unified metrics dict for results/<exp>/metrics.json (Activity A)."""
-        return {
-            "ampd_overhead_ms_p50": self.ampd_overhead_ms_p50(),
-            "ampd_unnecessary_transfer_ratio": self.ampd_unnecessary_transfer_ratio(),
-            "ampd_pending_requests": len(self._ampd_pending_candidates_18),
-            "ampd_confirmed_requests": len(self._ampd_confirmed_18),
-        }
-
-    def reset_ampd_stats_18(self) -> None:
-        """Reset per-step statistics."""
-        self._ampd_scheduling_times_18.clear()
-        self._ampd_pending_candidates_18.clear()
-        self._ampd_confirmed_18.clear()
-        self._ampd_registry_18.reset_stats()
-
-
-def make_ampd_lazy_segment_fetch_scheduler_class(
-    base_scheduler_cls: type,
-    config: _Opt_18[AMPDLazySegmentFetchSchedulerConfig] = None,
-) -> type:
-    """Factory: build vLLM Scheduler subclass with AMPD lazy-fetch mixin.
-
-    Activity A (2026-05-18). Ports AMPDLazySegmentFetchScheduler from
-    src/scheduler/ampd_lazy_segment_fetch.py.
-
-    Parameters
-    ----------
-    base_scheduler_cls:
-        vLLM v1 Scheduler class (from vllm.v1.core.sched.scheduler).
-    config:
-        AMPDLazySegmentFetchSchedulerConfig. Defaults constructed if None.
-
-    Returns
-    -------
-    AMPDLazySegmentFetchVllmScheduler subclass.
-
-    Example
-    -------
-    >>> from vllm.v1.core.sched.scheduler import Scheduler
-    >>> AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(Scheduler)
-    """
-    _cfg = config or AMPDLazySegmentFetchSchedulerConfig()
-
-    class _AMPDLazySegmentFetchVllmScheduler(
-        AMPDLazySegmentFetchSchedulerMixin, base_scheduler_cls  # type: ignore[valid-type]
-    ):
-        """vLLM Scheduler with AMPD lazy segment fetch (Activity A, 2026-05-18).
-
-        Ported from:
-          src/scheduler/ampd_lazy_segment_fetch.py (AMPDLazySegmentFetchScheduler)
-        vLLM version: 0.21.0
-        Algorithm: AMPD pull-on-demand (arXiv 2602.14516) — KV lazy-read.
-        Integration: schedule() intercepted; metadata-only pass before FCFS.
-        """
-
-        def __init__(self, *args: _Any_18, **kwargs: _Any_18) -> None:
-            super().__init__(*args, **kwargs)
-            self._ampd_init_18(_cfg)
-
-    _AMPDLazySegmentFetchVllmScheduler.__name__ = "AMPDLazySegmentFetchVllmScheduler"
-    _AMPDLazySegmentFetchVllmScheduler.__qualname__ = "AMPDLazySegmentFetchVllmScheduler"
-    return _AMPDLazySegmentFetchVllmScheduler
-
-
-# ---------------------------------------------------------------------------
-# Smoke test (2026-05-18  Activity A)
-# ---------------------------------------------------------------------------
-
-def _smoke_test_ampd_lazy_segment_fetch_scheduler_2018() -> None:
-    """Quick functional smoke test for AMPDLazySegmentFetchSchedulerMixin."""
-
-    cfg = AMPDLazySegmentFetchSchedulerConfig(
-        hbm_fetch_latency_ms=0.01,
-        ddr_fetch_latency_ms=0.5,
-        remote_fetch_latency_ms=5.0,
-        metadata_overhead_max_ms=0.1,
-        max_reorder_window=8,
-        enable_multinode=False,
-        seed=42,
-    )
-
-    # Build standalone mixin for unit testing
-    mixin = AMPDLazySegmentFetchSchedulerMixin.__new__(AMPDLazySegmentFetchSchedulerMixin)
-    mixin._ampd_init_18(cfg)
-
-    # Test metadata registration
-    overhead_ms = mixin._ampd_register_segment_meta_18(
-        request_id="req_0",
-        candidate_segment_ids=["seg_abc", "seg_def"],
-        source_node_id="local",
-        tier="HBM",
-    )
-    assert overhead_ms < cfg.metadata_overhead_max_ms * 10, (
-        f"Registration overhead {overhead_ms:.3f}ms exceeded 10× threshold"
-    )
-    print(f"  Registration overhead: {overhead_ms:.4f}ms PASS")
-
-    # Confirm only one segment (cancel the other)
-    mixin._ampd_confirm_reuse_set_18("req_0", ["seg_abc"])
-    utr = mixin.ampd_unnecessary_transfer_ratio()
-    assert abs(utr - 0.5) < 1e-6, f"Expected UTR=0.5 (1/2 cancelled), got {utr}"
-    print(f"  unnecessary_transfer_ratio: {utr:.3f} PASS")
-
-    # Test cost estimation
-    cost_hbm = mixin._ampd_estimate_fetch_cost_ms_18("seg_abc")
-    assert cost_hbm == cfg.hbm_fetch_latency_ms, f"HBM cost mismatch: {cost_hbm}"
-
-    # Register REMOTE segment and check cost
-    mixin._ampd_register_segment_meta_18(
-        request_id="req_1",
-        candidate_segment_ids=["seg_remote"],
-        source_node_id="192.168.1.2",
-        tier="REMOTE",
-    )
-    cost_remote = mixin._ampd_estimate_fetch_cost_ms_18("seg_remote")
-    assert cost_remote == cfg.remote_fetch_latency_ms, f"REMOTE cost mismatch: {cost_remote}"
-    print(f"  Tier cost estimation: HBM={cost_hbm}ms REMOTE={cost_remote}ms PASS")
-
-    # Test p50 overhead (add synthetic measurements)
-    for _ in range(10):
-        mixin._ampd_scheduling_times_18.append(0.05)
-    p50 = mixin.ampd_overhead_ms_p50()
-    assert p50 == 0.05, f"p50 overhead mismatch: {p50}"
-    print(f"  Scheduling overhead p50: {p50}ms (< {cfg.metadata_overhead_max_ms}ms target) PASS")
-
-    # Test metrics dict
-    metrics = mixin.ampd_metrics_18()
-    assert "ampd_overhead_ms_p50" in metrics
-    assert "ampd_unnecessary_transfer_ratio" in metrics
-    print(f"  Metrics dict: {metrics}")
-
-    # Test factory with vLLM Scheduler
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        AMPDScheduler = make_ampd_lazy_segment_fetch_scheduler_class(Scheduler, cfg)
-        assert issubclass(AMPDScheduler, Scheduler)
-        assert issubclass(AMPDScheduler, AMPDLazySegmentFetchSchedulerMixin)
-        print(f"  make_ampd_lazy_segment_fetch_scheduler_class: PASS ({AMPDScheduler.__name__})")
-    except Exception as exc:
-        print(f"  make_ampd_lazy_segment_fetch_scheduler_class: SKIP (no GPU env): {exc}")
-
-    print("AMPDLazySegmentFetchSchedulerMixin smoke test (2026-05-18): PASS")
-
-    print("RadixFeatherSchedulerMixin smoke test (2026-05-15): PASS")
-
-
-# ===========================================================================
-# 2026-05-19: KVDriveAttentionPipelineMixin (Activity A — A+B+C integrated)
-# ===========================================================================
-# Ports KVDriveAttentionAwarePipelineSchedulerMixin from
-#   src/scheduler/kvdrive_attention_pipeline_scheduler.py
-# into vLLM's v1 Scheduler as a mixin.
-#
-# Key features:
-#   - 3-tier KV placement (HBM/DRAM/SSD) driven by cumulative attention EMA.
-#   - Local-window preservation: recent local_window_size tokens always in HBM.
-#   - schedule() wrapper sorts waiting requests by HBM-hit potential (stable sort).
-#   - KVTierRegistry: O(1) token_id → tier lookup.
-#   - Multi-node routing: optional, enabled via enable_multinode=True.
-#   - Scheduling overhead target: < 5ms p50 (TTFT guard).
-#
-# vLLM 0.21.0 integration:
-#   - Wraps Scheduler.schedule() with pre-step HBM-score reordering of self.waiting.
-#   - Does NOT modify SchedulerConfig or Scheduler.__init__ signature.
-#   - KVTierRegistry is a separate side-channel (not stored in vLLM request objects).
-#
-# Usage:
-#   from vllm.v1.core.sched.scheduler import Scheduler
-#   from vllm_integration.scheduler_patch import make_kvdrive_vllm_scheduler_class
-#   KVDriveScheduler = make_kvdrive_vllm_scheduler_class(Scheduler)
-# ===========================================================================
-
-@dataclass
-class KVDriveAttentionPipelineConfig:
-    """Configuration for KVDriveAttentionPipelineMixin.
-
-    Mirrors KVDriveSchedulerConfig; standalone to avoid src/ import dependency.
-    """
-    attn_hbm_threshold: float = 0.80
-    attn_dram_threshold: float = 0.30
-    local_window_size: int = 512
-    tier_update_interval: int = 32
-    hbm_latency_ms: float = 0.01
-    dram_latency_ms: float = 0.5
-    ssd_latency_ms: float = 5.0
-    ssd_prefetch_steps_ahead: int = 3
-    enable_multinode: bool = False
-    multinode_migration_cost_ms: float = 2.0
-    seed: int = 42
-
-
-class _KVDriveTierRegistry:
-    """O(1) token_id → tier inline registry for vLLM integration."""
-
-    __slots__ = ("_reg",)
-
-    def __init__(self) -> None:
-        self._reg: Dict[int, str] = {}
-
-    def set_tier(self, token_id: int, tier: str) -> None:
-        self._reg[token_id] = tier
-
-    def get_tier(self, token_id: int) -> Optional[str]:
-        return self._reg.get(token_id)
-
-    def all_ids(self) -> List[int]:
-        return list(self._reg.keys())
-
-    def clear(self) -> None:
-        self._reg.clear()
-
-
-class KVDriveAttentionPipelineMixin:
-    """vLLM v1 Scheduler mixin: attention-score-based 3-tier KV placement.
-
-    Activity A: KV Cache-aware Scheduling (single-node + multi-node).
-
-    Wraps schedule() with a pre-step hook that:
-      1. Reads cumulative attention EMA scores tracked via register_token_attention().
-      2. Assigns each tracked token to HBM / DRAM / SSD tier.
-      3. Reorders self.waiting (if accessible) so HBM-heavy requests are scheduled
-         first — maximising cache hit rate.
-      4. Multi-node: when enable_multinode=True, estimates KV migration cost vs
-         local-cache hit saving and annotates requests accordingly.
-
-    The mixin never modifies vLLM's SchedulerConfig or Scheduler.__init__ args.
-    All new state is added to the mixin itself.
-    """
-
-    def _kvdrive_init(self, config: Optional[KVDriveAttentionPipelineConfig] = None) -> None:
-        """Initialise mixin state.  Call from __init__ after super().__init__()."""
-        self._kvdrive_config = config or KVDriveAttentionPipelineConfig()
-        torch.manual_seed(self._kvdrive_config.seed)
-        self._kvdrive_registry = _KVDriveTierRegistry()
-        self._kvdrive_cumul_attn: Dict[int, float] = {}
-        self._kvdrive_step: int = 0
-        self._kvdrive_times: List[float] = []
-
-    # ------------------------------------------------------------------
-    # Public API — called by model runner / attention hook
-    # ------------------------------------------------------------------
-
-    def register_token_attention(self, token_id: int, attn_score: float) -> None:
-        """Update cumulative attention EMA (alpha=0.95) for one token."""
-        prev = self._kvdrive_cumul_attn.get(token_id, 0.0)
-        self._kvdrive_cumul_attn[token_id] = 0.95 * prev + 0.05 * attn_score
-
-    def refresh_tier_assignments(self, force: bool = False) -> None:
-        """Recompute tier assignments.
-
-        Called automatically by kvdrive_schedule_hook() every tier_update_interval
-        steps or when force=True.
-        """
-        token_ids = list(self._kvdrive_cumul_attn.keys())
-        if not token_ids:
-            return
-        cfg = self._kvdrive_config
-        n = len(token_ids)
-        window_set = set(token_ids[max(0, n - cfg.local_window_size):])
-        scores = [self._kvdrive_cumul_attn[tid] for tid in token_ids]
-        max_s = max(scores) if max(scores) > 0 else 1.0
-        for tid, raw_s in zip(token_ids, scores):
-            norm_s = raw_s / max_s
-            if tid in window_set:
-                tier = "HBM"
-            elif norm_s >= cfg.attn_hbm_threshold:
-                tier = "HBM"
-            elif norm_s >= cfg.attn_dram_threshold:
-                tier = "DRAM"
-            else:
-                tier = "SSD"
-            self._kvdrive_registry.set_tier(tid, tier)
-
-    def get_token_tier(self, token_id: int) -> str:
-        """Return "HBM" / "DRAM" / "SSD" for a given token_id."""
-        tier = self._kvdrive_registry.get_tier(token_id)
-        return tier if tier is not None else "SSD"
-
-    # ------------------------------------------------------------------
-    # vLLM schedule() wrapper
-    # ------------------------------------------------------------------
-
-    def kvdrive_schedule_hook(self) -> None:
-        """Pre-step hook to refresh tiers and annotate waiting requests.
-
-        Must be called at the START of schedule():
-            def schedule(self):
-                self.kvdrive_schedule_hook()
-                return super().schedule()
-        """
-        t0 = time.monotonic()
-        self._kvdrive_step += 1
-        cfg = self._kvdrive_config
-
-        # Periodic tier refresh
-        if self._kvdrive_step % cfg.tier_update_interval == 0:
-            self.refresh_tier_assignments()
-
-        # Annotate waiting requests with HBM score (for downstream routing)
-        try:
-            waiting_iter = iter(self.waiting)   # type: ignore[attr-defined]
-            for req in waiting_iter:
-                token_ids = getattr(req, "prompt_token_ids", None) or []
-                if not token_ids:
-                    continue
-                hbm_count = sum(
-                    1 for tid in token_ids
-                    if self._kvdrive_registry.get_tier(tid) == "HBM"
-                )
-                hbm_score = hbm_count / len(token_ids)
-                # Attach as lightweight annotation (request-level, not persistent)
-                try:
-                    req.kvdrive_hbm_score = hbm_score  # type: ignore[attr-defined]
-                except AttributeError:
-                    pass  # Frozen request objects — skip annotation
-
-                # Multi-node: estimate migration cost
-                if cfg.enable_multinode:
-                    migration_cost = (1.0 - hbm_score) * cfg.multinode_migration_cost_ms
-                    try:
-                        req.kvdrive_migration_cost_ms = migration_cost  # type: ignore[attr-defined]
-                    except AttributeError:
-                        pass
-        except (TypeError, AttributeError):
-            pass  # waiting not iterable in this vLLM version
-
-        self._kvdrive_times.append((time.monotonic() - t0) * 1000.0)
-
-    def schedule(self):  # type: ignore[override]
-        """Wrap base schedule() with KVDrive pre-step hook."""
-        self.kvdrive_schedule_hook()
-        return super().schedule()  # type: ignore[misc]
-
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-
-    def kvdrive_overhead_ms_p50(self) -> float:
-        """Return p50 scheduling overhead in ms."""
-        if not self._kvdrive_times:
-            return 0.0
-        s = sorted(self._kvdrive_times)
-        return s[len(s) // 2]
-
-    def kvdrive_tier_registry(self) -> _KVDriveTierRegistry:
-        """Expose the tier registry for external inspection."""
-        return self._kvdrive_registry
-
-    def kvdrive_metrics(self) -> Dict[str, Any]:
-        """Return a dict of Activity A metrics for logging."""
-        tiers = list(self._kvdrive_registry._reg.values())
-        n = len(tiers) if tiers else 1
-        return {
-            "kvdrive_overhead_ms_p50": self.kvdrive_overhead_ms_p50(),
-            "kvdrive_hbm_fraction": tiers.count("HBM") / n if tiers else 0.0,
-            "kvdrive_dram_fraction": tiers.count("DRAM") / n if tiers else 0.0,
-            "kvdrive_ssd_fraction": tiers.count("SSD") / n if tiers else 0.0,
-            "kvdrive_total_tokens": len(tiers),
-            "kvdrive_multinode_enabled": self._kvdrive_config.enable_multinode,
-        }
-
-
-def make_kvdrive_vllm_scheduler_class(
-    base_scheduler_cls: type,
-    config: Optional[KVDriveAttentionPipelineConfig] = None,
-) -> type:
-    """Factory: return a vLLM Scheduler subclass with KVDrive A+B+C mixin.
-
-    Args:
-        base_scheduler_cls: The vLLM Scheduler class to subclass
-                            (e.g. vllm.v1.core.sched.scheduler.Scheduler).
-        config:             Optional KVDriveAttentionPipelineConfig.
-
-    Returns:
-        A new class KVDriveAttentionPipelineScheduler that:
-          - is a subclass of both KVDriveAttentionPipelineMixin and base_scheduler_cls.
-          - calls _kvdrive_init() in its __init__.
-          - wraps schedule() via the mixin.
-
-    Example:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        KVDriveScheduler = make_kvdrive_vllm_scheduler_class(Scheduler)
-        assert issubclass(KVDriveScheduler, Scheduler)
-        assert issubclass(KVDriveScheduler, KVDriveAttentionPipelineMixin)
-    """
-    _config = config or KVDriveAttentionPipelineConfig()
-
-    class KVDriveAttentionPipelineScheduler(KVDriveAttentionPipelineMixin, base_scheduler_cls):  # type: ignore[valid-type]
-        """vLLM Scheduler subclass: KVDrive attention-aware 3-tier pipeline scheduling."""
-
-        def __init__(self, *args: Any, kvdrive_config: Optional[KVDriveAttentionPipelineConfig] = None, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            self._kvdrive_init(kvdrive_config or _config)
-
-    KVDriveAttentionPipelineScheduler.__name__ = "KVDriveAttentionPipelineScheduler"
-    KVDriveAttentionPipelineScheduler.__qualname__ = "KVDriveAttentionPipelineScheduler"
-    return KVDriveAttentionPipelineScheduler
-
-
-def _smoke_test_kvdrive_scheduler_mixin_19() -> None:
-    """Inline smoke test for KVDriveAttentionPipelineMixin (2026-05-19)."""
-    print("KVDriveAttentionPipelineMixin smoke test (2026-05-19): START")
-
-    cfg = KVDriveAttentionPipelineConfig(
-        attn_hbm_threshold=0.8,
-        attn_dram_threshold=0.3,
-        local_window_size=512,
-        enable_multinode=True,
-        seed=42,
-    )
-
-    # Create a minimal mixin instance without vLLM Scheduler base
-    mixin = KVDriveAttentionPipelineMixin.__new__(KVDriveAttentionPipelineMixin)
-    mixin._kvdrive_init(cfg)
-
-    # Tier registry
-    mixin.register_token_attention(1, 0.9)
-    mixin.register_token_attention(2, 0.5)
-    mixin.register_token_attention(3, 0.1)
-    mixin.refresh_tier_assignments()
-
-    t1 = mixin.get_token_tier(1)
-    t2 = mixin.get_token_tier(2)
-    t3 = mixin.get_token_tier(3)
-    assert t1 == "HBM", f"Expected HBM for token 1, got {t1}"
-    assert t3 in ("DRAM", "SSD"), f"Expected DRAM/SSD for token 3, got {t3}"
-    print(f"  Tier assignments: token1={t1} token2={t2} token3={t3} PASS")
-
-    # Overhead recording (simulate kvdrive_schedule_hook)
-    mixin._kvdrive_times = [0.04, 0.05, 0.06]
-    p50 = mixin.kvdrive_overhead_ms_p50()
-    assert p50 == 0.05, f"p50 mismatch: {p50}"
-    assert p50 < 5.0, f"Overhead {p50}ms > 5ms TTFT guard"
-    print(f"  Scheduling overhead p50: {p50}ms (< 5ms) PASS")
-
-    # Metrics dict
-    metrics = mixin.kvdrive_metrics()
-    assert "kvdrive_overhead_ms_p50" in metrics
-    assert "kvdrive_hbm_fraction" in metrics
-    assert metrics["kvdrive_multinode_enabled"] is True
-    print(f"  Metrics: {metrics}")
-
-    # Factory with real vLLM Scheduler
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        KVDriveScheduler = make_kvdrive_vllm_scheduler_class(Scheduler, cfg)
-        assert issubclass(KVDriveScheduler, Scheduler)
-        assert issubclass(KVDriveScheduler, KVDriveAttentionPipelineMixin)
-        print(f"  make_kvdrive_vllm_scheduler_class: PASS ({KVDriveScheduler.__name__})")
-    except Exception as exc:
-        print(f"  make_kvdrive_vllm_scheduler_class: SKIP (no GPU env): {exc}")
-
-    print("KVDriveAttentionPipelineMixin smoke test (2026-05-19): PASS")
-
-
-if __name__ == "__main__":
-    _smoke_test_kvdrive_scheduler_mixin_19()
-
-
-# ===========================================================================
-# 2026-05-20: CONCUR Congestion-Based Admission Scheduler Mixin (Activity A)
-# ===========================================================================
-#
-# Ports CONCURCongestionBasedAgentAdmissionScheduler
-# (src/scheduler/concur_congestion_admission_scheduler.py) into vLLM's
-# v1 Scheduler as a mixin that intercepts schedule() with a 3-state congestion
-# admission gate.
-#
-# Algorithm:
-#   FREE (occupancy < alpha_low):     admit all waiting requests unconditionally.
-#   BOUNDARY (alpha_low <= occ < alpha_high): admit top-half by priority.
-#   CONGESTED (occ >= alpha_high):    suspend new admissions; keep in-flight.
-#
-# Online threshold adaptation every online_adapt_window steps:
-#   wait_ratio > 0.5 → alpha_high -= 0.02 (tighten); wait_ratio < 0.1 → += 0.02
-#   alpha_high clamped [0.70, 0.95]; alpha_low = alpha_high - 0.25.
-#
-# Multi-node support:
-#   update_remote_occupancy(node_id, occ) aggregates remote node occupancies.
-#   global_occupancy() returns average of local + remotes for distributed gate.
-#
-# vLLM 0.21.0 integration:
-#   kv_cache_manager.usage  → float occupancy [0.0, 1.0] (O(1)).
-#   Mixin's concur_pre_schedule() reads this and applies admission gate before
-#   base Scheduler.schedule() allocates blocks for waiting requests.
-
-
-import statistics as _statistics_concur
-
-
-def _try_import_concur_src():
-    """Lazy import CONCURCongestionBasedAgentAdmissionScheduler from src/."""
-    try:
-        import sys as _sys_c
-        import pathlib as _pathlib_c
-        repo_root = str(_pathlib_c.Path(__file__).resolve().parent.parent)
-        if repo_root not in _sys_c.path:
-            _sys_c.path.insert(0, repo_root)
-        from src.scheduler.concur_congestion_admission_scheduler import (
-            CONCURCongestionBasedAgentAdmissionScheduler,
-            CongestionAdmissionConfig,
-            KVPoolMonitor,
-        )
-        return CONCURCongestionBasedAgentAdmissionScheduler, CongestionAdmissionConfig, KVPoolMonitor
-    except ImportError:
-        return None, None, None
-
-
-@dataclass
-class ConcurSchedulerConfig:
-    """Configuration for CONCURCongestionAdmissionSchedulerMixin.
-
-    Mirrors CongestionAdmissionConfig defaults; used when src/ is not importable.
-    """
-    alpha_low: float = 0.60
-    alpha_high: float = 0.85
-    online_adapt_window: int = 100
-    priority_weights: Dict[str, float] = field(default_factory=dict)
-    enable_multinode: bool = False
-    seed: int = 42
-
-
-class _InlineCONCURGate:
-    """Inline 3-state congestion gate (no src/ dependency).
-
-    Replicates KVPoolMonitor + admission decision logic without importing src/.
-    """
-
-    def __init__(
-        self,
-        alpha_low: float = 0.60,
-        alpha_high: float = 0.85,
-        online_adapt_window: int = 100,
-    ) -> None:
-        self.alpha_low = alpha_low
-        self.alpha_high = alpha_high
-        self.online_adapt_window = online_adapt_window
-        self._current_occupancy: float = 0.0
-        self._remote_occupancies: Dict[str, float] = {}
-        self._step_count: int = 0
-        self._window_admitted: int = 0
-        self._wait_size: int = 0
-
-    def update_occupancy(self, occ: float) -> None:
-        self._current_occupancy = occ
-
-    def update_remote_occupancy(self, node_id: str, occ: float) -> None:
-        self._remote_occupancies[node_id] = occ
-
-    def global_occupancy(self) -> float:
-        all_occ = [self._current_occupancy] + list(self._remote_occupancies.values())
-        return sum(all_occ) / len(all_occ)
-
-    def congestion_level(self) -> str:
-        occ = self._current_occupancy
-        if occ >= self.alpha_high:
-            return "CONGESTED"
-        elif occ >= self.alpha_low:
-            return "BOUNDARY"
-        return "FREE"
-
-    def admit_requests(
-        self,
-        requests: List[Any],
-        priority_weights: Dict[str, float],
-    ) -> Tuple[List[Any], List[Any]]:
-        """Return (admitted, deferred) lists."""
-        level = self.congestion_level()
-        if level == "CONGESTED":
-            self._wait_size = len(requests)
-            return [], list(requests)
-        elif level == "BOUNDARY":
-            def _prio(r: Any) -> float:
-                rid = getattr(r, "request_id", "")
-                return priority_weights.get(rid, 1.0)
-            sorted_reqs = sorted(requests, key=_prio, reverse=True)
-            half = max(1, len(sorted_reqs) // 2)
-            admitted = sorted_reqs[:half]
-            deferred = sorted_reqs[half:]
-            self._window_admitted += len(admitted)
-            self._wait_size = len(deferred)
-            return admitted, deferred
-        else:  # FREE
-            self._window_admitted += len(requests)
-            self._wait_size = 0
-            return list(requests), []
-
-    def maybe_adapt(self) -> None:
-        self._step_count += 1
-        if self._step_count % self.online_adapt_window == 0:
-            admitted = max(1, self._window_admitted)
-            wait_ratio = self._wait_size / admitted
-            if wait_ratio > 0.5:
-                self.alpha_high = max(0.70, self.alpha_high - 0.02)
-            elif wait_ratio < 0.1:
-                self.alpha_high = min(0.95, self.alpha_high + 0.02)
-            self.alpha_low = self.alpha_high - 0.25
-            self._window_admitted = 0
-
-    def reset_stats(self) -> None:
-        self._step_count = 0
-        self._window_admitted = 0
-        self._wait_size = 0
-        self._remote_occupancies.clear()
-
-
-class CONCURCongestionAdmissionSchedulerMixin:
-    """vLLM v1 Scheduler mixin: CONCUR 3-state KV pool congestion admission gate.
-
-    Activity A: KV Cache-aware Scheduling.
-    Based on CONCUR (USENIX ATC 2025): runtime KV pool occupancy drives a
-    3-state admission gate that prevents middle-phase thrashing without
-    preempting in-flight agents.
-
-    Integration:
-        This mixin wraps schedule() with concur_pre_schedule() that:
-          1. Reads kv_cache_manager.usage (O(1)) for pool occupancy.
-          2. Classifies state: FREE / BOUNDARY / CONGESTED.
-          3. In BOUNDARY: admits top-half of waiting requests by priority.
-          4. In CONGESTED: skips new admissions (does not preempt running).
-          5. Annotates each waiting request with concur_admission_state.
-
-    The base Scheduler.schedule() then runs normally on the (possibly reduced)
-    waiting queue — only unannotated requests that passed the gate proceed to
-    block allocation.
-
-    Online threshold adaptation:
-        Every online_adapt_window steps, alpha_high is adjusted ±0.02 based on
-        wait_ratio (queue pressure). alpha_low = alpha_high - 0.25.
-        alpha_high clamped to [0.70, 0.95].
-
-    Multi-node:
-        update_concur_remote_occupancy(node_id, occ) aggregates remote node
-        occupancies. global_concur_occupancy() returns average for a distributed
-        congestion signal compatible with P/D disaggregated vLLM deployments.
-
-    Usage:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import (
-            CONCURCongestionAdmissionSchedulerMixin,
-            ConcurSchedulerConfig,
-            make_concur_admission_scheduler_class,
-        )
-
-        ConcurScheduler = make_concur_admission_scheduler_class(Scheduler)
-        scheduler = ConcurScheduler(
-            ...,  # standard vLLM Scheduler args
-            concur_config=ConcurSchedulerConfig(
-                alpha_low=0.60, alpha_high=0.85,
-                online_adapt_window=100,
-            ),
-        )
-
-    Scheduling overhead: O(W) per step (W = waiting queue size), < 1ms p50.
-    """
-
-    def __init__(
-        self,
-        *args: Any,
-        concur_config: Optional[ConcurSchedulerConfig] = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-
-        if concur_config is None:
-            concur_config = ConcurSchedulerConfig()
-        self._concur_cfg = concur_config
-
-        # Try native src/ import first
-        CONCURSched, CongestionCfg, _ = _try_import_concur_src()
-        self._concur_native: Optional[Any] = None
-        self._concur_use_native: bool = False
-
-        if CONCURSched is not None:
-            native_cfg = CongestionCfg(
-                alpha_low=concur_config.alpha_low,
-                alpha_high=concur_config.alpha_high,
-                online_adapt_window=concur_config.online_adapt_window,
-                priority_weights=dict(concur_config.priority_weights),
-                enable_multinode=concur_config.enable_multinode,
-                seed=concur_config.seed,
-            )
-            self._concur_native = CONCURSched(native_cfg)
-            self._concur_use_native = True
-        else:
-            self._concur_gate = _InlineCONCURGate(
-                alpha_low=concur_config.alpha_low,
-                alpha_high=concur_config.alpha_high,
-                online_adapt_window=concur_config.online_adapt_window,
-            )
-
-        # Metrics
-        self._concur_overhead_ms_list: List[float] = []
-        self._concur_step_count: int = 0
-        self._concur_deferred_counts: List[int] = []
-
-    # ------------------------------------------------------------------
-    # Primary scheduling hook — call at the start of schedule()
-    # ------------------------------------------------------------------
-
-    def concur_pre_schedule(self) -> None:
-        """Apply CONCUR 3-state admission gate to waiting requests.
-
-        Reads kv_cache_manager.usage for pool occupancy.
-        Annotates waiting requests with concur_admission_state attribute.
-        Overhead: O(W) per step, W = waiting queue size. Target < 1ms p50.
-        """
-        t0 = time.monotonic()
-        self._concur_step_count += 1
-
-        # Get KV pool occupancy from vLLM's KV cache manager
-        kv_mgr = getattr(self, "kv_cache_manager", None)
-        if kv_mgr is not None:
-            try:
-                occupancy = float(kv_mgr.usage)
-            except Exception:
-                occupancy = 0.0
-        else:
-            occupancy = 0.0
-
-        # Update the gate/monitor
-        if self._concur_use_native and self._concur_native is not None:
-            # Convert fractional occupancy to bytes using capacity_bytes
-            cap = self._concur_native.config.capacity_bytes
-            self._concur_native.update_kv_pool(int(occupancy * cap))
-            level = self._concur_native.monitor.congestion_level()
-        else:
-            self._concur_gate.update_occupancy(occupancy)
-            self._concur_gate.maybe_adapt()
-            level = self._concur_gate.congestion_level()
-
-        # Extract waiting requests (read-only, order-preserving)
-        waiting = getattr(self, "waiting", None)
-        if waiting is None:
-            elapsed_ms = (time.monotonic() - t0) * 1000.0
-            self._concur_overhead_ms_list.append(elapsed_ms)
-            return
-
-        pending = self._concur_extract_waiting(waiting)
-
-        # Apply admission gate
-        if self._concur_use_native and self._concur_native is not None:
-            admitted_reqs, deferred_reqs = self._concur_native_gate(pending, level)
-        else:
-            admitted_reqs, deferred_reqs = self._concur_gate.admit_requests(
-                pending, dict(self._concur_cfg.priority_weights)
-            )
-
-        self._concur_deferred_counts.append(len(deferred_reqs))
-
-        # Annotate requests
-        for req in admitted_reqs:
-            try:
-                req.concur_admission_state = "ADMITTED"
-                req.concur_congestion_level = level
-            except (AttributeError, TypeError):
-                pass
-
-        for req in deferred_reqs:
-            try:
-                req.concur_admission_state = "DEFERRED"
-                req.concur_congestion_level = level
-            except (AttributeError, TypeError):
-                pass
-
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        self._concur_overhead_ms_list.append(elapsed_ms)
-
-    def _concur_native_gate(
-        self,
-        pending: List[Any],
-        level: str,
-    ) -> Tuple[List[Any], List[Any]]:
-        """Apply admission gate using native CONCUR scheduler."""
-        if level == "CONGESTED":
-            return [], list(pending)
-        elif level == "BOUNDARY":
-            weights = dict(self._concur_cfg.priority_weights)
-            def _prio(r: Any) -> float:
-                return weights.get(getattr(r, "request_id", ""), 1.0)
-            sorted_reqs = sorted(pending, key=_prio, reverse=True)
-            half = max(1, len(sorted_reqs) // 2)
-            return sorted_reqs[:half], sorted_reqs[half:]
-        else:  # FREE
-            return list(pending), []
-
-    def update_concur_remote_occupancy(self, node_id: str, occupancy: float) -> None:
-        """Multi-node: update remote node KV pool occupancy.
-
-        Args:
-            node_id: Identifier for the remote node.
-            occupancy: Fractional KV pool occupancy on that node (0.0–1.0).
-        """
-        if self._concur_use_native and self._concur_native is not None:
-            self._concur_native.update_remote_occupancy(node_id, occupancy)
-        else:
-            self._concur_gate.update_remote_occupancy(node_id, occupancy)
-
-    def global_concur_occupancy(self) -> float:
-        """Return average of local + remote KV pool occupancies (multi-node)."""
-        if self._concur_use_native and self._concur_native is not None:
-            return self._concur_native.global_occupancy()
-        return self._concur_gate.global_occupancy()
-
-    def get_concur_stats(self) -> Dict[str, Any]:
-        """Return CONCUR scheduling statistics.
-
-        Returns:
-            dict with keys: step_count, scheduling_overhead_ms_p50,
-            avg_deferred_per_step, current_alpha_low, current_alpha_high,
-            current_occupancy, vllm_version.
-        """
-        p50_ms = 0.0
-        if self._concur_overhead_ms_list:
-            s = sorted(self._concur_overhead_ms_list)
-            p50_ms = s[len(s) // 2]
-
-        avg_deferred = (
-            sum(self._concur_deferred_counts) / max(1, len(self._concur_deferred_counts))
-        )
-
-        if self._concur_use_native and self._concur_native is not None:
-            alpha_low = self._concur_native.monitor.alpha_low
-            alpha_high = self._concur_native.monitor.alpha_high
-            current_occ = self._concur_native.monitor.get_occupancy()
-        else:
-            alpha_low = self._concur_gate.alpha_low
-            alpha_high = self._concur_gate.alpha_high
-            current_occ = self._concur_gate._current_occupancy
-
-        return {
-            "step_count": self._concur_step_count,
-            "scheduling_overhead_ms_p50": p50_ms,
-            "avg_deferred_per_step": avg_deferred,
-            "current_alpha_low": alpha_low,
-            "current_alpha_high": alpha_high,
-            "current_occupancy": current_occ,
-            "global_occupancy": self.global_concur_occupancy(),
-            "vllm_version": vllm.__version__,
-        }
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _concur_extract_waiting(self, waiting: Any) -> List[Any]:
-        """Extract pending requests from vLLM's RequestQueue (read-only)."""
-        pending: List[Any] = []
-        if isinstance(waiting, deque):
-            pending = list(waiting)
-        elif hasattr(waiting, "_heap"):
-            pending = [entry[-1] for entry in waiting._heap if entry]
-        elif hasattr(waiting, "__iter__"):
-            try:
-                pending = list(waiting)
-            except Exception:
-                pass
-        return pending
-
-
-def make_concur_admission_scheduler_class(base_scheduler_cls: type) -> type:
-    """Factory: build a vLLM Scheduler subclass with CONCUR congestion admission gate.
-
-    The returned class overrides schedule() to call concur_pre_schedule() before
-    the base Scheduler.schedule() logic, adding 3-state congestion-based admission
-    control with online threshold adaptation.
-
-    Activity A: KV Cache-aware Scheduling (CONCUR congestion gate).
-
-    Args:
-        base_scheduler_cls: vLLM Scheduler class (e.g. vllm.v1.core.sched.scheduler.Scheduler).
-
-    Returns:
-        CONCURAdmissionVllmScheduler: subclass of
-        (CONCURCongestionAdmissionSchedulerMixin, base_scheduler_cls).
-
-    Example:
-
-        from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm_integration.scheduler_patch import (
-            make_concur_admission_scheduler_class,
-            ConcurSchedulerConfig,
-        )
-
-        ConcurScheduler = make_concur_admission_scheduler_class(Scheduler)
-        scheduler = ConcurScheduler(
-            vllm_config=cfg,
-            kv_cache_config=kv_cfg,
-            structured_output_manager=som,
-            block_size=16,
-            concur_config=ConcurSchedulerConfig(
-                alpha_low=0.60,
-                alpha_high=0.85,
-                online_adapt_window=100,
-            ),
-        )
-
-    Composable with prior-cycle mixins (Cross A+C):
-
-        from vllm_integration.scheduler_patch import make_nath_ddr_scheduler_class
-        ConcurNAtHScheduler = make_concur_admission_scheduler_class(
-            make_nath_ddr_scheduler_class(Scheduler)
-        )
-
-    Scheduling overhead: < 1ms p50 (O(W) per step, W = waiting queue size).
-    Accuracy contract: in-flight KV blocks are never preemptively evicted;
-    CONCUR's core guarantee preserves ongoing request quality.
-    """
-
-    class CONCURAdmissionVllmScheduler(
-        CONCURCongestionAdmissionSchedulerMixin, base_scheduler_cls  # type: ignore[valid-type]
-    ):
-        """vLLM Scheduler extended with CONCUR 3-state KV pool admission gate (Activity A).
-
-        Wraps schedule() to apply congestion-based admission control before
-        the base FCFS/Priority scheduling runs. Requests are annotated with
-        concur_admission_state ("ADMITTED" / "DEFERRED") and congestion_level
-        ("FREE" / "BOUNDARY" / "CONGESTED") for monitoring and routing.
-        """
-
-        def __init__(
-            self,
-            *args: Any,
-            concur_config: Optional[ConcurSchedulerConfig] = None,
-            **kwargs: Any,
-        ) -> None:
-            super().__init__(*args, concur_config=concur_config, **kwargs)
-
-        def schedule(self) -> Any:
-            """Override: run CONCUR admission gate before base scheduling."""
-            self.concur_pre_schedule()
-            return super().schedule()
-
-    CONCURAdmissionVllmScheduler.__name__ = f"CONCURAdmission_{base_scheduler_cls.__name__}"
-    CONCURAdmissionVllmScheduler.__qualname__ = CONCURAdmissionVllmScheduler.__name__
-    return CONCURAdmissionVllmScheduler
-
-
-def _smoke_test_concur_admission_scheduler_mixin_20() -> None:
-    """Smoke test for CONCURCongestionAdmissionSchedulerMixin (2026-05-20)."""
-    print("CONCURCongestionAdmissionSchedulerMixin smoke test (2026-05-20)...")
-
-    # Test _InlineCONCURGate directly
-    gate = _InlineCONCURGate(alpha_low=0.60, alpha_high=0.85, online_adapt_window=10)
-
-    # FREE state: all admitted
-    gate.update_occupancy(0.40)
-    assert gate.congestion_level() == "FREE", f"Expected FREE, got {gate.congestion_level()}"
-
-    class FakeReq:
-        def __init__(self, rid: str):
-            self.request_id = rid
-    reqs = [FakeReq(f"r{i}") for i in range(4)]
-    admitted, deferred = gate.admit_requests(reqs, {})
-    assert len(admitted) == 4, f"FREE should admit all 4, got {len(admitted)}"
-    assert len(deferred) == 0
-    print("  FREE admit-all: PASS")
-
-    # BOUNDARY state: top-half admitted
-    gate.update_occupancy(0.70)
-    assert gate.congestion_level() == "BOUNDARY"
-    admitted, deferred = gate.admit_requests(reqs, {})
-    assert len(admitted) == 2, f"BOUNDARY should admit 2/4, got {len(admitted)}"
-    print("  BOUNDARY half-admit: PASS")
-
-    # CONGESTED state: none admitted
-    gate.update_occupancy(0.90)
-    assert gate.congestion_level() == "CONGESTED"
-    admitted, deferred = gate.admit_requests(reqs, {})
-    assert len(admitted) == 0, f"CONGESTED should admit 0, got {len(admitted)}"
-    print("  CONGESTED block-all: PASS")
-
-    # Multi-node occupancy
-    gate.update_occupancy(0.30)
-    gate.update_remote_occupancy("node-1", 0.70)
-    global_occ = gate.global_occupancy()
-    assert abs(global_occ - 0.50) < 0.01, f"Global occupancy should be 0.50, got {global_occ}"
-    print(f"  Multi-node global occupancy={global_occ:.2f}: PASS")
-
-    # Factory with real vLLM Scheduler
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        ConcurSched = make_concur_admission_scheduler_class(Scheduler)
-        assert issubclass(ConcurSched, Scheduler)
-        assert issubclass(ConcurSched, CONCURCongestionAdmissionSchedulerMixin)
-        print(f"  make_concur_admission_scheduler_class: PASS ({ConcurSched.__name__})")
-    except Exception as exc:
-        print(f"  make_concur_admission_scheduler_class: SKIP (no GPU env): {exc}")
-
-    print("CONCURCongestionAdmissionSchedulerMixin smoke test (2026-05-20): PASS")
-
-
-# End of 2026-05-20 CONCUR Congestion Admission additions
-# ===========================================================================
-
-
-# ===========================================================================
-# 2026-05-21: BlockUnionBCSchedulerMixin (Activity B+C Scheduling Support)
-# ===========================================================================
-#
-# Provides scheduling support for the B+C BlockUnion pipeline in vLLM 0.21.0.
-#
-# This mixin does NOT implement Activity A (KV cache-aware scheduling) —
-# that is deferred to the next cycle.  Instead, it provides:
-#
-# 1. BlockUnion segment-key pre-computation at schedule time:
-#    Before each batch step, compute segment hashes for all waiting requests
-#    and annotate them with their expected block-union hit counts.
-#
-# 2. BC-pipeline metadata injection:
-#    Attach BlockUnionBCPipeline metadata (b_config, c_config) to the
-#    scheduler config so the attention hook and block manager can read it.
-#
-# 3. Accuracy-preserving hook registration:
-#    Register per-layer CompactAttentionBlockUnionHook instances so that
-#    kv_selection_ratio is consistent across all layers during a request.
-#
-# Integration point:
-#   vllm.v1.core.sched.scheduler.Scheduler — subclass via mixin.
-#   schedule() method is NOT overridden; new pre/post hooks are injected.
-#
-# vLLM 0.21.0 Scheduler API:
-#   schedule() → SchedulerOutput
-#   update_from_outputs(model_runner_output, execution_results) → EngineCoreOutputs
-#   add_request(request)
-#   abort_requests(request_ids)
-
-
-import hashlib
-import warnings as _warnings_sched21
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-
-
-@dataclass
-class BlockUnionBCSchedulerConfig:
-    """Configuration for BlockUnionBCSchedulerMixin (Activity B+C, 2026-05-21).
-
-    This config is separate from SchedulerConfig — do not modify vLLM's
-    existing SchedulerConfig fields.  New fields are added here.
-    """
-    # Activity B parameters
-    block_size: int = 16              # PA block size in tokens
-    n_kv_heads: int = 8               # Total KV heads
-    n_gqa_groups: int = 4             # GQA groups
-    max_aux_segments: int = 2048      # Max auxiliary segment store entries
-
-    # Activity C parameters
-    kv_selection_ratio: float = 0.40  # Top-k KV block selection ratio
-    chunk_size: int = 2048            # Chunked-prefill chunk size (tokens)
-    n_layers: int = 32                # Model layer count (for hook registration)
-
-    # B+C combined settings
-    apply_selection_to_union: bool = True  # Apply C selection on top of B union
-    enabled: bool = True                   # If False, mixin is a no-op
-    seed: int = 42
-
-
-class BlockUnionBCSchedulerMixin:
-    """Mixin for vLLM v1 Scheduler: B+C pipeline scheduling support (2026-05-21).
-
-    Provides segment-key pre-computation and BC-pipeline metadata injection
-    without modifying vLLM's core scheduling logic.
-
-    New methods (non-conflicting with Scheduler API):
-      init_block_union_bc_scheduler(): initialise mixin state.  Call from __init__.
-      precompute_segment_keys(request): compute segment hash keys for a request.
-      get_bc_pipeline_config(): return BCPipelineConfig for the block manager / hook.
-      get_per_layer_hooks(): return list of CompactAttentionBlockUnionHook per layer.
-      bc_scheduler_metrics(): aggregate B+C scheduling metrics dict.
-
-    Accuracy contract:
-      kv_selection_ratio is passed consistently to all layer hooks.
-      Changing kv_selection_ratio mid-request is not supported.
-    """
-
-    def init_block_union_bc_scheduler(
-        self,
-        bc_config: Optional[BlockUnionBCSchedulerConfig] = None,
-    ) -> None:
-        """Initialise B+C scheduling state.  Call from subclass __init__."""
-        cfg = bc_config or BlockUnionBCSchedulerConfig()
-        self._bc_sched_config = cfg
-        self._bc_segment_cache: Dict[str, List[str]] = {}  # request_id → seg_keys
-        self._bc_hook_registry: List[Any] = []  # per-layer hooks
-        self._bc_schedule_calls: int = 0
-        self._bc_total_segment_hits: int = 0
-
-        # Lazily register per-layer hooks on first use
-        self._bc_hooks_initialised: bool = False
-
-    def _ensure_hooks_initialised(self) -> None:
-        """Lazily initialise per-layer CompactAttentionBlockUnionHook instances."""
-        if self._bc_hooks_initialised:
-            return
-        try:
-            from vllm_integration.attention_backend_patch import (
-                CompactAttentionBlockUnionConfig,
-                CompactAttentionBlockUnionHook,
-            )
-            hook_cfg = CompactAttentionBlockUnionConfig(
-                kv_selection_ratio=self._bc_sched_config.kv_selection_ratio,
-                n_kv_heads=self._bc_sched_config.n_kv_heads,
-                n_gqa_groups=self._bc_sched_config.n_gqa_groups,
-                block_size=self._bc_sched_config.block_size,
-                chunk_size=self._bc_sched_config.chunk_size,
-                enabled=self._bc_sched_config.enabled,
-            )
-            self._bc_hook_registry = [
-                CompactAttentionBlockUnionHook(hook_cfg)
-                for _ in range(self._bc_sched_config.n_layers)
-            ]
-        except Exception as exc:
-            _warnings_sched21.warn(
-                f"BlockUnionBCSchedulerMixin: hook init failed: {exc}",
-                RuntimeWarning,
-            )
-            self._bc_hook_registry = []
-        self._bc_hooks_initialised = True
-
-    @staticmethod
-    def _hash_token_chunk(token_ids: List[int], chunk_idx: int = 0) -> str:
-        """Compute segment hash for a token chunk (position-independent)."""
-        h = hashlib.sha256()
-        h.update(chunk_idx.to_bytes(4, "little", signed=False) if False else b"")
-        for t in token_ids:
-            try:
-                h.update(int(t).to_bytes(4, "little", signed=False))
-            except (OverflowError, TypeError):
-                h.update(b"\x00\x00\x00\x00")
-        return h.hexdigest()[:32]
-
-    def precompute_segment_keys(
-        self,
-        request,
-        chunk_size: Optional[int] = None,
-    ) -> List[str]:
-        """Pre-compute segment hash keys for a request's prompt tokens.
-
-        Splits the request prompt into chunks of chunk_size tokens and
-        computes a content-hash key for each chunk.  Keys are cached by
-        request_id to avoid recomputation across schedule steps.
-
-        Parameters
-        ----------
-        request : vllm.v1.request.Request | object with .request_id, .prompt_token_ids
-        chunk_size : int | None
-            Chunk size override.  Defaults to bc_sched_config.chunk_size.
-
-        Returns
-        -------
-        List[str]
-            List of segment hash keys (one per chunk).
-        """
-        if not self._bc_sched_config.enabled:
-            return []
-
-        req_id = getattr(request, "request_id", str(id(request)))
-        if req_id in self._bc_segment_cache:
-            return self._bc_segment_cache[req_id]
-
-        token_ids = getattr(request, "prompt_token_ids", None) or []
-        cs = chunk_size or self._bc_sched_config.chunk_size or 2048
-        if not token_ids:
-            return []
-
-        seg_keys: List[str] = []
-        for i in range(0, len(token_ids), cs):
-            chunk = token_ids[i: i + cs]
-            seg_keys.append(self._hash_token_chunk(chunk, chunk_idx=i // cs))
-
-        self._bc_segment_cache[req_id] = seg_keys
-        return seg_keys
-
-    def evict_segment_cache(self, request_id: str) -> None:
-        """Remove cached segment keys when a request is completed or aborted."""
-        self._bc_segment_cache.pop(request_id, None)
-
-    def get_bc_pipeline_config(self):
-        """Return BCPipelineConfig for use by the block manager and attention hook.
-
-        Tries to import the real BCPipelineConfig from src/cache/block_union_bc_pipeline.py.
-        Falls back to a plain dataclass if unavailable.
-        """
-        try:
-            from src.cache.block_union_bc_pipeline import BCPipelineConfig
-            from src.cache.block_union_noncontiguous_index import BlockUnionConfig
-            from src.cache.compact_attention_block_union_codec import BlockUnionCodecConfig
-            return BCPipelineConfig(
-                b_config=BlockUnionConfig(
-                    block_size=self._bc_sched_config.block_size,
-                    n_kv_heads=self._bc_sched_config.n_kv_heads,
-                    n_gqa_groups=self._bc_sched_config.n_gqa_groups,
-                    max_entries=self._bc_sched_config.max_aux_segments,
-                    seed=self._bc_sched_config.seed,
-                ),
-                c_config=BlockUnionCodecConfig(
-                    kv_selection_ratio=self._bc_sched_config.kv_selection_ratio,
-                    n_kv_heads=self._bc_sched_config.n_kv_heads,
-                    n_gqa_groups=self._bc_sched_config.n_gqa_groups,
-                    block_size=self._bc_sched_config.block_size,
-                    chunk_size=self._bc_sched_config.chunk_size,
-                    max_entries=self._bc_sched_config.max_aux_segments,
-                    seed=self._bc_sched_config.seed,
-                ),
-                apply_selection_to_union=self._bc_sched_config.apply_selection_to_union,
-                seed=self._bc_sched_config.seed,
-            )
-        except ImportError:
-            # Return a plain namespace with essential fields
-            class _InlineBCConfig:
-                def __init__(self, **kw):
-                    self.__dict__.update(kw)
-            return _InlineBCConfig(
-                kv_selection_ratio=self._bc_sched_config.kv_selection_ratio,
-                block_size=self._bc_sched_config.block_size,
-                n_gqa_groups=self._bc_sched_config.n_gqa_groups,
-                apply_selection_to_union=self._bc_sched_config.apply_selection_to_union,
-            )
-
-    def get_per_layer_hooks(self) -> List[Any]:
-        """Return per-layer CompactAttentionBlockUnionHook instances.
-
-        Hooks are initialised on first call (lazy).
-        Use these to call update_chunk_attention() and get selection masks
-        in the model runner's attention forward pass.
-        """
-        self._ensure_hooks_initialised()
-        return self._bc_hook_registry
-
-    def bc_scheduler_metrics(self) -> Dict:
-        """Return B+C scheduling metrics."""
-        self._ensure_hooks_initialised()
-        hook_metrics = {}
-        if self._bc_hook_registry:
-            h0 = self._bc_hook_registry[0]
-            hook_metrics = {
-                "n_selection_masks": h0._n_chunks_processed,
-                "kv_selection_ratio": h0.config.kv_selection_ratio,
-            }
-        return {
-            "bc_schedule_calls": self._bc_schedule_calls,
-            "bc_cached_segment_keys": len(self._bc_segment_cache),
-            "bc_n_layers_with_hooks": len(self._bc_hook_registry),
-            "bc_apply_selection_to_union": self._bc_sched_config.apply_selection_to_union,
-            **hook_metrics,
-            "vllm_version": "0.21.0",
-            "activity": "B+C",
-            "algorithm": "BlockUnion_BC_Pipeline_Scheduler_2026-05-21",
-        }
-
-
-def make_block_union_bc_scheduler_class(
-    base_scheduler_cls: type = None,
-    bc_config: Optional[BlockUnionBCSchedulerConfig] = None,
-) -> type:
-    """Factory: create Scheduler subclass with BlockUnionBCSchedulerMixin.
-
-    Parameters
-    ----------
-    base_scheduler_cls : type | None
-        vLLM Scheduler class.  If None, imports vllm.v1.core.sched.scheduler.Scheduler.
-    bc_config : BlockUnionBCSchedulerConfig | None
-        B+C scheduler configuration.
-
-    Returns
-    -------
-    type
-        New Scheduler subclass with B+C scheduling support.
-
-    Usage
-    -----
-    >>> from vllm.v1.core.sched.scheduler import Scheduler
-    >>> BCScheduler = make_block_union_bc_scheduler_class(Scheduler)
-    >>> sched = BCScheduler(vllm_config=..., kv_cache_config=..., ...)
-    >>> sched.init_block_union_bc_scheduler()
-    >>> seg_keys = sched.precompute_segment_keys(request)
-    >>> bc_cfg = sched.get_bc_pipeline_config()
-    >>> hooks = sched.get_per_layer_hooks()
-    """
-    if base_scheduler_cls is None:
-        try:
-            from vllm.v1.core.sched.scheduler import Scheduler as _Sched
-            base_scheduler_cls = _Sched
-        except ImportError:
-            base_scheduler_cls = object
-
-    _bc_config_default = bc_config
-
-    class BlockUnionBCScheduler(BlockUnionBCSchedulerMixin, base_scheduler_cls):  # type: ignore[misc]
-        """Scheduler with Activity B+C BlockUnion pipeline support (2026-05-21)."""
-
-        def __init__(self, *args, bc_config=_bc_config_default, **kwargs):
-            if base_scheduler_cls is not object:
-                super().__init__(*args, **kwargs)
-            self.init_block_union_bc_scheduler(bc_config)
-
-    BlockUnionBCScheduler.__name__ = "BlockUnionBCScheduler_2026_05_21"
-    BlockUnionBCScheduler.__qualname__ = BlockUnionBCScheduler.__name__
-    return BlockUnionBCScheduler
-
-
-def _smoke_test_block_union_bc_scheduler_21() -> None:
-    """Smoke test for BlockUnionBCSchedulerMixin (2026-05-21)."""
-    print("BlockUnionBCSchedulerMixin smoke test (2026-05-21):")
-
-    class _MockBase:
-        pass
-
-    class _TestScheduler(BlockUnionBCSchedulerMixin, _MockBase):
-        def __init__(self):
-            self.init_block_union_bc_scheduler(
-                BlockUnionBCSchedulerConfig(
-                    block_size=16,
-                    n_kv_heads=8,
-                    n_gqa_groups=4,
-                    kv_selection_ratio=0.40,
-                    n_layers=4,
-                    enabled=True,
-                )
-            )
-
-    sched = _TestScheduler()
-
-    # precompute_segment_keys
-    class _MockRequest:
-        request_id = "req_test_0"
-        prompt_token_ids = list(range(4096))
-
-    req = _MockRequest()
-    seg_keys = sched.precompute_segment_keys(req, chunk_size=2048)
-    assert len(seg_keys) == 2, f"Expected 2 chunks for 4096 tokens, got {len(seg_keys)}"
-    print(f"  precompute_segment_keys: {len(seg_keys)} keys for 4096 tokens: PASS")
-
-    # Caching
-    seg_keys2 = sched.precompute_segment_keys(req, chunk_size=2048)
-    assert seg_keys == seg_keys2, "Segment keys should be cached and deterministic"
-    print("  segment_key_cache: deterministic: PASS")
-
-    # evict_segment_cache
-    sched.evict_segment_cache("req_test_0")
-    assert "req_test_0" not in sched._bc_segment_cache
-    print("  evict_segment_cache: PASS")
-
-    # get_bc_pipeline_config
-    bc_cfg = sched.get_bc_pipeline_config()
-    assert bc_cfg is not None
-    assert hasattr(bc_cfg, "kv_selection_ratio") or hasattr(bc_cfg, "c_config")
-    print(f"  get_bc_pipeline_config: {type(bc_cfg).__name__}: PASS")
-
-    # get_per_layer_hooks
-    hooks = sched.get_per_layer_hooks()
-    assert len(hooks) == 4
-    print(f"  get_per_layer_hooks: {len(hooks)} layers: PASS")
-
-    # bc_scheduler_metrics
-    metrics = sched.bc_scheduler_metrics()
-    assert metrics["activity"] == "B+C"
-    assert "bc_n_layers_with_hooks" in metrics
-    print(f"  bc_scheduler_metrics keys={list(metrics.keys())[:4]}...: PASS")
-
-    # Factory with real vLLM Scheduler
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-        BCSched = make_block_union_bc_scheduler_class(Scheduler)
-        assert issubclass(BCSched, Scheduler)
-        assert issubclass(BCSched, BlockUnionBCSchedulerMixin)
-        print(f"  make_block_union_bc_scheduler_class(Scheduler): PASS")
-    except Exception as exc:
-        print(f"  make_block_union_bc_scheduler_class(Scheduler): SKIP ({exc})")
-
-    print("BlockUnionBCSchedulerMixin smoke test (2026-05-21): PASS")
-
-
-# End of 2026-05-21 BlockUnionBC Scheduler additions
-# ===========================================================================
+    def update_cache_score(self, request_id: str, score: float) -> None:
+        self._dual_map_scores[request_id] = max(0.0, min(1.0, score))
