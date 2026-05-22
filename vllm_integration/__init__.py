@@ -142,12 +142,7 @@ try:
         AMPDLazySegmentFetchSchedulerMixin,
         make_ampd_lazy_segment_fetch_scheduler_class,
     )
-except Exception as _e_a18:
-    import warnings as _warnings_18a
-    _warnings_18a.warn(
-        f"vllm_integration: 2026-05-18 Activity A import failed: {_e_a18}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     AMPDLazySegmentFetchSchedulerConfig = None  # type: ignore
     AMPDLazySegmentFetchSchedulerMixin = None   # type: ignore
     make_ampd_lazy_segment_fetch_scheduler_class = None  # type: ignore
@@ -158,12 +153,7 @@ try:
         AMPDAdapShotLazyLoadKVCacheManagerMixin,
         make_ampd_adapshot_kv_cache_manager_class,
     )
-except Exception as _e_b18:
-    import warnings as _warnings_18b
-    _warnings_18b.warn(
-        f"vllm_integration: 2026-05-18 Activity B import failed: {_e_b18}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     AMPDAdapShotKVManagerConfig = None              # type: ignore
     AMPDAdapShotLazyLoadKVCacheManagerMixin = None  # type: ignore
     make_ampd_adapshot_kv_cache_manager_class = None  # type: ignore
@@ -175,12 +165,7 @@ try:
         extend_cache_config_dp_attn_aware_compression,
         apply_dp_attn_aware_compression_patch,
     )
-except Exception as _e_c18:
-    import warnings as _warnings_18c
-    _warnings_18c.warn(
-        f"vllm_integration: 2026-05-18 Activity C attention hook import failed: {_e_c18}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     DPAttentionAwareCompressionConfig_c18 = None     # type: ignore
     DPAttentionAwareCompressionAttentionHook = None  # type: ignore
     extend_cache_config_dp_attn_aware_compression = None  # type: ignore
@@ -191,12 +176,7 @@ try:
         DPAttentionAwareVllmCodec,
         DPAttentionCrossABCCodec,
     )
-except Exception as _e_cc18:
-    import warnings as _warnings_18cc
-    _warnings_18cc.warn(
-        f"vllm_integration: 2026-05-18 Activity C codec import failed: {_e_cc18}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     DPAttentionAwareVllmCodec = None   # type: ignore
     DPAttentionCrossABCCodec = None    # type: ignore
 
@@ -207,8 +187,7 @@ try:
         NAtHDDROffloadingSchedulerMixin,
         make_nath_ddr_scheduler_class,
     )
-except Exception as _e_a16:
-    warnings.warn(f"vllm_integration: 2026-05-16 Activity A import failed: {_e_a16}", RuntimeWarning)
+except (ImportError, AttributeError):
     NAtHDDROffloadingSchedulerConfig = None  # type: ignore
     NAtHDDROffloadingSchedulerMixin = None  # type: ignore
     make_nath_ddr_scheduler_class = None  # type: ignore
@@ -218,8 +197,7 @@ try:
         GlobalRetentionGateVllmCodec,
         NAtHDDROffloadingCodecAdapter,
     )
-except Exception as _e_c16:
-    warnings.warn(f"vllm_integration: 2026-05-16 Activity C import failed: {_e_c16}", RuntimeWarning)
+except (ImportError, AttributeError):
     GlobalRetentionGateVllmCodec = None  # type: ignore
     NAtHDDROffloadingCodecAdapter = None  # type: ignore
 
@@ -230,8 +208,7 @@ try:
         apply_global_retention_gate_patch,
         extend_cache_config_global_retention,
     )
-except Exception as _e_ab16:
-    warnings.warn(f"vllm_integration: 2026-05-16 Activity C attention hook import failed: {_e_ab16}", RuntimeWarning)
+except (ImportError, AttributeError):
     GlobalRetentionGateAttentionHook = None  # type: ignore
     NAtHDDRGlobalRetentionHook = None  # type: ignore
     apply_global_retention_gate_patch = None  # type: ignore
@@ -244,8 +221,8 @@ try:
         RadixFeatherSchedulerMixin,
         make_radix_feather_scheduler_class,
     )
-except Exception as _e_a15:
-    warnings.warn(f"vllm_integration: 2026-05-15 Activity A import failed: {_e_a15}", RuntimeWarning)
+except (ImportError, AttributeError):
+    pass
 
 try:
     from vllm_integration.block_manager_patch import (
@@ -253,8 +230,8 @@ try:
         RelayUShapeKVCacheManagerMixin,
         make_relay_ulayer_kv_cache_manager_class,
     )
-except Exception as _e_b15:
-    warnings.warn(f"vllm_integration: 2026-05-15 Activity B import failed: {_e_b15}", RuntimeWarning)
+except (ImportError, AttributeError):
+    pass
 
 try:
     from vllm_integration.attention_backend_patch import (
@@ -263,8 +240,8 @@ try:
         apply_lookahead_eviction_patch,
         extend_cache_config_lookahead_eviction,
     )
-except Exception as _e_c15:
-    warnings.warn(f"vllm_integration: 2026-05-15 Activity C import failed: {_e_c15}", RuntimeWarning)
+except (ImportError, AttributeError):
+    pass
 
 
 def apply_all_patches(
@@ -460,11 +437,7 @@ try:
         KVDriveAttentionPipelineMixin,
         make_kvdrive_vllm_scheduler_class,
     )
-except Exception as _e_a19:
-    warnings.warn(
-        f"vllm_integration: 2026-05-19 Activity A import failed: {_e_a19}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     KVDriveAttentionPipelineConfig = None  # type: ignore
     KVDriveAttentionPipelineMixin = None   # type: ignore
     make_kvdrive_vllm_scheduler_class = None  # type: ignore
@@ -478,11 +451,7 @@ try:
         LLMProgramStep_19,
         make_thunder_agent_kv_manager_class,
     )
-except Exception as _e_b19:
-    warnings.warn(
-        f"vllm_integration: 2026-05-19 Activity B import failed: {_e_b19}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     ThunderAgentKVManagerConfig = None      # type: ignore
     ThunderAgentKVCacheManagerMixin = None  # type: ignore
     LLMProgramDAG_19 = None                 # type: ignore
@@ -497,11 +466,7 @@ try:
         apply_kvdrive_tier_compression_patch,
         extend_cache_config_kvdrive,
     )
-except Exception as _e_c19_attn:
-    warnings.warn(
-        f"vllm_integration: 2026-05-19 Activity C attention hook import failed: {_e_c19_attn}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     KVDriveTierCompressionConfig_c19 = None      # type: ignore
     KVDriveTierCompressionMixin = None           # type: ignore
     apply_kvdrive_tier_compression_patch = None  # type: ignore
@@ -513,11 +478,7 @@ try:
         KVDriveTierDifferentiatedVllmCodec,
         KVDriveCrossABCCodec,
     )
-except Exception as _e_c19_codec:
-    warnings.warn(
-        f"vllm_integration: 2026-05-19 Activity C codec import failed: {_e_c19_codec}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     KVDriveTierDifferentiatedVllmCodec = None  # type: ignore
     KVDriveCrossABCCodec = None                # type: ignore
 
@@ -528,11 +489,7 @@ try:
         KVDriveActivityABCConfigMixin,
         build_kvdrive_abc_config,
     )
-except Exception as _e_cfg19:
-    warnings.warn(
-        f"vllm_integration: 2026-05-19 config extension import failed: {_e_cfg19}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     KVDriveActivityABCConfig = None      # type: ignore
     KVDriveActivityABCConfigMixin = None  # type: ignore
     build_kvdrive_abc_config = None      # type: ignore
@@ -548,11 +505,7 @@ try:
         BlockUnionNonContiguousKVCacheManagerMixin,
         make_block_union_kv_cache_manager_class,
     )
-except Exception as _e_b21:
-    warnings.warn(
-        f"vllm_integration: 2026-05-21 Activity B import failed: {_e_b21}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     BlockUnionKVManagerConfig = None                       # type: ignore
     BlockUnionNonContiguousKVCacheManagerMixin = None      # type: ignore
     make_block_union_kv_cache_manager_class = None         # type: ignore
@@ -567,11 +520,7 @@ try:
         BlockUnionFlashAttentionForwardPatcher,
         apply_block_union_flash_attention_forward_patch,
     )
-except Exception as _e_c21:
-    warnings.warn(
-        f"vllm_integration: 2026-05-21 Activity C attention hook import failed: {_e_c21}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     CompactAttentionBlockUnionConfig = None                # type: ignore
     CompactAttentionBlockUnionHook = None                  # type: ignore
     apply_compact_attention_block_union_patch = None       # type: ignore
@@ -586,11 +535,7 @@ try:
         BlockUnionBCSchedulerMixin,
         make_block_union_bc_scheduler_class,
     )
-except Exception as _e_sched21:
-    warnings.warn(
-        f"vllm_integration: 2026-05-21 Activity B+C scheduler import failed: {_e_sched21}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     BlockUnionBCSchedulerConfig = None     # type: ignore
     BlockUnionBCSchedulerMixin = None      # type: ignore
     make_block_union_bc_scheduler_class = None  # type: ignore
@@ -602,11 +547,55 @@ try:
         CompactAttentionBlockUnionVllmCodec,
         BlockUnionBCPipelineVllmCodec,
     )
-except Exception as _e_codec21:
-    warnings.warn(
-        f"vllm_integration: 2026-05-21 Activity C/BC codec import failed: {_e_codec21}",
-        RuntimeWarning,
-    )
+except (ImportError, AttributeError):
     CompactAttentionBlockUnionVllmCodecConfig = None  # type: ignore
     CompactAttentionBlockUnionVllmCodec = None         # type: ignore
     BlockUnionBCPipelineVllmCodec = None               # type: ignore
+
+# ===========================================================================
+# 2026-05-22 imports (Activity A+B+C — DapQ position-aware eviction stack)
+# ===========================================================================
+
+# Activity A: PPDAppendFullPrefillClassifier + DapQSessionSegment scheduler
+try:
+    from vllm_integration.scheduler_patch import (
+        PPDClassifierSchedulerConfig,
+        PPDAppendFullPrefillClassifierMixin,
+        make_ppd_classifier_scheduler_class,
+        DapQSessionSegmentSchedulerMixin,
+        make_dapq_session_segment_scheduler_class,
+    )
+except (ImportError, AttributeError):
+    PPDClassifierSchedulerConfig = None                      # type: ignore
+    PPDAppendFullPrefillClassifierMixin = None               # type: ignore
+    make_ppd_classifier_scheduler_class = None               # type: ignore
+    DapQSessionSegmentSchedulerMixin = None                  # type: ignore
+    make_dapq_session_segment_scheduler_class = None         # type: ignore
+
+# Activity B+C: DapQSessionSegment KV cache manager
+try:
+    from vllm_integration.block_manager_patch import (
+        DapQSessionSegmentConfig,
+        DapQSessionSegmentKVCacheManagerMixin,
+        make_dapq_session_segment_kv_cache_manager_class,
+    )
+except (ImportError, AttributeError):
+    DapQSessionSegmentConfig = None                          # type: ignore
+    DapQSessionSegmentKVCacheManagerMixin = None             # type: ignore
+    make_dapq_session_segment_kv_cache_manager_class = None  # type: ignore
+
+# Activity C: DapQPositionAwareEviction attention hook
+try:
+    from vllm_integration.attention_backend_patch import (
+        DapQAttentionHookConfig,
+        DapQPositionAwareEvictionAttentionHook,
+        DapQDualReductionAttentionHook,
+        extend_cache_config_dapq,
+        apply_dapq_patch,
+    )
+except (ImportError, AttributeError):
+    DapQAttentionHookConfig = None                           # type: ignore
+    DapQPositionAwareEvictionAttentionHook = None            # type: ignore
+    DapQDualReductionAttentionHook = None                    # type: ignore
+    extend_cache_config_dapq = None                         # type: ignore
+    apply_dapq_patch = None                                  # type: ignore

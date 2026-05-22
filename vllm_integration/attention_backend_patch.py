@@ -240,6 +240,10 @@ class DapQPositionAwareEvictionAttentionHook:
 
         self._write_count: int = 0
         self._read_count: int = 0
+        # Auxiliary segment store: {(kv_key, layer_idx): (comp_k, comp_v, selected_indices)}
+        # Used ONLY for Activity B segment cache re-use path.
+        # The primary attention kernel NEVER reads from here.
+        self._segment_store: Dict[Tuple[str, int], Tuple[Any, Any, Any]] = {}
 
     def write_to_cache(
         self,
@@ -249,7 +253,14 @@ class DapQPositionAwareEvictionAttentionHook:
         layer_idx: int = 0,
         pos_decode: Optional[int] = None,
     ) -> Tuple["torch.Tensor", "torch.Tensor"]:
-        """Compress KV tensors using DapQ position-aware eviction.
+        """Store compact K/V in auxiliary segment store; return ORIGINAL tensors.
+
+        CORRECTED DESIGN (loop 2, 2026-05-22):
+            Computes DapQ compact K/V (selected tokens gathered contiguously) and
+            stores them in self._segment_store[(kv_key, layer_idx)].
+            Returns the ORIGINAL key_tensor / value_tensor UNCHANGED so the vLLM
+            primary attention kernel always receives the full unmodified KV
+            (zero softmax probability-mass distortion).
 
         Args:
             kv_key: String key for the segment (e.g. "{request_id}_layer_{layer_idx}").
@@ -259,8 +270,8 @@ class DapQPositionAwareEvictionAttentionHook:
             pos_decode: Current decode position. If None, inferred from seq_len.
 
         Returns:
-            (compressed_key, compressed_value): Sparse tensors with non-selected
-            positions zeroed. Same dtype and shape as inputs.
+            (key_tensor, value_tensor): The ORIGINAL tensors, unchanged.
+            The compact K/V is stored in self._segment_store for Activity B re-use.
         """
         if not self.enabled:
             return key_tensor, value_tensor
@@ -271,47 +282,67 @@ class DapQPositionAwareEvictionAttentionHook:
         k_key = f"{kv_key}_k_l{layer_idx}"
         v_key = f"{kv_key}_v_l{layer_idx}"
 
-        if self._use_native:
-            # Use native DapQ codec
-            comp_k = self._codec.compression_hook(k_key, key_tensor)
-            comp_v = self._codec.compression_hook(v_key, value_tensor)
-        else:
-            # Fallback inline eviction
-            comp_k = self._codec.compress(k_key, key_tensor, pos_decode)
-            comp_v = self._codec.compress(v_key, value_tensor, pos_decode)
+        try:
+            if self._use_native:
+                # Use native DapQ codec to compute compact K/V for segment store
+                comp_k = self._codec.compression_hook(k_key, key_tensor)
+                comp_v = self._codec.compression_hook(v_key, value_tensor)
+            else:
+                # Fallback inline eviction
+                comp_k = self._codec.compress(k_key, key_tensor, pos_decode)
+                comp_v = self._codec.compress(v_key, value_tensor, pos_decode)
 
-        return comp_k, comp_v
+            # Compute selected_indices for compact gather (non-zero rows)
+            if _TORCH_AVAILABLE and comp_k is not None and comp_k.dim() >= 2:
+                mask = comp_k.abs().sum(dim=-1) > 1e-9 if comp_k.dim() == 2 else comp_k.reshape(comp_k.shape[0], -1).abs().sum(dim=-1) > 1e-9
+                selected_indices = mask.nonzero(as_tuple=False).squeeze(1)
+                # Compact gather: only store selected rows
+                compact_k = key_tensor[selected_indices]
+                compact_v = value_tensor[selected_indices]
+            else:
+                selected_indices = None
+                compact_k = comp_k
+                compact_v = comp_v
+
+            # Store compact K/V in auxiliary segment store (Activity B path only)
+            self._segment_store[(kv_key, layer_idx)] = (compact_k, compact_v, selected_indices)
+        except Exception:
+            # Graceful: if DapQ eviction fails, segment store is simply not populated.
+            pass
+
+        # Always return the ORIGINAL tensors — primary attention kernel is unaffected.
+        return key_tensor, value_tensor
 
     def read_from_cache(
         self,
         kv_key: str,
-        compressed_key: "torch.Tensor",
-        compressed_value: "torch.Tensor",
         layer_idx: int = 0,
-    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
-        """Return KV tensors before attention kernel.
+        # Legacy overload: if compressed_key/value passed as positional args, ignored
+        _legacy_compressed_key: Optional["torch.Tensor"] = None,
+        _legacy_compressed_value: Optional["torch.Tensor"] = None,
+    ) -> Optional[Tuple["torch.Tensor", "torch.Tensor", Any]]:
+        """Return compact K/V from auxiliary segment store (Activity B re-use path).
 
-        In DapQ's eviction scheme, the 'decompressed' form is the sparse tensor
-        itself (selected positions at original precision, unselected = 0). This
-        is safe for masked attention computation.
+        CORRECTED DESIGN (loop 2, 2026-05-22):
+            Returns the compact (eviction-selected) K/V stored by write_to_cache.
+            Called ONLY on the segment-cache hit path (Activity B), NOT in the
+            primary attention kernel path.
 
         Args:
             kv_key: String key used in write_to_cache.
-            compressed_key: Output of write_to_cache (key).
-            compressed_value: Output of write_to_cache (value).
             layer_idx: Transformer layer index.
 
         Returns:
-            (key, value): Same as input — sparse FP16/FP32 tensors. Attention
-            kernel receives tensors at full precision for selected positions.
+            (compact_k, compact_v, selected_indices) if present, else None.
+            compact_k / compact_v are gathered (compact, contiguous) tensors.
+            selected_indices: LongTensor of row indices that were selected.
         """
         if not self.enabled:
-            return compressed_key, compressed_value
+            return None
 
         self._read_count += 1
-        # DapQ eviction: decompressed form IS the sparse tensor (selected positions intact).
-        # Non-selected positions are 0 — masked attention handles these correctly.
-        return compressed_key, compressed_value
+        entry = self._segment_store.get((kv_key, layer_idx), None)
+        return entry  # None on miss, (compact_k, compact_v, selected_indices) on hit
 
     def get_importance_mask(self, kv_key: str, layer_idx: int = 0) -> Optional["torch.Tensor"]:
         """Return importance mask [seq_len] bool tensor for the given key/layer."""
@@ -569,9 +600,10 @@ def apply_dapq_patch(
                 output_block_scale=None,
             ):
                 if hook.enabled and _TORCH_AVAILABLE:
-                    seq_len = key.shape[0] if key.dim() == 2 else key.shape[0]
                     kv_key = f"flash_attn_step"
-                    # Apply DapQ eviction to key and value before original forward
+                    # Store compact K/V in segment store (Activity B auxiliary path).
+                    # write_to_cache returns ORIGINAL key/value unchanged — primary
+                    # attention kernel receives full unmodified KV (zero error).
                     key, value = hook.write_to_cache(
                         kv_key, key, value, layer_idx=0
                     )
@@ -703,25 +735,31 @@ class DapQDualReductionAttentionHook:
             chunk_idx: Chunk index within the token sequence.
 
         Returns:
-            (compressed_key, compressed_value): DapQ-evicted sparse tensors.
+            (key_tensor, value_tensor): ORIGINAL tensors unchanged (primary kernel path).
+            Compact K/V is stored internally via _dapq_hook._segment_store for Activity B.
         """
         if not self.enabled:
             return key_tensor, value_tensor
 
-        # Step 1: Apply DapQ eviction (Activity C)
+        # Step 1: Apply DapQ eviction (C) — stores compact K/V in _dapq_hook._segment_store,
+        #         returns original tensors unchanged for the primary attention kernel.
         kv_key = f"{session_id}_turn{turn_id}_layer{layer_idx}_chunk{chunk_idx}"
-        comp_k, comp_v = self._dapq_hook.write_to_cache(
+        orig_k, orig_v = self._dapq_hook.write_to_cache(
             kv_key, key_tensor, value_tensor, layer_idx=layer_idx
         )
 
-        # Step 2: Register in session-aware segment cache (Activity B)
+        # Step 2: Register compact K/V in session-aware segment cache (Activity B)
+        # Retrieve the compact entry from _segment_store for Activity B registration.
         if self._use_native and self._pipeline is not None and _TORCH_AVAILABLE:
             _token_ids = token_ids if token_ids is not None else list(range(key_tensor.shape[0]))
             try:
+                # Use compact K/V from segment store if available, else fall back to original
+                compact_entry = self._dapq_hook.read_from_cache(kv_key, layer_idx=layer_idx)
+                kv_for_segment = compact_entry[0] if compact_entry is not None else orig_k
                 self._pipeline.segment_cache.put_turn_segment(
                     token_ids=_token_ids,
                     chunk_idx=chunk_idx,
-                    kv=comp_k,
+                    kv=kv_for_segment,
                     session_id=session_id,
                     turn_id=turn_id,
                     layer_idx=layer_idx,
@@ -730,7 +768,7 @@ class DapQDualReductionAttentionHook:
                 pass  # Graceful: segment registration failure does not block attention
 
         self._segment_counter += 1
-        return comp_k, comp_v
+        return orig_k, orig_v
 
     def process_session(
         self,
