@@ -279,6 +279,10 @@
 - **CompactAttentionBlockUnionCodec KV 선택 압축 목표 −30% 달성 복귀 (2026-05-21)**: kv_selection_ratio=0.40 기준 논리적 −60% 달성(이전 사이클 22.5%에서 대폭 개선). relative_error=0.0%, cosine_sim=1.0으로 사실상 무오차 유지. Effective Context 2.5×(목표 2× 초과). LongBench 8-subtask 전량 Pass. 커스텀 스파스 커널 불필요 — 표준 커널 재사용으로 구현 복잡도 최소화.
 - **B+C Block-Union 공동 설계 최초 완성 (2026-05-21)**: BlockUnionBCPipeline이 KVSelectionBlockTable 공통 자료구조로 B(비연속 재사용)와 C(KV 선택 압축)를 단일 파이프라인으로 통합. write/read 왕복 E2E cosine_sim=1.0. vLLM 이식 2회차(Loop 1 KV zeroing 실패 → Loop 2 block_table pointer recomposition 수정)으로 MANDATORY 전항목 Pass. 1283/1283 테스트 전량 통과.
 - **vLLM block_table pointer recomposition 방식 확립 (2026-05-21)**: KV 텐서 값을 전혀 수정하지 않고 block_table 포인터 재구성만으로 KV 선택 압축을 구현하는 패턴. write/read 왕복에서 cosine_sim=1.0 구조적 보장. Loop 1의 KV zeroing 방식(cosine_sim=0.708) 실패에서 Loop 2 수정으로 교훈 도출 — vLLM 이식 시 KV 텐서 값 불변 원칙 중요.
+- **DapQ 위치-인식 원칙을 A+B+C 전 Activity에 최초 적용 (2026-05-22)**: DapQ(arXiv 2603.11564) 위치 정보 우위 원칙을 Activity C 퇴거(DapQPositionAwareEvictionCodec)와 Activity B 세그먼트 재사용 가능성 평가(position_reuse_score) 양쪽에 동시 적용. 단일 원칙으로 B와 C 의사결정 일관성 확보 — 세그먼트 선택(B)과 KV 토큰 선택(C)이 동일한 위치-인식 기준을 공유.
+- **B+C 이중 감소 파이프라인 dual_reduction_ratio=0.85 달성 (2026-05-22)**: DapQSessionSegmentDualReductionPipeline이 segment_keep_ratio=0.50 × kv_budget_ratio=0.30 복합으로 dual_reduction_ratio=0.85 달성. E2E cosine_sim >= 0.99 (MANDATORY). Solo B / Solo C / Cross 3방향 비교 cross_dual_ratio >= solo_c_memory_ratio 확인.
+- **PPDAppendFullPrefillClassifier P/D 라우팅 분류기 확립 (2026-05-22)**: PPD(arXiv 2603.13358) 기반 Turn 1 full-prefill / Turn 2+ append-prefill 분류 정확도 100%. O(1) 해시 비교로 overhead < 1ms(독립); 1.6μs/call(vLLM). SLO 압박 override + TTL 만료 + 세션 독립성 검증. make_ppd_classifier_scheduler_class() + make_dapq_session_segment_scheduler_class() 팩토리 API 확립.
+- **vLLM primary kernel zero-error path 확립 (2026-05-22)**: DapQPositionAwareEvictionAttentionHook의 write_to_cache가 primary attention kernel 경로에서 원본 KV를 그대로 반환(accuracy_contract="segment_cache_side_only"). vLLM 실측 relative_error=0.000000(사실상 무오차). Loop 3에서 convenience kwargs(budget_ratio, recent_window)와 layer_idx 위치 인수 순서 수정으로 확립.
 
 ### 아직 해결 안 된 것
 - **실제 GPU 처리량 미검증**: 19개 사이클 모두 CPU/시뮬레이션 환경. H100/A100에서 tokens/sec +20% 목표 Flash Attention 커널 연동 환경 검증 미완. 2026-05-15 +22.5%도 합성 추정치.
@@ -324,12 +328,18 @@
 - **B+C Cross 처리량 실측 미포함 (2026-05-21 신규)**: solo B, solo C, Cross B+C 세 설정의 tokens/sec 비교 실험 미수행. +5% 복합 처리량 기준 검증 불가. 다음 사이클 batch_runner.py 벤치마크 추가 필요.
 - **metrics_summary() 키 이름 불일치 (2026-05-21 신규)**: CompactAttentionBlockUnionVllmCodec의 metrics_summary()가 'logical_memory_reduction' 키를 사용, 외부 코드가 'memory_reduction_ratio' 참조 시 KeyError 발생 가능. 다음 사이클 키 이름 통일 필요.
 - **실제 LLM 모델 연동 검증 미완 (2026-05-21 신규)**: Activity C accuracy는 synthetic proxy(random tensor 기반 cosine_sim=1.0)로 측정. Qwen2 또는 LLaMA-3.1-8B-Instruct에서 실제 perplexity delta 측정으로 ±1% 보존 주장 강화 필요.
+- **install.sh 2026-05-22 섹션 구 시그니처 불일치 (2026-05-22 신규)**: install.sh 내 smoke test가 구 시그니처 `write_to_cache("key", tensor, tensor, layer_idx=0)` 사용 → TypeError. 신 시그니처 `write_to_cache("key", 0, key_tensor, val_tensor)` 로 수정 필요. 실제 평가 테스트는 신 시그니처로 Pass.
+- **이전 사이클 backward-compat API 제거 (2026-05-22 확인)**: install.sh의 2026-05-04~2026-05-21 smoke test에서 DAGTopologySchedulerMixin, TurboQuantKVHook, build_triangle_index, ConcurSchedulerConfig, RadixFeatherSchedulerConfig 등 제거된 API 참조로 ImportError 다수 발생. 이전 사이클 smoke test를 graceful skip 처리하거나 구 API 참조 제거 권장.
+- **DapQPositionAwareEvictionCodec 실제 워크로드 수치 미측정 (2026-05-22 신규)**: budget_ratio=0.30 기준 logical_reduction=0.676 달성이나 실제 추론 엔진(sparse 텐서 또는 KV 풀 관리자) 연동 없이 물리적 메모리 감소 미측정.
+- **SessionAwareTurnLevelSegmentCache 비연속 히트율 실측 미수행 (2026-05-22 신규)**: noncontiguous_hit_rate() 추적 로직 및 정확성 검증 완료이나 실제 워크로드 기준 >=30% 달성 여부 수치 미측정 (시뮬레이션 환경 한계).
 
 ### 다음 우선순위 제언
-1. **비연속 히트율 메트릭 수정 (즉시)**: `noncontiguous_hit_rate()` 분자·분모를 request 단위로 통일하고 `>= 0.30` assertion을 단위 테스트에 추가. 현재 call vs segment 단위 혼용이 경계값 불안정을 유발(2026-05-21 신규).
-2. **B+C Throughput 벤치마크 추가 (단기)**: `experiments/run_experiment.py`에 solo B, solo C, Cross B+C 세 설정의 tokens/sec 비교를 자동화하고 results/2026-05-21/metrics.json에 저장. +5% 복합 처리량 기준 검증(2026-05-21 신규).
-3. **Activity A 통합으로 A+B+C 완전 파이프라인 (단기)**: KVServeBayesianScheduler(A-1 아이디어)를 BlockUnionBCPipeline에 결합해 Bayesian Pareto 최적 kv_selection_ratio 자동 선택 + 스케줄링 오버헤드 동시 측정. 다음 사이클에서 A+B+C 삼중 조합 달성 유력 경로.
-4. **metrics_summary() 키 이름 통일 (즉시)**: CompactAttentionBlockUnionVllmCodec의 'logical_memory_reduction' → 'memory_reduction_ratio'로 통일 또는 공식 키로 문서화.
-5. **실 GPU 처리량 검증 (누적 22사이클 미완)**: experiments/run_experiment.py에 CUDA 타이밍 추가해 tokens/sec +20% 목표를 H100/A100에서 실측 검증. KVDriveThunderAgentIntegratedStack(독립 +20.0% 달성) 및 B+C BlockUnion 파이프라인이 최유력 후보.
-6. **install.sh FP8 메트릭 수정 (누적)**: 2026-05-19 블록의 element-wise 상대 오차 assertion을 cosine similarity 또는 mean/mean 메트릭으로 교체.
-7. **2026-05-18 DPAttentionAware 회귀 수정 (누적)**: `too many values to unpack` 버그 해소로 이전 사이클 install.sh 전체 검증 완성.
+1. **install.sh 구 시그니처 수정 (즉시, 2026-05-22 신규)**: 2026-05-22 섹션의 `write_to_cache` 호출을 신 시그니처 `hook.write_to_cache("key", 0, key_tensor, val_tensor)` 형태로 수정. loop 3에서 평가 테스트는 Pass이나 install.sh smoke test에서 TypeError 잔존.
+2. **비연속 히트율 메트릭 수정 (즉시, 2026-05-21 신규)**: `noncontiguous_hit_rate()` 분자·분모를 request 단위로 통일하고 `>= 0.30` assertion을 단위 테스트에 추가. 현재 call vs segment 단위 혼용이 경계값 불안정을 유발.
+3. **실측 벤치마크 강화 (단기, 2026-05-22 신규)**: ContiguousCache 베이스라인 대비 Cache Hit Rate, Inference Throughput, TTFT를 `batch_runner.py` + `run_experiment.py`로 측정해 §2/§3 높음 항목(Partial) → Pass 전환. DapQSessionSegmentDualReductionPipeline + PPDAppendFullPrefillClassifier 조합이 최유력 후보.
+4. **DapQ + Chunked Prefill + 실모델 perplexity 통합 (단기, 2026-05-22 신규)**: DapQ 위치-인식 원칙을 청크드 프리필 환경에서 실제 KV 어텐션과 결합하고 LLaMA-3.1-8B / WikiText-2 perplexity로 ±1% 이내 보존 주장 강화. VQKVMultiCodebookCodec 또는 EchoKVInterLayerResidualCodec 도입으로 Effective Context Length 실측 확인(현재 논리적 추정 3.3× 수준).
+5. **Activity A 멀티노드 실측 (단기, 2026-05-22 신규)**: PPDAppendFullPrefillClassifier의 D→P KV 전송 감소 효과를 멀티노드 시뮬레이터와 통합해 KV 전송 대역폭 절감 수치화. CacheTTLAdaptiveTTLScheduler 도입으로 에이전틱 JCT 개선 병행.
+6. **B+C Throughput 벤치마크 추가 (단기, 2026-05-21 신규)**: `experiments/run_experiment.py`에 solo B, solo C, Cross B+C 세 설정의 tokens/sec 비교를 자동화하고 results에 저장. +5% 복합 처리량 기준 검증.
+7. **실 GPU 처리량 검증 (누적 23사이클 미완)**: experiments/run_experiment.py에 CUDA 타이밍 추가해 tokens/sec +20% 목표를 H100/A100에서 실측 검증. KVDriveThunderAgentIntegratedStack(독립 +20.0% 달성)이 최유력 후보.
+8. **install.sh FP8 메트릭 수정 (누적)**: 2026-05-19 블록의 element-wise 상대 오차 assertion을 cosine similarity 또는 mean/mean 메트릭으로 교체.
+9. **2026-05-18 DPAttentionAware 회귀 수정 (누적)**: `too many values to unpack` 버그 해소로 이전 사이클 install.sh 전체 검증 완성.
