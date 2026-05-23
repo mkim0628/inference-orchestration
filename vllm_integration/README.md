@@ -234,6 +234,49 @@ xc_hook = RuntimeCertifiedKVSculptVllmHook(
 | Prior cycles (2026-05-20 through 2026-05-22) | PASS | No regressions; all prior patch factories/hooks preserved |
 | Tensor-parallel (TP > 1) | PARTIAL | `build_clc_noncontiguous_block_table()` is not TP-aware; caller must broadcast from rank 0. Runtime warning emitted when TP detected. |
 
+### §TP — Tensor-Parallel (TP) Limitations and Usage Contract
+
+`CLCPositionalBiasGatedKVCacheManagerMixin` is **not TP-aware**.  In multi-GPU
+tensor-parallel deployments (TP > 1), all TP ranks must use identical block tables,
+but the CLC auxiliary store is maintained per-process (not shared across TP ranks).
+
+**Limitation:**
+- `build_clc_noncontiguous_block_table()` computes block indices from the local
+  process's `_clc_store` or `_clc_src_cache._meta` dict.  In a TP environment
+  each rank may have different segment state, leading to inconsistent block tables
+  if called independently on each rank.
+- `get_clc_segment_with_policy()` emits a `warnings.warn()` when TP is detected
+  (via `VLLM_TENSOR_PARALLEL_SIZE`, `WORLD_SIZE`, or `torch.distributed.get_world_size()`).
+
+**Required caller pattern for TP deployments:**
+```python
+import torch.distributed as dist
+from vllm_integration.block_manager_patch import make_clc_bias_gate_kv_cache_manager_class
+
+# On TP rank 0 only: compute the block table
+if dist.get_rank() == 0:
+    table = mgr.build_clc_noncontiguous_block_table(segment_keys, block_size=16)
+else:
+    table = None
+
+# Broadcast shape + tensor from rank 0 to all TP ranks
+if table is not None:
+    # Signal that table is non-None
+    flag = torch.tensor([1], dtype=torch.int64)
+    dist.broadcast(flag, src=0)
+    dist.broadcast(table, src=0)
+else:
+    flag = torch.tensor([0], dtype=torch.int64)
+    dist.broadcast(flag, src=0)
+
+# Now all ranks have the same table — safe to inject into FlashAttentionImpl
+if flag.item() == 1:
+    output = flash_attn_impl.forward(..., block_tables=table)
+```
+
+**Alternative:** Set `VLLM_TENSOR_PARALLEL_SIZE=1` to suppress TP detection warnings
+in environments where TP is handled at a higher level (e.g., via disaggregated prefill).
+
 ---
 
 ## 2026-05-22 Cycle: Activity A+B+C (DapQ Position-Aware KV Eviction + Session Segment Dual Reduction + PPD Prefill Classifier)

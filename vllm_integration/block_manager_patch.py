@@ -1124,11 +1124,19 @@ class CLCPositionalBiasGatedKVCacheManagerMixin:
         block_indices: List[int] = []
 
         for key in segment_keys:
-            # Prefer src/ cache entry if available
+            # Prefer src/ cache entry if available.
+            # Access positional metadata via _meta dict (SegmentMeta namedtuple with
+            # pos_orig_start / pos_orig_end fields) — src/ does not expose get_raw_entry().
             entry: Optional[_CLCSegmentEntry] = None
             if self._clc_src_cache is not None:
                 try:
-                    raw = self._clc_src_cache.get_raw_entry(key)
+                    # Try _meta dict first (standard src/ internal attribute)
+                    raw = None
+                    if hasattr(self._clc_src_cache, "_meta"):
+                        raw = self._clc_src_cache._meta.get(key)
+                    # Fallback: try get_raw_entry() if available (future-proof)
+                    if raw is None and hasattr(self._clc_src_cache, "get_raw_entry"):
+                        raw = self._clc_src_cache.get_raw_entry(key)
                     if raw is not None:
                         pos_start = int(getattr(raw, "pos_orig_start", 0))
                         pos_end = int(getattr(raw, "pos_orig_end", pos_start + block_size))
