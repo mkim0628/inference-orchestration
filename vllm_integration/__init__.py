@@ -349,6 +349,18 @@ def apply_all_patches(
 
 __all__ = [
     "apply_all_patches",
+    # 2026-05-23 (Activity C+A+B — RuntimeCertified + CPD + CLC)
+    "CPDRouterSchedulerConfig",
+    "CPDWarmColdSchedulerMixin",
+    "make_cpd_warm_cold_scheduler_class",
+    "CLCBiasGateKVManagerConfig",
+    "CLCPositionalBiasGatedKVCacheManagerMixin",
+    "make_clc_bias_gate_kv_cache_manager_class",
+    "RuntimeCertifiedAttentionHookConfig",
+    "RuntimeCertifiedAttentionHook",
+    "apply_runtime_certified_patch",
+    "extend_cache_config_runtime_certified",
+    "RuntimeCertifiedKVSculptVllmHook",
     # 2026-05-21 (Activity B+C — BlockUnion pipeline)
     "BlockUnionKVManagerConfig",
     "BlockUnionNonContiguousKVCacheManagerMixin",
@@ -551,6 +563,50 @@ except (ImportError, AttributeError):
     CompactAttentionBlockUnionVllmCodecConfig = None  # type: ignore
     CompactAttentionBlockUnionVllmCodec = None         # type: ignore
     BlockUnionBCPipelineVllmCodec = None               # type: ignore
+
+# ===========================================================================
+# 2026-05-23 imports (Activity C+A+B — RuntimeCertified + CPD + CLC)
+# ===========================================================================
+
+# Activity A: CPDWarmColdHitRateRouter scheduler mixin
+try:
+    from vllm_integration.scheduler_patch import (
+        CPDRouterSchedulerConfig,
+        CPDWarmColdSchedulerMixin,
+        make_cpd_warm_cold_scheduler_class,
+    )
+except (ImportError, AttributeError):
+    CPDRouterSchedulerConfig = None              # type: ignore
+    CPDWarmColdSchedulerMixin = None             # type: ignore
+    make_cpd_warm_cold_scheduler_class = None    # type: ignore
+
+# Activity B: CLCPositionalBiasGated KV cache manager
+try:
+    from vllm_integration.block_manager_patch import (
+        CLCBiasGateKVManagerConfig,
+        CLCPositionalBiasGatedKVCacheManagerMixin,
+        make_clc_bias_gate_kv_cache_manager_class,
+    )
+except (ImportError, AttributeError):
+    CLCBiasGateKVManagerConfig = None                     # type: ignore
+    CLCPositionalBiasGatedKVCacheManagerMixin = None      # type: ignore
+    make_clc_bias_gate_kv_cache_manager_class = None      # type: ignore
+
+# Activity C: RuntimeCertified INT8K+INT4V attention hook
+try:
+    from vllm_integration.attention_backend_patch import (
+        RuntimeCertifiedAttentionHookConfig,
+        RuntimeCertifiedAttentionHook,
+        apply_runtime_certified_patch,
+        extend_cache_config_runtime_certified,
+        RuntimeCertifiedKVSculptVllmHook,
+    )
+except (ImportError, AttributeError):
+    RuntimeCertifiedAttentionHookConfig = None        # type: ignore
+    RuntimeCertifiedAttentionHook = None              # type: ignore
+    apply_runtime_certified_patch = None              # type: ignore
+    extend_cache_config_runtime_certified = None      # type: ignore
+    RuntimeCertifiedKVSculptVllmHook = None           # type: ignore
 
 # ===========================================================================
 # 2026-05-22 imports (Activity A+B+C — DapQ position-aware eviction stack)

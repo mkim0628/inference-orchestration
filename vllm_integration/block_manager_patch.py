@@ -833,3 +833,285 @@ class WorkloadAwareTTLKVCacheManager(KVCacheManager):
         """Pin segment to prevent TTL eviction."""
         if segment_key in self._ttl_entries:
             self._ttl_entries[segment_key].pinned = True
+
+
+# ===========================================================================
+# 2026-05-23: CLCPositionalBiasGatedSegmentCache — Activity B
+# ===========================================================================
+
+@dataclass
+class CLCBiasGateKVManagerConfig:
+    """Configuration for CLC Positional Bias Gated segment KV cache manager.
+
+    Activity B: Non-Contiguous KV Cache Reuse (2603.20218).
+    ΔPos-threshold gated 3-stage reencoding policy for segment reuse.
+    """
+    max_context_length: int = 4096
+    bias_threshold: float = 0.15          # ΔPos <= this: DIRECT_REUSE (no reencoding)
+    rope_distortion_threshold: float = 0.40  # ΔPos > this: FULL_REENCODING required
+    partial_reencoding_layer_ratio: float = 0.5  # fraction of layers for partial reencoding
+    max_entries: int = 1000
+    seed: int = 42
+
+
+@dataclass
+class _CLCSegmentEntry:
+    """Metadata for a CLC-gated segment in the auxiliary store."""
+    kv_tensor: Any  # torch.Tensor | None
+    pos_orig_start: int
+    pos_orig_end: int
+    content_hash: str
+    last_access: float = 0.0
+
+
+class CLCPositionalBiasGatedKVCacheManagerMixin:
+    """Mixin adding CLC positional-bias-gated non-contiguous segment reuse.
+
+    2026-05-23: Activity B — CLC Positional Bias Gated Segment Cache.
+    Based on arXiv 2603.20218 (CLC accuracy limit analysis).
+
+    Ports CLCPositionalBiasGatedSegmentCache from src/cache/ into vLLM's
+    v1 KVCacheManager as an auxiliary side-channel store alongside the
+    native PagedAttention block pool.
+
+    Key API:
+      store_clc_segment(key, kv_tensor, pos_start, pos_end, content_hash)
+        — Store a KV segment with position metadata.
+      get_clc_segment_with_policy(key, pos_target_start)
+        — Return (kv_tensor, policy) where policy is:
+            "direct_reuse"     : ΔPos <= bias_threshold → no reencoding needed
+            "partial_reencoding": bias_threshold < ΔPos <= rope_distortion_threshold
+            "full_reencoding"  : ΔPos > rope_distortion_threshold
+
+    vLLM integration contract:
+      - Auxiliary store only. Does NOT modify vLLM's native block allocation.
+      - PagedAttention block table is passed through unchanged.
+      - Non-contiguous block table is supplementary; callers inject it before
+        FlashAttention kernel via the block_tables parameter.
+      - LRU eviction enforced at max_entries.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        clc_config: Optional[CLCBiasGateKVManagerConfig] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._clc_config = clc_config or CLCBiasGateKVManagerConfig()
+        self._clc_store: OrderedDict = OrderedDict()  # key -> _CLCSegmentEntry
+        self._clc_hits = 0
+        self._clc_misses = 0
+        self._clc_direct_reuse_hits = 0
+        self._clc_partial_reencoding_hits = 0
+        self._clc_full_reencoding_hits = 0
+        # Try to import verified src/ implementation
+        _add_repo_root_to_path()
+        self._clc_src_cache = None
+        try:
+            from src.cache.clc_positional_bias_gated_segment_cache import (
+                CLCPositionalBiasGatedSegmentCache,
+                CLCBiasGateConfig,
+            )
+            cfg_src = CLCBiasGateConfig(
+                max_context_length=self._clc_config.max_context_length,
+                bias_threshold=self._clc_config.bias_threshold,
+                rope_distortion_threshold=self._clc_config.rope_distortion_threshold,
+                partial_reencoding_layer_ratio=self._clc_config.partial_reencoding_layer_ratio,
+                max_entries=self._clc_config.max_entries,
+                seed=self._clc_config.seed,
+            )
+            self._clc_src_cache = CLCPositionalBiasGatedSegmentCache(cfg_src)
+        except Exception:
+            pass  # use inline fallback
+
+    def _clc_compute_delta_pos(self, pos_orig_start: int, pos_target_start: int) -> float:
+        """Compute normalized positional bias ΔPos = |target - orig| / max_context_length."""
+        return abs(pos_target_start - pos_orig_start) / max(1, self._clc_config.max_context_length)
+
+    def _clc_check_policy(self, pos_orig_start: int, pos_target_start: int) -> str:
+        """Determine reencoding policy from ΔPos."""
+        delta = self._clc_compute_delta_pos(pos_orig_start, pos_target_start)
+        cfg = self._clc_config
+        if delta <= cfg.bias_threshold:
+            return "direct_reuse"
+        elif delta <= cfg.rope_distortion_threshold:
+            return "partial_reencoding"
+        else:
+            return "full_reencoding"
+
+    def store_clc_segment(
+        self,
+        key: str,
+        kv_tensor: Any,
+        pos_orig_start: int,
+        pos_orig_end: int,
+        content_hash: str,
+    ) -> None:
+        """Store KV segment with positional metadata for CLC-gated reuse.
+
+        Args:
+            key: Cache key (e.g., content_hash + "_" + layer_idx).
+            kv_tensor: KV tensor to store (torch.Tensor or None).
+            pos_orig_start: Original context position where segment starts.
+            pos_orig_end: Original context position where segment ends.
+            content_hash: Hash of segment token content.
+        """
+        if self._clc_src_cache is not None:
+            try:
+                import torch
+                if kv_tensor is not None:
+                    self._clc_src_cache.put_segment(
+                        key, kv_tensor, pos_orig_start, pos_orig_end, content_hash
+                    )
+                return
+            except Exception:
+                pass
+        # Inline fallback
+        if key in self._clc_store:
+            self._clc_store.move_to_end(key)
+        else:
+            if len(self._clc_store) >= self._clc_config.max_entries:
+                self._clc_store.popitem(last=False)
+            self._clc_store[key] = _CLCSegmentEntry(
+                kv_tensor=kv_tensor,
+                pos_orig_start=pos_orig_start,
+                pos_orig_end=pos_orig_end,
+                content_hash=content_hash,
+                last_access=time.monotonic(),
+            )
+
+    def get_clc_segment_with_policy(
+        self,
+        key: str,
+        pos_target_start: int,
+    ) -> Tuple[Any, str]:
+        """Get cached KV segment with positional bias reencoding policy.
+
+        Returns:
+            (kv_tensor, policy) where:
+              kv_tensor: Cached KV tensor (None on miss)
+              policy: "direct_reuse" | "partial_reencoding" | "full_reencoding"
+
+        The policy tells the caller how to handle positional encoding
+        before passing the KV to the attention kernel.
+        """
+        if self._clc_src_cache is not None:
+            try:
+                kv, policy_enum = self._clc_src_cache.get_with_policy(key, pos_target_start)
+                if kv is None:
+                    self._clc_misses += 1
+                    return None, "full_reencoding"
+                self._clc_hits += 1
+                policy_str = policy_enum.value  # "direct_reuse" | "partial" | "full"
+                # Normalize enum value to canonical string
+                if "direct" in policy_str:
+                    policy_str = "direct_reuse"
+                    self._clc_direct_reuse_hits += 1
+                elif "partial" in policy_str:
+                    policy_str = "partial_reencoding"
+                    self._clc_partial_reencoding_hits += 1
+                else:
+                    policy_str = "full_reencoding"
+                    self._clc_full_reencoding_hits += 1
+                return kv, policy_str
+            except Exception:
+                pass
+        # Inline fallback
+        if key not in self._clc_store:
+            self._clc_misses += 1
+            return None, "full_reencoding"
+        self._clc_hits += 1
+        entry = self._clc_store[key]
+        self._clc_store.move_to_end(key)
+        entry.last_access = time.monotonic()
+        policy = self._clc_check_policy(entry.pos_orig_start, pos_target_start)
+        if policy == "direct_reuse":
+            self._clc_direct_reuse_hits += 1
+        elif policy == "partial_reencoding":
+            self._clc_partial_reencoding_hits += 1
+        else:
+            self._clc_full_reencoding_hits += 1
+        return entry.kv_tensor, policy
+
+    def clc_noncontiguous_direct_hit_rate(self) -> float:
+        """Fraction of hits that used DIRECT_REUSE (no reencoding needed)."""
+        total_hits = (self._clc_direct_reuse_hits +
+                      self._clc_partial_reencoding_hits +
+                      self._clc_full_reencoding_hits)
+        return self._clc_direct_reuse_hits / max(1, total_hits)
+
+    def clc_hit_rate(self) -> float:
+        """Overall CLC segment cache hit rate."""
+        total = self._clc_hits + self._clc_misses
+        return self._clc_hits / max(1, total)
+
+    def clc_stats(self) -> Dict[str, Any]:
+        """Return CLC cache stats dict for observability."""
+        return {
+            "hit_rate": self.clc_hit_rate(),
+            "noncontiguous_direct_hit_rate": self.clc_noncontiguous_direct_hit_rate(),
+            "direct_reuse_hits": self._clc_direct_reuse_hits,
+            "partial_reencoding_hits": self._clc_partial_reencoding_hits,
+            "full_reencoding_hits": self._clc_full_reencoding_hits,
+            "total_hits": self._clc_hits,
+            "total_misses": self._clc_misses,
+            "store_size": len(self._clc_store),
+        }
+
+    def clc_evict_lru(self) -> int:
+        """Manually evict LRU entry from CLC store. Returns bytes freed."""
+        if not self._clc_store:
+            return 0
+        _, entry = self._clc_store.popitem(last=False)
+        try:
+            return entry.kv_tensor.nbytes if entry.kv_tensor is not None else 0
+        except Exception:
+            return 0
+
+
+def make_clc_bias_gate_kv_cache_manager_class(
+    base_class: Optional[type] = None,
+    clc_config: Optional[CLCBiasGateKVManagerConfig] = None,
+) -> type:
+    """Factory: subclass vLLM KVCacheManager with CLCPositionalBiasGatedKVCacheManagerMixin.
+
+    Returns a class that:
+      - is a subclass of vLLM's KVCacheManager (or base_class)
+      - adds store_clc_segment() / get_clc_segment_with_policy()
+      - tracks direct_reuse / partial / full reencoding hits
+
+    Usage:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm_integration.block_manager_patch import (
+            CLCBiasGateKVManagerConfig,
+            make_clc_bias_gate_kv_cache_manager_class,
+        )
+        cfg = CLCBiasGateKVManagerConfig(bias_threshold=0.15)
+        CLCKVMgr = make_clc_bias_gate_kv_cache_manager_class(KVCacheManager, cfg)
+        # issubclass(CLCKVMgr, KVCacheManager) is True
+
+    vLLM version: 0.21.0
+    Activity: B — CLCPositionalBiasGatedSegmentCache
+    """
+    if base_class is None:
+        try:
+            from vllm.v1.core.kv_cache_manager import KVCacheManager as _KVM
+            base_class = _KVM
+        except Exception:
+            base_class = object
+
+    _cfg = clc_config
+
+    class CLCBiasGateKVCacheManager(
+        CLCPositionalBiasGatedKVCacheManagerMixin,
+        base_class,  # type: ignore[valid-type]
+    ):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if _cfg is not None and "clc_config" not in kwargs:
+                kwargs["clc_config"] = _cfg
+            super().__init__(*args, **kwargs)
+
+    CLCBiasGateKVCacheManager.__name__ = "CLCBiasGateKVCacheManager"
+    CLCBiasGateKVCacheManager.__qualname__ = "CLCBiasGateKVCacheManager"
+    return CLCBiasGateKVCacheManager

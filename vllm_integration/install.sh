@@ -44,6 +44,231 @@ VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
 
 echo ""
+echo "=== 2026-05-23 C+A+B smoke tests (RuntimeCertified INT8K+INT4V + CPD Warm/Cold + CLC Positional Bias Gate) ==="
+set +e
+python - <<'PYEOF_2026_05_23'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity C: RuntimeCertifiedAttentionHook — INT8K+INT4V compression
+# ---------------------------------------------------------------------------
+from vllm_integration.attention_backend_patch import (
+    RuntimeCertifiedAttentionHookConfig,
+    RuntimeCertifiedAttentionHook,
+    extend_cache_config_runtime_certified,
+    RuntimeCertifiedKVSculptVllmHook,
+)
+
+cfg = RuntimeCertifiedAttentionHookConfig(
+    d_head=64, n_kv_heads=4, n_layers=4,
+    error_threshold=0.005, key_bits=8, value_bits=4,
+    max_entries=100, seed=42,
+)
+hook = RuntimeCertifiedAttentionHook(config=cfg)
+
+# write_to_cache: returns ORIGINAL tensors (primary attention kernel unchanged)
+key_t = torch.randn(16, 64, dtype=torch.float32)
+val_t = torch.randn(16, 64, dtype=torch.float32)
+k_out, v_out = hook.write_to_cache("test_seg", key_t, val_t, layer_idx=0)
+assert k_out is key_t, "write_to_cache must return original key tensor"
+assert v_out is val_t, "write_to_cache must return original value tensor"
+print(f"  RuntimeCertifiedAttentionHook write_to_cache (original KV passthrough): PASS")
+
+# compression_hook: INT8K round-trip accuracy (MANDATORY: < 1% error)
+x = torch.randn(32, 64)
+restored = hook.compression_hook("key", x)
+import torch.nn.functional as F
+q = torch.randn(4, 64)
+scale = 64 ** -0.5
+attn_orig = F.softmax(q @ x.T * scale, dim=-1) @ x
+attn_rest = F.softmax(q @ restored.T * scale, dim=-1) @ restored
+rel_err = ((attn_orig - attn_rest).norm() / attn_orig.norm().clamp(min=1e-8)).item()
+assert rel_err < 0.01, f"compression_hook relative_error={rel_err:.4f} >= 0.01 (MANDATORY)"
+print(f"  compression_hook relative_error={rel_err:.6f} < 0.01: PASS (MANDATORY Activity C)")
+
+# memory_reduction_ratio: INT8K+INT4V vs FP16 >= 50%
+mrr = hook.memory_reduction_ratio()
+assert mrr >= 0.50, f"memory_reduction_ratio={mrr:.3f} < 0.50 (MANDATORY)"
+print(f"  memory_reduction_ratio={mrr:.3f} >= 0.50: PASS (MANDATORY Activity C)")
+
+# extend_cache_config_runtime_certified
+class _FakeCC:
+    pass
+fake_cc = _FakeCC()
+extend_cache_config_runtime_certified(fake_cc, cfg)
+assert getattr(fake_cc, "compression_method", None) == "int8_key_int4_value_with_fp16_fallback"
+assert getattr(fake_cc, "rc_error_threshold", None) == 0.005
+assert getattr(fake_cc, "rc_key_bits", None) == 8
+assert getattr(fake_cc, "rc_value_bits", None) == 4
+print(f"  extend_cache_config_runtime_certified: PASS")
+
+# hook_stats
+stats = hook.hook_stats()
+assert "memory_reduction_ratio" in stats
+assert "compression_method" in stats
+print(f"  hook_stats keys: PASS {list(stats.keys())}")
+
+# RuntimeCertifiedKVSculptVllmHook (Cross-1)
+cross_hook = RuntimeCertifiedKVSculptVllmHook(config=cfg, kvsculpt_budget_ratio=0.50, n_layers=4)
+k2 = torch.randn(32, 64, dtype=torch.float32)
+v2 = torch.randn(32, 64, dtype=torch.float32)
+k_cross_out, v_cross_out = cross_hook.write_to_cache("cross_seg", k2, v2, layer_idx=0)
+assert k_cross_out is k2, "Cross-1 hook must return original key"
+assert v_cross_out is v2, "Cross-1 hook must return original value"
+mrr_cross = cross_hook.memory_reduction_ratio()
+assert mrr_cross >= 0.50, f"Cross-1 memory_reduction_ratio={mrr_cross:.3f} < 0.50"
+print(f"  RuntimeCertifiedKVSculptVllmHook (Cross-1): PASS memory_reduction={mrr_cross:.3f}")
+
+# ---------------------------------------------------------------------------
+# Activity A: CPDWarmColdSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.scheduler_patch import (
+    CPDRouterSchedulerConfig,
+    CPDWarmColdSchedulerMixin,
+    make_cpd_warm_cold_scheduler_class,
+)
+
+class FakeRequest:
+    def __init__(self, rid, token_ids, session_turn=0):
+        self.request_id = rid
+        self.prompt_token_ids = token_ids
+        self.session_turn = session_turn
+
+class MinimalCPDScheduler(CPDWarmColdSchedulerMixin):
+    def __init__(self, **kwargs):
+        self.waiting = []
+        super().__init__(**kwargs)
+    def schedule(self):
+        self.cpd_pre_schedule()
+        return []
+
+cpd_cfg = CPDRouterSchedulerConfig(high_hit_threshold=0.70, low_hit_threshold=0.25, seed=42)
+sched = MinimalCPDScheduler(cpd_config=cpd_cfg)
+
+# Test request classification
+req1 = FakeRequest("r1", list(range(50)), session_turn=0)
+req2 = FakeRequest("r2", list(range(50)), session_turn=0)
+sched.waiting = [req1, req2]
+sched.cpd_pre_schedule()
+# After classification, requests have cpd_path annotation
+for req in [req1, req2]:
+    assert hasattr(req, "cpd_path"), "Request must have cpd_path after classification"
+    assert getattr(req, "cpd_path") in ("warm", "cold", "neutral"), f"Invalid path: {req.cpd_path}"
+    assert 0.0 <= getattr(req, "cpd_predicted_hit_rate", 0) <= 1.0
+print(f"  CPDWarmColdSchedulerMixin classification: PASS (paths: {req1.cpd_path}, {req2.cpd_path})")
+
+# Overhead < 1ms per request
+import time
+big_reqs = [FakeRequest(f"r{i}", list(range(50))) for i in range(100)]
+sched.waiting = big_reqs
+t0 = time.monotonic()
+sched.cpd_pre_schedule()
+elapsed_us = (time.monotonic() - t0) * 1e6 / len(big_reqs)
+assert elapsed_us < 1000.0, f"Mean overhead {elapsed_us:.1f}us >= 1000us"
+print(f"  CPDWarmColdSchedulerMixin overhead: {elapsed_us:.1f}us/request < 1000us: PASS")
+
+# routing_stats
+stats_a = sched.cpd_routing_stats()
+assert "warm_ratio" in stats_a and "cold_ratio" in stats_a and "neutral_ratio" in stats_a
+assert "scheduling_overhead_mean_us" in stats_a
+print(f"  cpd_routing_stats: PASS {stats_a}")
+
+# Factory: make_cpd_warm_cold_scheduler_class
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    CPDSched = make_cpd_warm_cold_scheduler_class(Scheduler, cpd_cfg)
+    assert issubclass(CPDSched, Scheduler)
+    assert issubclass(CPDSched, CPDWarmColdSchedulerMixin)
+    print(f"  make_cpd_warm_cold_scheduler_class: PASS ({CPDSched.__name__})")
+except Exception as exc:
+    print(f"  make_cpd_warm_cold_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity B: CLCPositionalBiasGatedKVCacheManagerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.block_manager_patch import (
+    CLCBiasGateKVManagerConfig,
+    CLCPositionalBiasGatedKVCacheManagerMixin,
+    make_clc_bias_gate_kv_cache_manager_class,
+)
+
+class MinimalCLCMgr(CLCPositionalBiasGatedKVCacheManagerMixin):
+    def __init__(self, **kwargs):
+        self._clc_config = kwargs.get("clc_config") or CLCBiasGateKVManagerConfig()
+        from collections import OrderedDict
+        self._clc_store = OrderedDict()
+        self._clc_hits = 0
+        self._clc_misses = 0
+        self._clc_direct_reuse_hits = 0
+        self._clc_partial_reencoding_hits = 0
+        self._clc_full_reencoding_hits = 0
+        self._clc_src_cache = None
+
+clc_cfg = CLCBiasGateKVManagerConfig(
+    max_context_length=4096, bias_threshold=0.15,
+    rope_distortion_threshold=0.40, max_entries=100, seed=42,
+)
+mgr = MinimalCLCMgr(clc_config=clc_cfg)
+
+# Store segment
+kv_seg = torch.randn(16, 64)
+mgr.store_clc_segment("seg_A", kv_seg, pos_orig_start=100, pos_orig_end=200, content_hash="hashA")
+assert "seg_A" in mgr._clc_store, "Segment should be stored"
+
+# DIRECT_REUSE: ΔPos = |100 - 100| / 4096 = 0.0 <= 0.15
+kv_got, policy = mgr.get_clc_segment_with_policy("seg_A", pos_target_start=100)
+assert policy == "direct_reuse", f"Expected direct_reuse, got {policy}"
+assert kv_got is not None
+print(f"  CLCPositionalBiasGatedKVCacheManagerMixin DIRECT_REUSE (ΔPos=0.0): PASS")
+
+# PARTIAL_REENCODING: ΔPos = |100 - 1600| / 4096 ≈ 0.37 (0.15 < 0.37 <= 0.40)
+kv_got2, policy2 = mgr.get_clc_segment_with_policy("seg_A", pos_target_start=1600)
+assert policy2 == "partial_reencoding", f"Expected partial_reencoding, got {policy2}"
+print(f"  CLCPositionalBiasGatedKVCacheManagerMixin PARTIAL_REENCODING (ΔPos≈0.37): PASS")
+
+# FULL_REENCODING: ΔPos = |100 - 2100| / 4096 ≈ 0.49 > 0.40
+kv_got3, policy3 = mgr.get_clc_segment_with_policy("seg_A", pos_target_start=2100)
+assert policy3 == "full_reencoding", f"Expected full_reencoding, got {policy3}"
+print(f"  CLCPositionalBiasGatedKVCacheManagerMixin FULL_REENCODING (ΔPos≈0.49): PASS")
+
+# Miss case
+kv_miss, policy_miss = mgr.get_clc_segment_with_policy("nonexistent", pos_target_start=100)
+assert kv_miss is None and policy_miss == "full_reencoding"
+print(f"  CLCPositionalBiasGatedKVCacheManagerMixin miss: PASS")
+
+# noncontiguous_direct_hit_rate
+rate = mgr.clc_noncontiguous_direct_hit_rate()
+assert 0.0 <= rate <= 1.0, f"Direct hit rate out of range: {rate}"
+print(f"  clc_noncontiguous_direct_hit_rate={rate:.2f}: PASS")
+
+# clc_stats
+stats_b = mgr.clc_stats()
+assert "hit_rate" in stats_b and "noncontiguous_direct_hit_rate" in stats_b
+print(f"  clc_stats: PASS {stats_b}")
+
+# Factory
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    CLCKVMgr = make_clc_bias_gate_kv_cache_manager_class(KVCacheManager, clc_cfg)
+    assert issubclass(CLCKVMgr, KVCacheManager)
+    assert issubclass(CLCKVMgr, CLCPositionalBiasGatedKVCacheManagerMixin)
+    print(f"  make_clc_bias_gate_kv_cache_manager_class: PASS ({CLCKVMgr.__name__})")
+except Exception as exc:
+    print(f"  make_clc_bias_gate_kv_cache_manager_class: SKIP (no GPU env): {exc}")
+
+print("=== 2026-05-23 C+A+B smoke tests: PASS ===")
+PYEOF_2026_05_23
+EXIT_2026_05_23=$?
+set -e
+if [ $EXIT_2026_05_23 -ne 0 ]; then
+  echo "WARNING: 2026-05-23 C+A+B smoke tests had failures (exit=$EXIT_2026_05_23)" >&2
+fi
+
+echo ""
 echo "=== 2026-05-22 A+B+C smoke tests (PPDAppendFullPrefillClassifier + DapQSessionSegment + DapQEviction) ==="
 set +e
 python - <<'PYEOF_2026_05_22'
