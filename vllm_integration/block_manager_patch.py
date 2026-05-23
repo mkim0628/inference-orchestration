@@ -995,7 +995,16 @@ class CLCPositionalBiasGatedKVCacheManagerMixin:
 
         The policy tells the caller how to handle positional encoding
         before passing the KV to the attention kernel.
+
+        Tensor-parallel note:
+            In multi-GPU TP deployments call build_clc_noncontiguous_block_table()
+            from TP rank 0 only and broadcast the result to peer ranks BEFORE
+            calling this method, to ensure consistent block-table decisions.
+            If a TP environment is detected here, a runtime warning is emitted.
         """
+        # Warn if running in a TP environment — block table may be inconsistent
+        self._warn_if_tp_environment()
+
         if self._clc_src_cache is not None:
             try:
                 kv, policy_enum = self._clc_src_cache.get_with_policy(key, pos_target_start)
@@ -1068,6 +1077,138 @@ class CLCPositionalBiasGatedKVCacheManagerMixin:
             return entry.kv_tensor.nbytes if entry.kv_tensor is not None else 0
         except Exception:
             return 0
+
+    def build_clc_noncontiguous_block_table(
+        self,
+        segment_keys: List[str],
+        block_size: int = 16,
+        max_blocks: int = 512,
+    ) -> Optional["torch.Tensor"]:
+        """Build a non-contiguous block table tensor for CLC segments.
+
+        Constructs an int64 tensor [1, max_blocks] from a list of CLC segment
+        keys. Each segment's stored position range is mapped to block indices.
+        Unused slots are padded with -1 (PagedAttention convention).
+
+        Block-alignment contract:
+          Segment boundaries are validated to be multiples of block_size.
+          If pos_orig_start or pos_orig_end is not block_size-aligned, the
+          segment is aligned DOWN (start) / UP (end) to the nearest block
+          boundary before computing block indices.  A misalignment warning is
+          recorded in self._clc_block_align_warnings.
+
+        Tensor-parallel (TP) note:
+          This method is NOT TP-aware.  In multi-GPU tensor-parallel deployments
+          all TP ranks must use identical block tables.  The caller is
+          responsible for broadcasting the returned tensor from TP rank 0 to
+          all other ranks before passing it to the attention kernel.  Calling
+          get_clc_segment_with_policy() before this broadcast may yield
+          inconsistent results across ranks.  See README.md §TP for details.
+
+        Args:
+            segment_keys: List of CLC segment keys (as used in store_clc_segment()).
+            block_size: Number of tokens per block — must match vLLM's block_size.
+            max_blocks: Maximum number of blocks in the returned table.
+
+        Returns:
+            int64 tensor [1, max_blocks] with block indices, or None if no
+            segments are found for any of the given keys.
+        """
+        if not _TORCH_AVAILABLE:
+            return None
+
+        # Initialise misalignment counter on first call
+        if not hasattr(self, "_clc_block_align_warnings"):
+            self._clc_block_align_warnings: int = 0
+
+        block_indices: List[int] = []
+
+        for key in segment_keys:
+            # Prefer src/ cache entry if available
+            entry: Optional[_CLCSegmentEntry] = None
+            if self._clc_src_cache is not None:
+                try:
+                    raw = self._clc_src_cache.get_raw_entry(key)
+                    if raw is not None:
+                        pos_start = int(getattr(raw, "pos_orig_start", 0))
+                        pos_end = int(getattr(raw, "pos_orig_end", pos_start + block_size))
+                        entry = _CLCSegmentEntry(
+                            kv_tensor=None,
+                            pos_orig_start=pos_start,
+                            pos_orig_end=pos_end,
+                            content_hash=key,
+                        )
+                except Exception:
+                    pass
+
+            if entry is None:
+                entry = self._clc_store.get(key)
+
+            if entry is None:
+                continue
+
+            pos_start = int(entry.pos_orig_start)
+            pos_end = int(entry.pos_orig_end)
+
+            # Validate and align segment boundaries to block_size multiples
+            if pos_start % block_size != 0:
+                self._clc_block_align_warnings += 1
+                pos_start = (pos_start // block_size) * block_size  # align down
+            if pos_end % block_size != 0:
+                self._clc_block_align_warnings += 1
+                pos_end = ((pos_end + block_size - 1) // block_size) * block_size  # align up
+
+            for pos in range(pos_start, pos_end, block_size):
+                blk = pos // block_size
+                if blk < max_blocks and blk not in block_indices:
+                    block_indices.append(blk)
+
+        if not block_indices:
+            return None
+
+        table = torch.full((1, max_blocks), -1, dtype=torch.int64)
+        for blk in block_indices:
+            table[0, blk] = blk
+        return table
+
+    # ------------------------------------------------------------------
+    # Tensor-parallel safety helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _warn_if_tp_environment() -> None:
+        """Emit a warning if a tensor-parallel environment is detected.
+
+        Detects TP by checking for WORLD_SIZE > 1 in torch.distributed or
+        the VLLM_TENSOR_PARALLEL_SIZE / WORLD_SIZE environment variables.
+        Called inside get_clc_segment_with_policy() when TP is detected.
+        """
+        import os
+        import warnings
+
+        tp_size = int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "1"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+        _dist_world_size = 1
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                _dist_world_size = dist.get_world_size()
+        except Exception:
+            pass
+
+        if tp_size > 1 or world_size > 1 or _dist_world_size > 1:
+            warnings.warn(
+                "CLCPositionalBiasGatedKVCacheManagerMixin: tensor-parallel (TP) "
+                "environment detected (tp_size=%d, world_size=%d, dist_world_size=%d). "
+                "build_clc_noncontiguous_block_table() is NOT TP-aware. "
+                "The caller must broadcast the returned block table from TP rank 0 "
+                "to all other ranks before passing it to the attention kernel. "
+                "See vllm_integration/README.md §TP for details." % (
+                    tp_size, world_size, _dist_world_size,
+                ),
+                stacklevel=3,
+            )
 
 
 def make_clc_bias_gate_kv_cache_manager_class(

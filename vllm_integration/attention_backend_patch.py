@@ -1500,11 +1500,17 @@ def apply_runtime_certified_patch(
         # Call original forward (primary attention kernel runs on unmodified KV)
         output = _orig_forward(*args, **kwargs)
         # Auxiliary: store compressed KV (best-effort, no accuracy impact)
+        # FlashAttentionImpl.forward signature (vLLM v1):
+        #   forward(self, layer, query, key, value, kv_cache, attn_metadata,
+        #           output, output_scale=None, output_block_scale=None)
+        # args[0]=layer, args[1]=query, args[2]=key, args[3]=value
         try:
             layer = getattr(self_impl, "_layer_idx", layer_idx)
             req_id = "batch"  # simplified — per-request keying requires model-runner changes
-            hook.write_to_cache(req_id, args[0] if args else None,
-                                args[1] if len(args) > 1 else None, layer)
+            # Prefer positional args; fall back to kwargs if args are not present
+            key_tensor = (args[2] if len(args) > 2 else None) or kwargs.get("key")
+            val_tensor = (args[3] if len(args) > 3 else None) or kwargs.get("value")
+            hook.write_to_cache(req_id, key_tensor, val_tensor, layer)
         except Exception:
             pass
         return output

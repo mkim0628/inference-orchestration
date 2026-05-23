@@ -180,6 +180,50 @@ xc_hook = RuntimeCertifiedKVSculptVllmHook(
 # xc_hook.memory_reduction_ratio() → 0.625 (INT8K+INT4V vs FP16)
 ```
 
+### Loop-2 Fixes (2026-05-23, vllm-evaluator feedback)
+
+1. **`apply_runtime_certified_patch` / `_patched_forward` — corrected arg indices**
+
+   `FlashAttentionImpl.forward` signature (vLLM v1):
+   `forward(self, layer, query, key, value, kv_cache, attn_metadata, output, ...)`
+   Positional args: `args[0]=layer`, `args[1]=query`, `args[2]=key`, `args[3]=value`.
+
+   Previous code incorrectly passed `args[0]` / `args[1]` as key / value.
+   Fixed: `key_tensor = args[2]`, `val_tensor = args[3]`.
+   Added kwargs fallback: `kwargs.get("key")` / `kwargs.get("value")` for callers
+   that use keyword arguments.
+
+2. **`CLCPositionalBiasGatedKVCacheManagerMixin.build_clc_noncontiguous_block_table()` — new method**
+
+   Added `build_clc_noncontiguous_block_table(segment_keys, block_size, max_blocks)`
+   (mirrors the pattern of `DapQSessionSegmentKVCacheManagerMixin.build_noncontiguous_block_table()`).
+
+   - Returns `torch.Tensor` int64 shape `[1, max_blocks]`, unused slots filled with -1.
+   - Validates segment boundaries against `block_size`: misaligned start is rounded DOWN,
+     misaligned end is rounded UP; each misalignment increments `self._clc_block_align_warnings`.
+   - Returns `None` when no segment is found for any of the given keys.
+
+3. **Tensor-parallel (TP) support — documentation and runtime warning**
+
+   `CLCPositionalBiasGatedKVCacheManagerMixin` does NOT implement TP-aware block-table
+   broadcasting.  The following guards are in place:
+
+   - `_warn_if_tp_environment()` static method: detects TP via
+     `VLLM_TENSOR_PARALLEL_SIZE`, `WORLD_SIZE`, and `torch.distributed.get_world_size()`.
+     Emits a `warnings.warn()` when TP > 1.
+   - `get_clc_segment_with_policy()` calls `_warn_if_tp_environment()` at the start.
+
+   **TP usage contract (caller responsibility):**
+   ```
+   # On TP rank 0 only:
+   table = mgr.build_clc_noncontiguous_block_table(segment_keys, block_size=16)
+   # Broadcast to all TP ranks before attention kernel call:
+   import torch.distributed as dist
+   if table is not None:
+       dist.broadcast(table, src=0)
+   # Now safe to pass table to FlashAttentionImpl.forward(..., block_tables=table)
+   ```
+
 ### Compatibility Table
 
 | Environment | Status | Notes |
@@ -188,6 +232,7 @@ xc_hook = RuntimeCertifiedKVSculptVllmHook(
 | vLLM 0.21.0 v1 + CPU only | PASS | GPU quantization path uses CPU tensors; factory guarded by try/except |
 | src/ not importable | PASS | All inline fallbacks (quantize_int8/int4, linear sigmoid, CLCSegmentEntry) embedded |
 | Prior cycles (2026-05-20 through 2026-05-22) | PASS | No regressions; all prior patch factories/hooks preserved |
+| Tensor-parallel (TP > 1) | PARTIAL | `build_clc_noncontiguous_block_table()` is not TP-aware; caller must broadcast from rank 0. Runtime warning emitted when TP detected. |
 
 ---
 
