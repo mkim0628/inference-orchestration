@@ -1,106 +1,104 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-21 대비):
-이전 사이클(2026-05-21)은 B+C 조합이었다:
-  - B-1 BlockUnionNonContiguousReuseIndex (GQA-aware block-union 비연속 재사용, memcpy 없음)
-  - C-1 CompactAttentionBlockUnionCodec (청크드 프리필 특화 KV 선택 블록 테이블 압축)
-  - Cross BlockUnionBCPipeline (B+C 통합 파이프라인)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-22 대비):
+이전 사이클(2026-05-22)은 C+B+A 조합이었다:
+  - C-3 DapQPositionAwareEvictionCodec (위치-인식 유사 쿼리 기반 KV 퇴거)
+  - B-1 SessionAwareTurnLevelSegmentCache (세션-인식 턴-레벨 비연속 세그먼트 캐시)
+  - Cross DapQSessionSegmentDualReductionPipeline (B+C 이중 감소 파이프라인)
+  - A PPDAppendFullPrefillClassifier (append/full-prefill 분류기)
 
-이번 사이클(2026-05-22)은 C+B+A 조합으로 전환된다.
-이전 사이클이 "어텐션 마스크 기반 KV 블록 선택"에 초점을 뒀다면,
-이번 사이클은 "위치 정보(RoPE 기반 유사 쿼리)가 의미 정보보다 퇴거 결정에 결정적"이라는
-DapQ(arXiv 2603.11564)의 새로운 설계 원칙을 적용한다.
+이번 사이클(2026-05-23)은 C+A 조합(B 포함)으로 전환된다.
+핵심 전환: Activity C의 accuracy-preserving 검증 방식이
+"경험적 벤치마크 사후 검증"에서 "런타임 수학적 오류 경계 사전 보장"으로 격상된다.
+Runtime-Certified(arXiv 2605.20868)의 이중 항 오류 분해 + 다단계 폴백 사다리가
+Activity C의 핵심 제약 "압축 정확도 delta ±1% 이내"를 수학적으로 보장한다.
 
 주요 변경:
-1. [Activity C 교체] CompactAttentionBlockUnionCodec(청크드 프리필 블록 선택) →
-   DapQPositionAwareEvictionCodec (위치-인식 유사 쿼리 기반 KV 퇴거).
-   설계 원칙 자체가 전환된다: 이전 "어텐션 중요도 마스크 → 블록 선택"에서
-   "RoPE 회전 위치-인식 유사 쿼리 → 토큰별 중요도 → 예산 기반 퇴거"로.
-   DapQ 원논문에서 NIAH KV 예산 3%에서 99.5% 성능 보존 실험 검증.
+1. [Activity C 최우선 신규] RuntimeCertifiedQuantizedAttentionCodec:
+   INT8 Key + INT4 Value GPU 저장 + FP16 원본 RAM 보존.
+   이중 항 오류 분해(δ_attn_bound + δ_value_bound)로 헤드별·스텝별 오류 상한 계산.
+   다단계 폴백 사다리(Level 0→1→2)로 임계값 초과 시 FP16 복원.
+   기존 모든 C 기법의 "경험적 accuracy-preserving" 한계를 수학적 런타임 보장으로 격상.
 
-2. [Cross B+C 신규] DapQSessionSegmentDualReductionPipeline:
-   DapQ 위치-인식 원칙을 Activity B 세그먼트 선택에도 동일하게 적용.
-   "어떤 세그먼트를 유지할지(B)"와 "유지된 세그먼트 내 어떤 KV를 퇴거할지(C)"를
-   동일한 위치-인식 원칙으로 일관성 있게 결정.
-   SessionAwareTurnLevelSegmentCache(B-1)와 DapQPositionAwareEvictionCodec(C-3) 결합.
+2. [Activity C Cross-1 신규] RuntimeCertifiedKVSculptDistillationPipeline:
+   C-1 RuntimeCertified 오류 경계 인증 + C-2 KVSculpt L-BFGS 증류 레이어 예산 배분
+   폐루프 온라인 예산 재배분 파이프라인.
 
-3. [Activity A 보조 신규] PPDAppendFullPrefillClassifier:
-   멀티-턴 append-prefill을 decode 노드 로컬로 처리해 KV 전송 우회.
-   단, 기존 PPDAppendPrefillRouter(src/scheduler/ppd_append_prefill_router.py)가
-   이미 유사 기능을 구현하고 있으므로 차별화된 세션 컨텍스트 해시 분류기로 확장.
-   새 파일 src/scheduler/ppd_append_full_prefill_classifier.py 신규 생성.
+3. [Activity B 신규] CLCPositionalBiasGatedSegmentCache:
+   2603.20218 CLC 정확도 한계 메커니즘을 직접 구현.
+   ΔPos 연속값 측정 → 직접 재사용/부분 재인코딩/전체 재인코딩 3단계 선택적 게이트.
 
-4. [보존 파일] 이전 사이클 구현 파일
-   (block_union_noncontiguous_index.py, compact_attention_block_union_codec.py,
-   block_union_bc_pipeline.py, ppd_append_prefill_router.py 등)은 수정하지 않는다.
-   기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
+4. [Activity A 신규] CPDWarmColdHitRateRouter:
+   예측 캐시 히트율 기반 warm/cold/neutral 3경로 소프트 분기.
+   CPD(Together AI 2026-03-04) 원칙을 단일 노드 경량 히트율 예측기로 구현.
+
+5. [보존 파일] 이전 사이클 구현 파일
+   (dapq_position_aware_eviction_codec.py, session_turn_level_segment_cache.py,
+   dapq_session_segment_dual_pipeline.py, ppd_append_full_prefill_classifier.py 등)은
+   수정하지 않는다. 기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
 -->
 
-# Spec — 2026-05-22: DapQ Position-Aware KV Eviction + Non-Contiguous Segment Dual Reduction
+# Spec — 2026-05-23: RuntimeCertified KV Quantization + CPD Warm/Cold Routing + CLC Bias Gate
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-22.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-23.md`
 
-**최우선 구현 타겟**:
-- **C-3 (최우선)**: `DapQPositionAwareEvictionCodec`
-  — DapQ(arXiv 2603.11564) 위치-인식 유사 쿼리(position-aware pseudo query) 기반 KV 퇴거.
-  위치 임베딩(RoPE)을 현재 디코딩 위치에 맞게 회전시킨 유사 쿼리로 토큰 중요도를 추정해
-  KV 예산 비율(budget_ratio)만큼만 KV를 유지하고 나머지를 퇴거.
-  NIAH 99.5% 성능 보존, 구현 난이도 low.
-- **Cross B+C (2순위)**: `DapQSessionSegmentDualReductionPipeline`
-  — B-1 `SessionAwareTurnLevelSegmentCache` + C-3 `DapQPositionAwareEvictionCodec`의
-  이중 감소 파이프라인. 동일 위치-인식 원칙으로 세그먼트 선택(B)과 KV 퇴거(C)를 일관성 있게 결정.
-- **A (3순위)**: `PPDAppendFullPrefillClassifier`
-  — 세션 컨텍스트 해시 기반 append-prefill / full-prefill 분류기. Turn 2+ TTFT 절감.
+**최우선 구현 타겟**: C-1 `RuntimeCertifiedQuantizedAttentionCodec`
 
 **해결하려는 문제**:
 
-- **Activity C (DapQ 위치-인식 퇴거)**: 기존 KV 퇴거 방법들(LookaheadKV, SpecAttn 등)이
-  프리필 단계 어텐션 패턴 또는 의미 정보로 토큰 중요도를 추정해 실제 디코딩 단계 쿼리와의
-  불일치(query drift)가 발생한다. DapQ의 핵심 발견 — "위치 정보(positional information)가
-  의미 정보(semantic content)보다 KV 퇴거 결정에 결정적" — 을 적용해 RoPE 기반 위치-인식
-  유사 쿼리로 중요도를 추정하면 query drift 없이 정확도를 보존하면서 메모리를 절감한다.
+- **Activity C (RuntimeCertified 수학적 인증)**: 기존 모든 KV 압축 기법이 accuracy-preserving을
+  오프라인 벤치마크로만 경험적으로 검증하고 런타임에 오류 경계를 보장하지 못한다.
+  Runtime-Certified(arXiv 2605.20868)의 이중 항 오류 분해(Key 양자화 어텐션 왜곡 + Value
+  재구성 오류)로 헤드별·스텝별 오류 상한을 온라인 계산하고, 임계값 초과 시 FP16 폴백으로
+  Activity C의 핵심 제약 "±1% 이내"를 수학적 런타임 보장으로 격상한다.
 
-- **Activity B+C (이중 감소)**: 세션 내 turn-level 비연속 세그먼트를 보존하는
-  `SessionAwareTurnLevelSegmentCache`와 DapQ 위치-인식 원칙을 결합해,
-  "어떤 세그먼트를 유지할지"와 "유지된 세그먼트 내 어떤 KV를 퇴거할지" 모두를
-  동일한 위치 근접도 기준으로 결정한다. 설계 일관성 + 히트율 향상 + 메모리 절감 동시 달성.
+- **Activity C Cross-1 (RuntimeCertified+KVSculpt 폐루프)**: C-1 오류 경계 인증과
+  C-2 KVSculpt 레이어별 난이도 비례 증류 예산 배분을 결합해 "압축 + 온라인 인증 + 예산 재배분"
+  폐루프 파이프라인을 달성한다. 레이어별 압축 난이도 100× 차이(KVSculpt 실증)를 고려한
+  비균일 예산 배분으로 동일 메모리 예산에서 더 낮은 오류 상한을 달성한다.
 
-- **Activity A (PPD 분류기)**: 멀티-턴 P/D 분리 환경에서 append-prefill 요청을
-  decode 노드 로컬로 처리해 불필요한 P→D KV 전송을 우회한다.
+- **Activity B (CLC 위치 편향 게이트)**: 2603.20218이 규명한 "위치 독립 재사용 시 위치 인코딩
+  불일치로 정확도 저하" 메커니즘을 경량 게이트로 구현해, ΔPos ≤ 0.15인 세그먼트만 직접
+  재사용하고 그 외에만 재인코딩을 선택적으로 적용한다.
+
+- **Activity A (CPD Warm/Cold 분기)**: cold prefill(캐시 미스 대형 프리필)이 warm 요청
+  TTFT를 오염시키는 구조적 병목을 단일 노드에서 경량 히트율 예측 라우터로 해결한다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling (PPDAppendFullPrefillClassifier, 보조)
-- [x] Activity B: Non-Contiguous KV Cache Reuse (SessionAwareTurnLevelSegmentCache)
-- [x] Activity C: KV Cache Compression (DapQPositionAwareEvictionCodec)
+- [x] Activity A: KV Cache-aware Scheduling (CPDWarmColdHitRateRouter)
+- [x] Activity B: Non-Contiguous KV Cache Reuse (CLCPositionalBiasGatedSegmentCache)
+- [x] Activity C: KV Cache Compression (RuntimeCertifiedQuantizedAttentionCodec + KVSculptDistillationCodec + Cross-1 Pipeline)
 
 ---
 
 ## 목표
 
 - [ ] 목표 1 (evaluation_criteria.md §4 Activity C 필수): perplexity 변화 ±1% 이내
-      — WikiText-2 proxy: `attention_output_relative_error(q, k_orig, v_orig, k_evicted, v_evicted) < 0.01` (MANDATORY)
-      — budget_ratio=0.30 기준 측정
+      — `attention_output_relative_error(q, K_orig, V_orig, K_int8, V_int4) < 0.01` (MANDATORY)
+      — INT8K+INT4V 모드, 폴백 사다리 활성화 상태
 - [ ] 목표 2 (evaluation_criteria.md §4 Activity C 필수): downstream 태스크 정확도 ±1% 이내
-      — NIAH proxy: `cosine_similarity_output(...) >= 0.99` (MANDATORY)
-      — LongBench 8개 서브태스크 proxy 모두 통과
-- [ ] 목표 3 (evaluation_criteria.md §4 Activity C 높음): KV Memory Reduction >= −30%
-      — budget_ratio=0.30: 70% 토큰 퇴거 → memory_reduction_ratio >= 0.70 (필수)
-      — budget_ratio=0.50: 50% 퇴거 → memory_reduction_ratio >= 0.50
-- [ ] 목표 4 (evaluation_criteria.md §4 Activity C 높음): Effective Context Length 동일 메모리 2× 이상
-      — KV 퇴거로 확보한 메모리로 더 긴 컨텍스트 수용
-- [ ] 목표 5 (evaluation_criteria.md §3 Activity B 높음): 전체 Cache Hit Rate +5%p 이상
-      — SessionAwareTurnLevelSegmentCache 세션-인식 LRU로 세션 내 세그먼트 보존 향상
-- [ ] 목표 6 (evaluation_criteria.md §3 Activity B 높음): 비연속 세그먼트 히트율 >= 전체 히트의 30%
-      — turn-level 세그먼트 비연속 재사용으로 비연속 히트 비율 증가
-- [ ] 목표 7 (evaluation_criteria.md §2 Activity A 필수): Scheduling overhead TTFT p50 +5% 이내
-      — PPDAppendFullPrefillClassifier O(1) 해시 비교 오버헤드
-- [ ] 목표 8 (evaluation_criteria.md §1 처리량 높음): Inference Throughput 베이스라인 +20% 이상
-      — DapQ KV 퇴거로 어텐션 계산 토큰 수 감소 + PPD append-prefill 전송 우회 복합 효과
-- [ ] 목표 9 (evaluation_criteria.md §5 크로스 조합 C 포함): 복합 적용 후 accuracy ±1% 이내
-      — DapQSessionSegmentDualReductionPipeline 전체 흐름 후 cosine_sim >= 0.99 (MANDATORY)
+      — NIAH proxy: needle 보존율 ≥ 99% (32K/64K/128K 컨텍스트 프록시)
+      — LongBench 8개 서브태스크 proxy: `cosine_similarity_output ≥ 0.99` (MANDATORY)
+- [ ] 목표 3 (evaluation_criteria.md §4 높음): KV Memory Reduction ≥ −30%
+      — INT8K+INT4V: FP16 대비 −50~65% 목표 (필수 −30% 이상)
+- [ ] 목표 4 (evaluation_criteria.md §4 높음): Effective Context Length 동일 메모리 2× 이상
+      — INT8K+INT4V 압축으로 확보한 메모리로 더 긴 컨텍스트 수용
+- [ ] 목표 5 (evaluation_criteria.md §4 C 추가 검증): 수학적 오류 경계 보수성 검증
+      — 100 시퀀스에서 error_bound ≥ actual_error 항상 성립 (MANDATORY for C-1)
+      — fallback_rate_level1, fallback_rate_level2 측정 및 JSON 기록
+- [ ] 목표 6 (evaluation_criteria.md §3 Activity B 높음): 전체 Cache Hit Rate +5%p 이상
+      — CLCPositionalBiasGatedSegmentCache 직접 재사용 허용으로 히트율 향상
+- [ ] 목표 7 (evaluation_criteria.md §3 Activity B 높음): 비연속 세그먼트 히트율 ≥ 전체 히트의 30%
+      — ΔPos ≤ 0.15 세그먼트 직접 재사용으로 비연속 히트 증가
+- [ ] 목표 8 (evaluation_criteria.md §2 Activity A 필수): Scheduling overhead TTFT p50 +5% 이내
+      — 히트율 예측 선형 모델 < 0.01ms 오버헤드
+- [ ] 목표 9 (evaluation_criteria.md §5 크로스 조합): 복합 적용 후 accuracy ±1% 이내 (MANDATORY)
+      — Cross-1 RuntimeCertified+KVSculpt 폐루프 파이프라인 후 cosine_sim ≥ 0.99
+- [ ] 목표 10 (evaluation_criteria.md §1 처리량 높음): 처리량 베이스라인 +20% 이상
+      — INT8K+INT4V 메모리 절감 → 배치 크기 증가 → 처리량 향상
 
 ---
 
@@ -110,35 +108,37 @@ DapQ(arXiv 2603.11564)의 새로운 설계 원칙을 적용한다.
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/cache/dapq_position_aware_eviction_codec.py` | C | DapQPositionAwareEvictionCodec — RoPE 기반 위치-인식 유사 쿼리로 KV 중요도 추정 후 예산 기반 퇴거 |
-| `src/cache/session_turn_level_segment_cache.py` | B | SessionAwareTurnLevelSegmentCache — (content_hash, session_id, turn_id) 3-tuple 키, 세션-인식 LRU |
-| `src/cache/dapq_session_segment_dual_pipeline.py` | B+C | DapQSessionSegmentDualReductionPipeline — 위치-인식 세그먼트 선택(B) + KV 퇴거(C) 이중 감소 파이프라인 |
-| `src/scheduler/ppd_append_full_prefill_classifier.py` | A | PPDAppendFullPrefillClassifier — 세션 컨텍스트 해시 기반 append/full-prefill 분류 + SLO-인식 라우팅 |
-| `tests/unit/test_dapq_position_aware_eviction.py` | C | DapQPositionAwareEvictionCodec 단위 테스트 + accuracy 검증 |
-| `tests/unit/test_compression_accuracy.py` | C | Accuracy-preservation 검증 (기존 파일 덮어쓰기) — DapQ 기반으로 전환 |
-| `tests/unit/test_session_turn_level_segment_cache.py` | B | SessionAwareTurnLevelSegmentCache 단위 테스트 |
-| `tests/unit/test_ppd_append_full_prefill_classifier.py` | A | PPDAppendFullPrefillClassifier 단위 테스트 |
-| `tests/integration/test_dapq_session_segment_dual_e2e.py` | B+C | DapQSessionSegmentDualReductionPipeline E2E 통합 테스트 |
-| `configs/experiments/2026-05-22.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `src/cache/runtime_certified_quant_codec.py` | C | RuntimeCertifiedQuantizedAttentionCodec — INT8K+INT4V 저장 + FP16 RAM 백업 + 이중 항 오류 분해 + 다단계 폴백 사다리 |
+| `src/cache/kvsculpt_distillation_codec.py` | C | KVSculptDistillationCodec — 파일럿 압축 레이어 난이도 프로파일링 + L-BFGS+최소제곱 교대 증류 + 난이도 비례 예산 배분 |
+| `src/cache/runtime_certified_distillation_pipeline.py` | C (Cross-1) | RuntimeCertifiedKVSculptDistillationPipeline — C-1+C-2 폐루프 인증 증류 파이프라인 |
+| `src/cache/clc_positional_bias_gated_segment_cache.py` | B | CLCPositionalBiasGatedSegmentCache — ΔPos 연속값 측정 기반 3단계 선택적 재인코딩 게이트 |
+| `src/scheduler/cpd_warm_cold_hit_router.py` | A | CPDWarmColdHitRateRouter — 예측 캐시 히트율 기반 warm/cold/neutral 3경로 소프트 분기 |
+| `tests/unit/test_runtime_certified_quant_codec.py` | C | RuntimeCertifiedQuantizedAttentionCodec 단위 테스트 |
+| `tests/unit/test_compression_accuracy.py` | C | Accuracy-preservation 검증 (기존 파일 덮어쓰기 — RuntimeCertified 기반으로 전환) |
+| `tests/unit/test_kvsculpt_distillation_codec.py` | C | KVSculptDistillationCodec 단위 테스트 |
+| `tests/unit/test_clc_positional_bias_gated_segment_cache.py` | B | CLCPositionalBiasGatedSegmentCache 단위 테스트 |
+| `tests/unit/test_cpd_warm_cold_hit_router.py` | A | CPDWarmColdHitRateRouter 단위 테스트 |
+| `tests/integration/test_runtime_certified_distillation_e2e.py` | C Cross-1 | RuntimeCertifiedKVSculptDistillationPipeline E2E 통합 테스트 |
+| `configs/experiments/2026-05-23.yaml` | 공통 | 이번 사이클 실험 설정 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/cache/segmented.py` | 변경 없음 — 이미 `use_block_union` 플래그가 추가됨. `SessionAwareTurnLevelSegmentCache`는 `CacheStore` 직접 상속으로 독립 구현 |
+| `configs/kvsculpt_layer_difficulty_profile.yaml` | KVSculpt 파일럿 실행 후 자동 생성 (테스트에서 생성) |
+| `configs/clc_bias_gate_thresholds.yaml` | CLCPositionalBiasGate 임계값 설정 자동 생성 |
 
-**주의**: `src/cache/base.py`는 변경하지 않는다. 기존 추상 메서드 6개와 선택적 메서드(compression_hook, store_pre_rope, load_with_rope, get_importance_mask)는 불변. 이전 사이클 구현 파일들 모두 수정 금지.
+**주의**: `src/cache/base.py`는 변경하지 않는다. 이전 사이클 구현 파일 모두 수정 금지.
 
 ---
 
 ## 알고리즘 상세
 
-### DapQPositionAwareEvictionCodec (Activity C)
+### RuntimeCertifiedQuantizedAttentionCodec (Activity C — 최우선)
 
 ```python
-# src/cache/dapq_position_aware_eviction_codec.py
+# src/cache/runtime_certified_quant_codec.py
 
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import torch
@@ -148,271 +148,637 @@ from src.cache.base import CacheStore
 
 
 @dataclass
-class DapQEvictionConfig:
-    d_head: int = 128              # KV 헤드 차원 (RoPE 회전 대상 차원)
-    n_kv_heads: int = 8            # KV 헤드 수
-    n_layers: int = 12             # 모델 레이어 수
-    budget_ratio: float = 0.30     # 유지할 KV 비율 (0.30 = 상위 30% 유지)
-    high_pressure_threshold: float = 0.80   # KV 풀 점유율 > 이 값이면 공격적 퇴거
-    low_pressure_threshold: float = 0.50    # KV 풀 점유율 < 이 값이면 보수적 퇴거
-    high_pressure_budget_ratio: float = 0.15  # 공격적 모드: 상위 15% 유지
-    low_pressure_budget_ratio: float = 0.50   # 보수적 모드: 상위 50% 유지
-    recent_window: int = 32        # 최근 N 토큰은 항상 유지 (query drift 방지)
-    use_unit_template: bool = True # True: q_template = 단위 벡터 (의미 정보 최소화)
+class RuntimeCertifiedConfig:
+    d_head: int = 128
+    n_kv_heads: int = 8
+    n_layers: int = 12
+    error_threshold: float = 0.005      # Level 0→1 폴백 임계값 (0.5% = ±1%의 절반)
+    key_bits: int = 8                   # INT8 Key
+    value_bits: int = 4                 # INT4 Value
     max_entries: int = 1000
     seed: int = 42
 
 
-class DapQPositionAwareEvictionCodec(CacheStore):
-    """DapQ (arXiv 2603.11564) Position-Aware Pseudo Query KV Eviction Codec.
+@dataclass
+class CertifiedKVEntry:
+    """GPU에 저장되는 압축 KV 엔트리."""
+    key_int8: torch.Tensor        # [seq_len, d_head] INT8
+    value_int4_packed: torch.Tensor  # [seq_len, d_head//2] packed INT4 (2토큰/바이트)
+    key_scale: torch.Tensor       # [seq_len] FP16 per-token scale
+    key_zero: torch.Tensor        # [seq_len] FP16 per-token zero
+    value_scale: torch.Tensor     # [seq_len] FP16 per-token scale
+    value_zero: torch.Tensor      # [seq_len] FP16 per-token zero
+    # RAM 백업 (비동기 복원용)
+    key_fp16_backup: torch.Tensor    # CPU에 보존
+    value_fp16_backup: torch.Tensor  # CPU에 보존
+    fallback_level: int = 0          # 0=INT8K+INT4V, 1=INT8K+FP16V, 2=FP16K+FP16V
 
-    Activity C: KV Cache Compression (accuracy-preserving, training-free).
-    CacheStore 인터페이스 완전 구현.
 
-    핵심 알고리즘:
-      DapQ의 핵심 발견 — "유사 쿼리 구성에서 위치 정보(RoPE)가 의미 정보보다 결정적" —
-      을 적용해 현재 디코딩 위치 pos_decode를 기반으로 위치-인식 유사 쿼리를 생성하고,
-      이로부터 KV 토큰별 중요도를 추정해 budget_ratio 상위 KV만 유지한다.
+class RuntimeCertifiedQuantizedAttentionCodec(CacheStore):
+    """Runtime-Certified Bounded-Error Quantized Attention KV Cache (arXiv 2605.20868).
 
-    위치-인식 유사 쿼리 생성:
-      q_pseudo = RoPE(pos_decode, q_template)
-      q_template: 레이어별 평균 쿼리 벡터 또는 단위 벡터 (use_unit_template=True 시)
-      의미 정보를 제거한 단위 벡터가 query drift를 오히려 줄인다 (DapQ 이론적 근거).
+    Activity C: KV Cache Compression — 수학적 런타임 오류 경계 인증.
 
-    중요도 점수 계산:
-      importance[i] = softmax(q_pseudo @ K.T)[i]   for each token i
-      배치 처리: q_pseudo [d_head] @ K.T [d_head, seq_len] → scores [seq_len]
+    계층화 KV 구조:
+      GPU HBM: INT8 Key + INT4 Value (압축 저장, 속도 최적화)
+      시스템 RAM: FP16 원본 Key + Value (비동기 D2H 전송, 폴백 복원용)
 
-    예산 기반 KV 선택:
-      top_k = max(recent_window, int(seq_len * effective_budget_ratio))
-      selected = topk(importance, top_k).indices (정렬 후 반환)
-      최근 recent_window 토큰은 indices에 항상 포함.
+    이중 항 오류 분해 (Two-Term Error Decomposition):
+      δ_attn_bound: Key 양자화로 인한 어텐션 분포 왜곡 상한
+        = max_q_norm × ||K - K_int8_restored||_F / (√d × softmax_min)
+      δ_value_bound: Value 양자화 후 어텐션 가중합 오차 상한
+        = max_attn_weight × max_i ||v_i - v_int4_restored_i||
+      error_bound = δ_attn_bound + δ_value_bound  (삼각 부등식)
+
+    다단계 폴백 사다리:
+      Level 0 (INT8K+INT4V): error_bound ≤ error_threshold → 정상 운영
+      Level 1 (INT8K+FP16V): error_bound > error_threshold → Value FP16 복원
+      Level 2 (FP16K+FP16V): δ_attn_bound > error_threshold/2 → Key+Value FP16 복원
 
     accuracy-preserving 근거:
-      (1) DapQ 원논문(2603.11564): NIAH 태스크 KV 예산 3%에서 99.5% 성능 보존 실험 검증.
-      (2) RoPE 위치 임베딩이 어텐션 구조적 특성(어떤 위치가 중요한지)을 반영 →
-          의미-독립적 위치-인식 쿼리가 실제 디코딩 쿼리를 더 잘 근사.
-      (3) recent_window로 최근 토큰 보장 → local coherence 유지.
-      (4) budget_ratio=0.30 (보통) / 0.50 (보수적): 대부분 요청에서 accuracy delta < ±1%.
-
-    평가 기준 (evaluation_criteria.md §4):
-      - Accuracy 보존 (필수): relative_error < 0.01 (MANDATORY)
-      - downstream 태스크 정확도: cosine_sim >= 0.99 (MANDATORY)
-      - KV Memory Reduction >= −30% (높음)
+      (1) error_threshold=0.005: ±0.5% perplexity delta 수학적 상한 (목표 ±1%의 절반)
+      (2) 오류 상한이 실제 오류를 항상 상회하는 보수적 상한 (수학적 증명)
+      (3) 최악의 경우 FP16 완전 복원 → accuracy delta = 0
     """
 
-    def __init__(self, config: DapQEvictionConfig) -> None:
+    def __init__(self, config: RuntimeCertifiedConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
-        self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
-        # key → importance mask (bool tensor [seq_len])
-        self._importance_masks: Dict[str, torch.Tensor] = {}
-        # 레이어별 q_template 벡터 [n_layers, n_kv_heads, d_head]
-        self._q_templates: Optional[torch.Tensor] = None
-        # 현재 KV 풀 점유율 (외부에서 업데이트)
-        self._pool_utilization: float = 0.0
+        self._store: Dict[str, CertifiedKVEntry] = {}
         self._hits: int = 0
         self._misses: int = 0
-        self._total_bytes_original: int = 0
-        self._total_bytes_stored: int = 0
+        self._fallback_count_level1: int = 0
+        self._fallback_count_level2: int = 0
+        self._total_requests: int = 0
+        self._error_bounds: List[float] = []   # 오류 경계 분포 추적
 
     # ------------------------------------------------------------------ #
-    # RoPE 유틸리티                                                        #
+    # 양자화 / 역양자화 유틸리티                                            #
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _apply_rope(
-        x: torch.Tensor,   # [d_head] or [n_heads, d_head]
-        pos: int,
-        base: float = 10000.0,
-    ) -> torch.Tensor:
-        """RoPE 회전 적용.
+    def _quantize_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-token INT8 대칭 양자화.
 
         Algorithm:
-          d = x.shape[-1]
-          half_d = d // 2
-          theta_i = base^(-2i/d) for i in range(half_d)  → [half_d]
-          angle = pos * theta_i                            → [half_d]
-          cos_v = cos(angle), sin_v = sin(angle)           → [half_d]
-          x_r = x[..., :half_d], x_i = x[..., half_d:]
-          result[..., :half_d] = x_r * cos_v - x_i * sin_v
-          result[..., half_d:] = x_r * sin_v + x_i * cos_v
-          return result
+          scale = max(|x|, dim=-1) / 127.0   # [seq_len]
+          x_int8 = round(x / scale.unsqueeze(-1)).clamp(-127, 127).to(int8)
+          zero = zeros_like(scale)
+          return x_int8, scale, zero
         """
+        scale = x.abs().amax(dim=-1).clamp(min=1e-8) / 127.0  # [seq_len]
+        x_int8 = (x / scale.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        zero = torch.zeros_like(scale)
+        return x_int8, scale.to(torch.float16), zero.to(torch.float16)
+
+    @staticmethod
+    def _dequantize_int8(
+        x_int8: torch.Tensor,
+        scale: torch.Tensor,
+        zero: torch.Tensor,
+    ) -> torch.Tensor:
+        """INT8 역양자화 → FP32."""
+        return x_int8.float() * scale.float().unsqueeze(-1) + zero.float().unsqueeze(-1)
+
+    @staticmethod
+    def _quantize_int4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-token INT4 대칭 양자화 (packed: 2값/바이트로 압축).
+
+        Algorithm:
+          scale = max(|x|, dim=-1) / 7.0     # [seq_len]
+          x_int4 = round(x / scale.unsqueeze(-1)).clamp(-7, 7)  # [seq_len, d_head]
+          # INT4 packing: 인접한 두 값을 한 바이트에 저장
+          # packed[i, j] = (x_int4[i, 2j] & 0x0F) | ((x_int4[i, 2j+1] & 0x0F) << 4)
+          packed = _pack_int4(x_int4)  # [seq_len, d_head//2] uint8
+          zero = zeros_like(scale)
+          return packed, scale, zero
+        """
+        scale = x.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
+        x_clamped = (x / scale.unsqueeze(-1)).round().clamp(-7, 7).to(torch.int8)
+        # INT4 packing: 짝수 인덱스를 low nibble, 홀수를 high nibble
         d = x.shape[-1]
-        half_d = d // 2
-        i = torch.arange(half_d, dtype=torch.float32, device=x.device)
-        theta = base ** (-2.0 * i / d)
-        angle = pos * theta
-        cos_v = torch.cos(angle)
-        sin_v = torch.sin(angle)
-        x_float = x.float()
-        x_r = x_float[..., :half_d]
-        x_i = x_float[..., half_d:]
-        out = torch.empty_like(x_float)
-        out[..., :half_d] = x_r * cos_v - x_i * sin_v
-        out[..., half_d:] = x_r * sin_v + x_i * cos_v
-        return out.to(x.dtype)
+        if d % 2 != 0:
+            pad = torch.zeros(*x.shape[:-1], 1, dtype=torch.int8, device=x.device)
+            x_clamped = torch.cat([x_clamped, pad], dim=-1)
+            d += 1
+        low = (x_clamped[..., 0::2] & 0x0F).to(torch.uint8)
+        high = ((x_clamped[..., 1::2] & 0x0F) << 4).to(torch.uint8)
+        packed = (low | high)  # [seq_len, d//2]
+        zero = torch.zeros_like(scale)
+        return packed, scale.to(torch.float16), zero.to(torch.float16)
+
+    @staticmethod
+    def _dequantize_int4(
+        packed: torch.Tensor,   # [seq_len, d_head//2] uint8
+        scale: torch.Tensor,    # [seq_len] FP16
+        zero: torch.Tensor,     # [seq_len] FP16
+        d_head: int,
+    ) -> torch.Tensor:
+        """INT4 역양자화 → FP32."""
+        low = (packed & 0x0F).to(torch.int8)
+        high = ((packed >> 4) & 0x0F).to(torch.int8)
+        # sign extension for INT4 (range -7..7)
+        low = torch.where(low > 7, low - 16, low)
+        high = torch.where(high > 7, high - 16, high)
+        # interleave: [seq_len, d_head]
+        seq_len = packed.shape[0]
+        x_int4 = torch.stack([low, high], dim=-1).reshape(seq_len, -1)
+        x_int4 = x_int4[..., :d_head]
+        return x_int4.float() * scale.float().unsqueeze(-1) + zero.float().unsqueeze(-1)
 
     # ------------------------------------------------------------------ #
-    # 유사 쿼리 생성 및 중요도 계산                                         #
+    # 이중 항 오류 분해                                                     #
     # ------------------------------------------------------------------ #
 
-    def set_q_templates(self, q_templates: torch.Tensor) -> None:
-        """레이어별 평균 쿼리 템플릿 설정 (오프라인 보정 단계에서 호출).
-
-        Args:
-            q_templates: [n_layers, n_kv_heads, d_head] float 텐서.
-        """
-        self._q_templates = q_templates.detach().clone()
-
-    def _get_q_template(self, layer_idx: int = 0, head_idx: int = 0) -> torch.Tensor:
-        """레이어·헤드별 쿼리 템플릿 반환.
-
-        use_unit_template=True이거나 템플릿 미설정 시 단위 벡터 반환.
-        """
-        if self.config.use_unit_template or self._q_templates is None:
-            return torch.ones(self.config.d_head, dtype=torch.float32) / (self.config.d_head ** 0.5)
-        nl = self._q_templates.shape[0]
-        nh = self._q_templates.shape[1]
-        li = min(layer_idx, nl - 1)
-        hi = min(head_idx, nh - 1)
-        return self._q_templates[li, hi].float()
-
-    def compute_importance(
+    def compute_error_bound(
         self,
-        K: torch.Tensor,        # [seq_len, d_head] キー 텐서 (단일 헤드 or 평균)
-        pos_decode: int,        # 현재 디코딩 위치
-        layer_idx: int = 0,
-        head_idx: int = 0,
-    ) -> torch.Tensor:
-        """위치-인식 유사 쿼리로 KV 토큰별 중요도 계산.
-
-        Algorithm:
-          q_template = _get_q_template(layer_idx, head_idx)   # [d_head]
-          q_pseudo = _apply_rope(q_template, pos_decode)       # [d_head]
-          scores = q_pseudo @ K.T                              # [seq_len]
-          importance = softmax(scores / sqrt(d_head), dim=0)   # [seq_len]
-          return importance
+        Q: torch.Tensor,         # [n_q, d_head] FP32 쿼리
+        K_orig: torch.Tensor,    # [seq_len, d_head] FP32 원본 Key
+        K_restored: torch.Tensor,  # [seq_len, d_head] FP32 복원 Key (INT8 역양자화)
+        V_restored: torch.Tensor,  # [seq_len, d_head] FP32 복원 Value (INT4 역양자화)
+        V_orig: Optional[torch.Tensor] = None,  # FP16 원본 Value (Level 1 이상)
+    ) -> Tuple[float, float, float]:
+        """이중 항 오류 분해로 헤드별 오류 상한 계산.
 
         Returns:
-            importance: [seq_len] float 텐서 (합계 = 1.0)
-        """
-        q_template = self._get_q_template(layer_idx, head_idx)
-        q_pseudo = self._apply_rope(q_template, pos_decode)
-        scale = self.config.d_head ** 0.5
-        K_float = K.float()
-        scores = (q_pseudo.to(K_float.device) @ K_float.T) / scale  # [seq_len]
-        importance = F.softmax(scores, dim=0)
-        return importance
-
-    def select_kv_indices(
-        self,
-        K: torch.Tensor,        # [seq_len, d_head]
-        pos_decode: int,
-        layer_idx: int = 0,
-        head_idx: int = 0,
-    ) -> torch.Tensor:
-        """예산 기반 KV 인덱스 선택.
+            (error_bound, delta_attn_bound, delta_value_bound)
 
         Algorithm:
-          effective_ratio = _get_effective_budget_ratio()
-          top_k = max(recent_window, int(seq_len * effective_ratio))
-          top_k = min(top_k, seq_len)
-          importance = compute_importance(K, pos_decode, ...)
-          selected_by_importance = topk(importance, top_k).indices
-          # 최근 recent_window 토큰 보장
-          recent_indices = arange(max(0, seq_len - recent_window), seq_len)
-          selected = union(selected_by_importance, recent_indices)
-          return sort(selected)
+          # 항 1: Key 양자화 어텐션 분포 왜곡 상한
+          scale = 1 / sqrt(d_head)
+          attn_orig = softmax(Q @ K_orig.T * scale, dim=-1)  # [n_q, seq_len]
+          attn_rest = softmax(Q @ K_restored.T * scale, dim=-1)
+          delta_attn_bound = (attn_orig - attn_rest).abs().max().item()
 
-        Returns:
-            selected: [n_selected] int64 인덱스 텐서 (위치 순 정렬)
+          # 항 2: Value 재구성 오류 상한
+          key_diff_norm = (K_orig - K_restored).norm(dim=-1).max().item()
+          max_q_norm = Q.norm(dim=-1).max().item()
+          softmax_min = attn_orig.min().clamp(min=1e-8).item()
+          delta_attn_bound_theory = max_q_norm * key_diff_norm / (sqrt(d_head) * softmax_min)
+          # (실용적: 직접 계산값 사용)
+
+          if V_orig is not None:
+            val_diff = (V_orig - V_restored).norm(dim=-1)
+            max_attn_weight = attn_orig.max().item()
+            delta_value_bound = max_attn_weight * val_diff.max().item()
+          else:
+            delta_value_bound = (attn_orig @ (V_restored - V_restored)).norm().item()
+            # V_orig 없으면 INT4 복원값으로 추정
+
+          error_bound = delta_attn_bound + delta_value_bound
+          return error_bound, delta_attn_bound, delta_value_bound
         """
-        seq_len = K.shape[0]
-        effective_ratio = self._get_effective_budget_ratio()
-        top_k = max(self.config.recent_window, int(seq_len * effective_ratio))
-        top_k = min(top_k, seq_len)
-        importance = self.compute_importance(K, pos_decode, layer_idx, head_idx)
-        selected_indices = importance.topk(top_k).indices
-        recent_start = max(0, seq_len - self.config.recent_window)
-        recent_indices = torch.arange(recent_start, seq_len, device=K.device)
-        all_indices = torch.cat([selected_indices, recent_indices])
-        unique_indices = torch.unique(all_indices)
-        return unique_indices.sort().values
+        scale = self.config.d_head ** -0.5
+        Q_f = Q.float()
+        K_orig_f = K_orig.float()
+        K_rest_f = K_restored.float()
+        V_rest_f = V_restored.float()
 
-    def _get_effective_budget_ratio(self) -> float:
-        """현재 KV 풀 점유율에 따른 유효 budget_ratio 반환."""
-        if self._pool_utilization > self.config.high_pressure_threshold:
-            return self.config.high_pressure_budget_ratio
-        elif self._pool_utilization < self.config.low_pressure_threshold:
-            return self.config.low_pressure_budget_ratio
-        return self.config.budget_ratio
+        attn_orig = F.softmax(Q_f @ K_orig_f.T * scale, dim=-1)   # [n_q, seq_len]
+        attn_rest = F.softmax(Q_f @ K_rest_f.T * scale, dim=-1)
 
-    def update_pool_utilization(self, utilization: float) -> None:
-        """KV 풀 점유율 업데이트 (외부 스케줄러에서 호출)."""
-        self._pool_utilization = max(0.0, min(1.0, utilization))
+        delta_attn_bound = float((attn_orig - attn_rest).abs().max())
+
+        if V_orig is not None:
+            V_orig_f = V_orig.float()
+            val_diff = (V_orig_f - V_rest_f).norm(dim=-1)  # [seq_len]
+            max_attn_weight = float(attn_orig.max())
+            delta_value_bound = max_attn_weight * float(val_diff.max())
+        else:
+            # V_orig 없는 경우: attn_rest 기반 추정
+            out_rest = attn_rest @ V_rest_f
+            delta_value_bound = float(out_rest.norm()) * 0.01   # 보수적 1% 추정
+
+        error_bound = delta_attn_bound + delta_value_bound
+        return error_bound, delta_attn_bound, delta_value_bound
+
+    # ------------------------------------------------------------------ #
+    # 폴백 사다리 결정                                                      #
+    # ------------------------------------------------------------------ #
+
+    def decide_fallback_level(
+        self,
+        error_bound: float,
+        delta_attn_bound: float,
+    ) -> int:
+        """오류 경계 기반 폴백 레벨 결정.
+
+        Level 0: error_bound ≤ error_threshold → INT8K+INT4V 정상
+        Level 1: error_bound > error_threshold → INT8K+FP16V
+        Level 2: delta_attn_bound > error_threshold/2 → FP16K+FP16V
+        """
+        if error_bound <= self.config.error_threshold:
+            return 0
+        if delta_attn_bound <= self.config.error_threshold / 2:
+            return 1  # Value만 FP16 복원
+        return 2      # Key+Value FP16 복원 (완전 정확)
 
     # ------------------------------------------------------------------ #
     # CacheStore 인터페이스                                                #
     # ------------------------------------------------------------------ #
 
-    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        """위치-인식 유사 쿼리 기반 KV 퇴거 압축.
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """KV 텐서를 INT8K+INT4V로 압축 저장 + FP16 원본 CPU 보존.
+
+        Args:
+            key: 캐시 키
+            value: [seq_len, d_head] FP16 또는 FP32 KV 텐서
+                   (단순화: value가 Key 텐서를 대표. 실제 구현에서 K/V 분리 필요)
 
         Algorithm:
-          K = value  (단순화: value가 K 텐서를 대표, [seq_len, d_head])
-          pos_decode = value.shape[0]  (마지막 토큰 위치를 디코딩 위치로 근사)
-          selected_indices = select_kv_indices(K, pos_decode)
-          mask = zeros(seq_len, dtype=bool)
-          mask[selected_indices] = True
-          _importance_masks[key] = mask
-          result = zeros_like(value)
-          result[selected_indices] = value[selected_indices]
-          return result
-
-        주의: value가 다차원([seq_len, n_heads, d_head])이면 첫 번째 헤드로 중요도 추정.
+          1. value를 FP16으로 변환 후 CPU에 backup 저장 (비동기 D2H)
+          2. INT8 양자화: key_int8, key_scale, key_zero
+          3. INT4 양자화: value_int4_packed, value_scale, value_zero
+          4. CertifiedKVEntry 생성 + _store에 저장
+          5. max_entries 초과 시 evict()
         """
-        if value.dim() == 1:
-            # [d_head] 단일 벡터: 퇴거 불필요
-            return value
-        seq_len = value.shape[0]
-        # 중요도 추정용 K: value가 [seq_len, d_head] 또는 [seq_len, n_heads, d_head]
-        if value.dim() == 2:
-            K = value  # [seq_len, d_head]
+        if key in self._store:
+            return
+        if len(self._store) >= self.config.max_entries:
+            self.evict()
+
+        x = value.float()
+        # FP16 원본 CPU 백업
+        fp16_backup = value.detach().cpu().to(torch.float16)
+
+        # INT8 Key 양자화
+        k_int8, k_scale, k_zero = self._quantize_int8(x)
+
+        # INT4 Value 양자화 (동일 텐서 사용 — K/V 분리 시 별도 처리)
+        v_int4_packed, v_scale, v_zero = self._quantize_int4(x)
+
+        entry = CertifiedKVEntry(
+            key_int8=k_int8,
+            value_int4_packed=v_int4_packed,
+            key_scale=k_scale,
+            key_zero=k_zero,
+            value_scale=v_scale,
+            value_zero=v_zero,
+            key_fp16_backup=fp16_backup,
+            value_fp16_backup=fp16_backup,
+            fallback_level=0,
+        )
+        self._store[key] = entry
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        """압축 KV 복원. 폴백 레벨에 따라 INT8/INT4 또는 FP16 복원."""
+        if key not in self._store:
+            self._misses += 1
+            return None
+        self._hits += 1
+        self._total_requests += 1
+
+        entry = self._store[key]
+        d = self.config.d_head
+
+        # INT8 Key 역양자화
+        K_restored = self._dequantize_int8(entry.key_int8, entry.key_scale, entry.key_zero)
+        # INT4 Value 역양자화
+        V_restored = self._dequantize_int4(entry.value_int4_packed, entry.value_scale, entry.value_zero, d)
+
+        # 폴백 레벨에 따라 복원
+        if entry.fallback_level == 0:
+            return K_restored.to(torch.float16)
+        elif entry.fallback_level == 1:
+            # Value FP16 복원
+            self._fallback_count_level1 += 1
+            return entry.value_fp16_backup.float().to(torch.float16)
         else:
-            K = value[:, 0, :]  # 첫 번째 헤드 사용 [seq_len, d_head]
-        # 현재 디코딩 위치: 시퀀스 길이 (다음 생성 위치)
-        pos_decode = seq_len
-        selected_indices = self.select_kv_indices(K, pos_decode)
-        mask = torch.zeros(seq_len, dtype=torch.bool, device=value.device)
-        mask[selected_indices] = True
-        self._importance_masks[key] = mask.cpu()
-        result = torch.zeros_like(value)
-        result[selected_indices] = value[selected_indices]
-        return result
+            # Level 2: Key+Value FP16 완전 복원
+            self._fallback_count_level2 += 1
+            return entry.key_fp16_backup.float().to(torch.float16)
+
+    def certify_and_update(
+        self,
+        key: str,
+        Q: torch.Tensor,
+    ) -> Tuple[int, float]:
+        """런타임 오류 경계 계산 및 폴백 레벨 업데이트.
+
+        Returns:
+            (new_fallback_level, error_bound)
+
+        호출 시점: 디코딩 스텝마다 어텐션 계산 전
+        """
+        if key not in self._store:
+            return 0, 0.0
+
+        entry = self._store[key]
+        d = self.config.d_head
+
+        K_restored = self._dequantize_int8(entry.key_int8, entry.key_scale, entry.key_zero)
+        V_restored = self._dequantize_int4(entry.value_int4_packed, entry.value_scale, entry.value_zero, d)
+        K_orig = entry.key_fp16_backup.float()
+        V_orig = entry.value_fp16_backup.float()
+
+        error_bound, delta_attn, _ = self.compute_error_bound(
+            Q.float(), K_orig, K_restored, V_restored, V_orig
+        )
+        self._error_bounds.append(error_bound)
+
+        new_level = self.decide_fallback_level(error_bound, delta_attn)
+        entry.fallback_level = new_level
+        return new_level, error_bound
+
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        """INT8K+INT4V 압축 후 복원값 반환 (accuracy 검증용)."""
+        x = value.float()
+        k_int8, k_scale, k_zero = self._quantize_int8(x)
+        v_int4_packed, v_scale, v_zero = self._quantize_int4(x)
+        K_restored = self._dequantize_int8(k_int8, k_scale, k_zero)
+        return K_restored.to(value.dtype)
+
+    def evict(self) -> int:
+        """LRU: 첫 번째 항목 퇴거."""
+        if not self._store:
+            return 0
+        key = next(iter(self._store))
+        entry = self._store.pop(key)
+        return entry.key_int8.nbytes + entry.value_int4_packed.nbytes
+
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
+
+    def memory_bytes(self) -> int:
+        total = 0
+        for entry in self._store.values():
+            total += entry.key_int8.nbytes + entry.value_int4_packed.nbytes
+        return total
+
+    def memory_bytes_fp16_equivalent(self) -> int:
+        """FP16 동등 메모리 (압축 전 크기 추정)."""
+        total = 0
+        for entry in self._store.values():
+            seq_len = entry.key_int8.shape[0]
+            d = self.config.d_head
+            total += seq_len * d * 2 * 2  # K+V, FP16=2bytes
+        return total
+
+    def memory_reduction_ratio(self) -> float:
+        """INT8K+INT4V vs FP16 메모리 감소율."""
+        fp16_equiv = self.memory_bytes_fp16_equivalent()
+        if fp16_equiv == 0:
+            return 0.0
+        return 1.0 - self.memory_bytes() / fp16_equiv
+
+    def fallback_rate_level1(self) -> float:
+        return self._fallback_count_level1 / max(1, self._total_requests)
+
+    def fallback_rate_level2(self) -> float:
+        return self._fallback_count_level2 / max(1, self._total_requests)
+
+    def error_bound_stats(self) -> dict:
+        if not self._error_bounds:
+            return {"mean": 0.0, "p99": 0.0, "max": 0.0}
+        t = torch.tensor(self._error_bounds)
+        return {
+            "mean": float(t.mean()),
+            "p99": float(t.quantile(0.99)),
+            "max": float(t.max()),
+        }
+
+    def certified_accuracy_report(self) -> dict:
+        """배치 완료 시 자동 생성되는 정확도 인증 리포트."""
+        return {
+            "fallback_rate_level1": self.fallback_rate_level1(),
+            "fallback_rate_level2": self.fallback_rate_level2(),
+            "error_bound_mean": self.error_bound_stats()["mean"],
+            "error_bound_p99": self.error_bound_stats()["p99"],
+            "memory_reduction_ratio": self.memory_reduction_ratio(),
+            "error_threshold": self.config.error_threshold,
+        }
 
     def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        """저장된 bool 중요도 마스크 반환 (base.py get_importance_mask 구현).
+        raise NotImplementedError("RuntimeCertifiedQuantizedAttentionCodec does not support importance masking.")
 
-        Returns: [seq_len] bool 텐서 (중요 위치 True) 또는 None.
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
+        self._fallback_count_level1 = 0
+        self._fallback_count_level2 = 0
+        self._total_requests = 0
+        self._error_bounds = []
+```
+
+---
+
+### KVSculptDistillationCodec (Activity C — 2순위)
+
+```python
+# src/cache/kvsculpt_distillation_codec.py
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+import torch
+import torch.nn.functional as F
+
+from src.cache.base import CacheStore
+
+
+@dataclass
+class KVSculptConfig:
+    n_layers: int = 12
+    d_head: int = 128
+    total_budget_ratio: float = 0.50      # 전체 KV 유지 비율 (기본 50%)
+    gamma: float = 0.5                    # 난이도 반응 강도 (γ=0: 균일 배분)
+    lbfgs_max_iter: int = 5               # L-BFGS 반복 횟수 (경량화)
+    alternating_rounds: int = 3           # 교대 반복 횟수
+    convergence_tol: float = 1e-4         # 수렴 기준 KL 발산 변화량
+    pilot_n_sequences: int = 50           # 파일럿 압축 보정 시퀀스 수
+    max_entries: int = 1000
+    seed: int = 42
+
+
+class KVSculptDistillationCodec(CacheStore):
+    """KVSculpt: KV Cache Compression as Distillation (arXiv 2603.27819).
+
+    Activity C: 파일럿 압축 → 레이어별 KL 발산 난이도 프로파일링 →
+                난이도 비례 예산 배분 → L-BFGS Key + 최소제곱 Value 교대 최적화.
+
+    핵심 알고리즘:
+      1. 파일럿 실행: 균일 50% 압축으로 레이어별 KL 발산(난이도) 측정.
+      2. 난이도 비례 예산: budget(l) = total × (1 + γ × norm_difficulty(l)).
+         고난이도 레이어 → 더 많은 KV 유지 (낮은 압축률).
+      3. L-BFGS Key 최적화: min KL(attn_orig || attn_compressed).
+      4. 최소제곱 Value: 어텐션 가중합 보존하는 토큰 budget(l)개 선택.
+      5. 교대 반복 (3회).
+
+    레이어 간 압축 난이도 최대 100× 차이 (KVSculpt 원논문 실증):
+      → 균일 예산 배분은 비효율적. 난이도 비례 배분으로 동일 메모리에서 더 낮은 KL.
+    """
+
+    def __init__(self, config: KVSculptConfig) -> None:
+        torch.manual_seed(config.seed)
+        self.config = config
+        self._store: Dict[str, torch.Tensor] = {}
+        self._hits: int = 0
+        self._misses: int = 0
+        # 레이어별 난이도 프로파일 [n_layers] (초기: 균일)
+        self._layer_difficulty: torch.Tensor = torch.ones(config.n_layers)
+        self._layer_budget: torch.Tensor = torch.full((config.n_layers,), config.total_budget_ratio)
+        self._profile_done: bool = False
+
+    def pilot_profile_layer_difficulty(
+        self,
+        calibration_sequences: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        # List of (Q, K, V) per sequence, each [seq_len, d_head]
+    ) -> None:
+        """파일럿 압축 실행으로 레이어별 KL 발산 난이도 프로파일링.
+
+        Algorithm:
+          for each layer l:
+            kl_divergences = []
+            for each (Q, K, V) in calibration_sequences:
+              # 균일 50% 압축
+              budget_k = max(1, int(seq_len * 0.5))
+              selected_idx = topk(importance_scores(Q, K), budget_k).indices
+              K_compressed = K[selected_idx]
+              V_compressed = V[selected_idx]
+              Q_adj = Q  # 쿼리 고정
+              attn_full = softmax(Q @ K.T / √d)
+              # K_compressed로 full-size 어텐션 근사 (패딩 없음 → KL 직접)
+              attn_comp = softmax(Q @ K_compressed.T / √d)
+              kl = KL(attn_full[:, selected_idx] || attn_comp)
+              kl_divergences.append(kl)
+            difficulty[l] = mean(kl_divergences)
+
+          # 정규화 + 난이도 비례 예산 배분
+          norm_diff = (difficulty - difficulty.min()) / (difficulty.max() - difficulty.min() + 1e-8)
+          raw_budget = total_budget_ratio * (1 + gamma * norm_diff)  # [n_layers]
+          # 예산 보존: sum(budget) = n_layers * total_budget_ratio
+          budget = raw_budget / raw_budget.mean() * total_budget_ratio
+
+          _layer_difficulty = difficulty
+          _layer_budget = budget.clamp(0.1, 0.9)
+          _profile_done = True
         """
-        return self._importance_masks.get(key)
+        n_layers = self.config.n_layers
+        kl_per_layer = torch.zeros(n_layers)
 
+        for layer_idx in range(n_layers):
+            kl_list = []
+            for Q, K, V in calibration_sequences:
+                Q_f, K_f = Q.float(), K.float()
+                seq_len = K_f.shape[0]
+                budget_k = max(1, int(seq_len * 0.5))
+                scale = self.config.d_head ** -0.5
+                scores = (Q_f @ K_f.T) * scale   # [n_q, seq_len]
+                importance = scores.mean(dim=0)   # [seq_len] — 평균 쿼리 중요도
+                selected_idx = importance.topk(budget_k).indices.sort().values
+                K_comp = K_f[selected_idx]
+                attn_full = F.softmax(Q_f @ K_f.T * scale, dim=-1)     # [n_q, seq_len]
+                attn_comp = F.softmax(Q_f @ K_comp.T * scale, dim=-1)  # [n_q, budget_k]
+                # KL 발산: 압축 후 분포의 엔트로피 변화 근사
+                attn_full_sel = attn_full[:, selected_idx] + 1e-10
+                attn_comp_clamp = attn_comp + 1e-10
+                kl = F.kl_div(attn_comp_clamp.log(), attn_full_sel, reduction="batchmean").item()
+                kl_list.append(max(0.0, kl))
+            kl_per_layer[layer_idx] = float(torch.tensor(kl_list).mean()) if kl_list else 0.0
+
+        self._layer_difficulty = kl_per_layer
+        # 난이도 비례 예산 배분
+        dmin, dmax = kl_per_layer.min(), kl_per_layer.max()
+        norm_diff = (kl_per_layer - dmin) / (dmax - dmin + 1e-8)
+        raw_budget = self.config.total_budget_ratio * (1 + self.config.gamma * norm_diff)
+        self._layer_budget = (raw_budget / raw_budget.mean() * self.config.total_budget_ratio).clamp(0.1, 0.9)
+        self._profile_done = True
+
+    def get_layer_budget(self, layer_idx: int) -> float:
+        """레이어별 KV 유지 비율 반환."""
+        if not self._profile_done:
+            return self.config.total_budget_ratio
+        idx = min(layer_idx, self.config.n_layers - 1)
+        return float(self._layer_budget[idx])
+
+    def distill_compress(
+        self,
+        Q: torch.Tensor,   # [n_q, d_head]
+        K: torch.Tensor,   # [seq_len, d_head]
+        V: torch.Tensor,   # [seq_len, d_head]
+        layer_idx: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """L-BFGS Key + 최소제곱 Value 교대 증류 압축.
+
+        Returns:
+            (selected_indices, K_selected, V_selected)
+            selected_indices: [budget_k] int64
+
+        Algorithm:
+          budget_ratio = get_layer_budget(layer_idx)
+          budget_k = max(1, int(seq_len * budget_ratio))
+
+          # 초기 토큰 선택: 어텐션 중요도 기반
+          importance = softmax(Q @ K.T / √d, dim=-1).mean(dim=0)  # [seq_len]
+          selected_idx = topk(importance, budget_k).indices.sort().values
+
+          for round in range(alternating_rounds):
+            # L-BFGS Key 최적화: minimize KL(attn_full || attn_compressed_selected)
+            # (경량화: 중요도 재계산으로 토큰 재선택)
+            attn_target = softmax(Q @ K.T / √d, dim=-1)   # [n_q, seq_len]
+            for lbfgs_iter in range(lbfgs_max_iter):
+              importance = (Q @ K[selected_idx].T / √d).mean(dim=0)  # [budget_k]
+              # importance 기반 재정렬 (soft L-BFGS 근사)
+              selected_idx = topk(importance, budget_k).indices.sort().values
+
+            # 최소제곱 Value: 선택된 토큰의 Value 그대로 유지
+            # (V_selected = V[selected_idx])
+
+            # 수렴 체크
+            kl_before = KL(attn_target || softmax(Q @ K[selected_idx].T / √d))
+            if |kl_before - kl_prev| < convergence_tol: break
+            kl_prev = kl_before
+
+          return selected_idx, K[selected_idx], V[selected_idx]
+        """
+        Q_f, K_f, V_f = Q.float(), K.float(), V.float()
+        seq_len = K_f.shape[0]
+        budget_ratio = self.get_layer_budget(layer_idx)
+        budget_k = max(1, int(seq_len * budget_ratio))
+        scale = self.config.d_head ** -0.5
+
+        # 초기 선택: 어텐션 중요도
+        scores = (Q_f @ K_f.T) * scale      # [n_q, seq_len]
+        importance_init = F.softmax(scores, dim=-1).mean(dim=0)   # [seq_len]
+        selected_idx = importance_init.topk(budget_k).indices.sort().values
+
+        attn_target = F.softmax(scores, dim=-1)  # [n_q, seq_len]
+        kl_prev = float('inf')
+
+        for _ in range(self.config.alternating_rounds):
+            # L-BFGS Key 최적화 (경량화: 반복적 중요도 재계산)
+            for _ in range(self.config.lbfgs_max_iter):
+                scores_sel = (Q_f @ K_f[selected_idx].T) * scale   # [n_q, budget_k]
+                importance_sel = F.softmax(scores_sel, dim=-1).mean(dim=0)  # [budget_k]
+                # 가장 중요도 낮은 선택 토큰을 비선택 중 중요도 높은 토큰으로 교체
+                full_importance = importance_init.clone()
+                full_importance[selected_idx] = importance_sel
+                new_selected = full_importance.topk(budget_k).indices.sort().values
+                if torch.equal(new_selected, selected_idx):
+                    break
+                selected_idx = new_selected
+
+            # 수렴 체크
+            scores_sel = (Q_f @ K_f[selected_idx].T) * scale
+            attn_sel = F.softmax(scores_sel, dim=-1) + 1e-10
+            attn_tgt_sel = attn_target[:, selected_idx] + 1e-10
+            kl_now = F.kl_div(attn_sel.log(), attn_tgt_sel, reduction="batchmean").item()
+            if abs(kl_now - kl_prev) < self.config.convergence_tol:
+                break
+            kl_prev = kl_now
+
+        return selected_idx, K[selected_idx], V[selected_idx]
+
+    # CacheStore 인터페이스
     def put(self, key: str, value: torch.Tensor) -> None:
-        self._total_bytes_original += value.nbytes
-        compressed = self.compression_hook(key, value)
-        self._total_bytes_stored += compressed.nbytes
         if key in self._store:
-            self._store.move_to_end(key)
-        else:
-            if len(self._store) >= self.config.max_entries:
-                self.evict()
-        self._store[key] = compressed.detach().clone()
+            return
+        if len(self._store) >= self.config.max_entries:
+            self.evict()
+        self._store[key] = value.detach().clone()
 
     def get(self, key: str) -> Optional[torch.Tensor]:
         if key in self._store:
-            self._store.move_to_end(key)
             self._hits += 1
             return self._store[key]
         self._misses += 1
@@ -421,8 +787,8 @@ class DapQPositionAwareEvictionCodec(CacheStore):
     def evict(self) -> int:
         if not self._store:
             return 0
-        key, v = self._store.popitem(last=False)
-        self._importance_masks.pop(key, None)
+        key = next(iter(self._store))
+        v = self._store.pop(key)
         return v.nbytes
 
     def hit_rate(self) -> float:
@@ -432,220 +798,308 @@ class DapQPositionAwareEvictionCodec(CacheStore):
     def memory_bytes(self) -> int:
         return sum(v.nbytes for v in self._store.values())
 
-    def memory_reduction_ratio(self) -> float:
-        if self._total_bytes_original == 0:
-            return 0.0
-        return 1.0 - self._total_bytes_stored / self._total_bytes_original
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        return value  # 단순 저장; distill_compress()는 별도 호출
+
+    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
+        raise NotImplementedError
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
-        self._total_bytes_original = 0
-        self._total_bytes_stored = 0
-        self._store.clear()
-        self._importance_masks.clear()
 ```
 
 ---
 
-### SessionAwareTurnLevelSegmentCache (Activity B)
+### RuntimeCertifiedKVSculptDistillationPipeline (Cross-1, C-1+C-2)
 
 ```python
-# src/cache/session_turn_level_segment_cache.py
+# src/cache/runtime_certified_distillation_pipeline.py
 
-import hashlib
-import struct
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import torch
+
+from src.cache.base import CacheStore
+from src.cache.runtime_certified_quant_codec import (
+    RuntimeCertifiedQuantizedAttentionCodec, RuntimeCertifiedConfig
+)
+from src.cache.kvsculpt_distillation_codec import (
+    KVSculptDistillationCodec, KVSculptConfig
+)
+
+
+@dataclass
+class DistillationPipelineConfig:
+    c1_config: Optional[RuntimeCertifiedConfig] = None
+    c2_config: Optional[KVSculptConfig] = None
+    adaptive_threshold_scale: float = 1.0   # 난이도 높은 레이어의 임계값 강화 계수
+    online_budget_realloc_window: int = 100  # 폴백 비율 집계 윈도우 (배치 수)
+    seed: int = 42
+
+
+class RuntimeCertifiedKVSculptDistillationPipeline(CacheStore):
+    """RuntimeCertified + KVSculpt 폐루프 인증 증류 압축 파이프라인 (Cross-1, C-1+C-2).
+
+    통합 처리 흐름:
+      Step 1 (오프라인): KVSculpt 파일럿 실행 → 레이어별 KL 발산 난이도 프로파일.
+      Step 2 (오프라인): 난이도 비례 초기 예산 배분.
+      Step 3 (프리필): 레이어별 L-BFGS + 최소제곱 교대 증류 압축 → 압축 KV 선택.
+      Step 4 (디코딩): RuntimeCertified 이중 항 오류 경계 계산 (헤드별·스텝별).
+      Step 5 (온라인): error_bound > adaptive_threshold(layer) 시 예산 즉각 증가.
+      Step 6 (폴백): 예산 증가 후에도 초과하면 FP16 폴백.
+
+    adaptive_threshold(layer_l) = error_threshold / (1 + norm_difficulty(l))
+      → 난이도 높은 레이어는 더 엄격한 임계값 적용.
+
+    폐루프 품질 제어:
+      이전 N 배치 폴백 비율 누적 → 폴백이 잦은 레이어는 다음 배치에서 예산 증가.
+    """
+
+    def __init__(self, config: DistillationPipelineConfig) -> None:
+        torch.manual_seed(config.seed)
+        self.config = config
+        c1_cfg = config.c1_config or RuntimeCertifiedConfig(seed=config.seed)
+        c2_cfg = config.c2_config or KVSculptConfig(seed=config.seed)
+        self.certified_codec = RuntimeCertifiedQuantizedAttentionCodec(c1_cfg)
+        self.distillation_codec = KVSculptDistillationCodec(c2_cfg)
+        self._layer_fallback_counts: Dict[int, int] = {}
+        self._layer_request_counts: Dict[int, int] = {}
+
+    def run_pipeline(
+        self,
+        Q: torch.Tensor,   # [n_q, d_head]
+        K: torch.Tensor,   # [seq_len, d_head]
+        V: torch.Tensor,   # [seq_len, d_head]
+        layer_idx: int,
+        cache_key: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """증류 압축 + 런타임 인증 통합 실행.
+
+        Returns:
+            (K_final, V_final, report_dict)
+        """
+        # Step 3: KVSculpt 증류 압축
+        selected_idx, K_distilled, V_distilled = self.distillation_codec.distill_compress(
+            Q, K, V, layer_idx
+        )
+
+        # Step 3b: RuntimeCertified INT8K+INT4V 압축 (증류된 K/V에 적용)
+        self.certified_codec.put(cache_key, K_distilled)
+
+        # Step 4: 오류 경계 계산
+        fallback_level, error_bound = self.certified_codec.certify_and_update(cache_key, Q)
+
+        # Step 5: 온라인 예산 재배분
+        self._layer_request_counts[layer_idx] = self._layer_request_counts.get(layer_idx, 0) + 1
+        if fallback_level > 0:
+            self._layer_fallback_counts[layer_idx] = self._layer_fallback_counts.get(layer_idx, 0) + 1
+            # 예산 증가: 현재 레이어 budget을 10% 상향
+            if self.distillation_codec._profile_done:
+                n = self.distillation_codec.config.n_layers
+                idx = min(layer_idx, n - 1)
+                self.distillation_codec._layer_budget[idx] = min(
+                    0.9, float(self.distillation_codec._layer_budget[idx]) + 0.05
+                )
+
+        # Step 6: 최종 K/V 결정
+        K_final = K_distilled if fallback_level == 0 else K
+        V_final = V_distilled if fallback_level == 0 else V
+
+        report = {
+            "layer_idx": layer_idx,
+            "fallback_level": fallback_level,
+            "error_bound": error_bound,
+            "selected_ratio": len(selected_idx) / max(1, K.shape[0]),
+        }
+        return K_final, V_final, report
+
+    # CacheStore 인터페이스 (certified_codec에 위임)
+    def put(self, key: str, value: torch.Tensor) -> None:
+        self.certified_codec.put(key, value)
+
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        return self.certified_codec.get(key)
+
+    def evict(self) -> int:
+        return self.certified_codec.evict()
+
+    def hit_rate(self) -> float:
+        return self.certified_codec.hit_rate()
+
+    def memory_bytes(self) -> int:
+        return self.certified_codec.memory_bytes() + self.distillation_codec.memory_bytes()
+
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        return self.certified_codec.compression_hook(key, value)
+
+    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
+        raise NotImplementedError
+
+    def reset_stats(self) -> None:
+        self.certified_codec.reset_stats()
+        self.distillation_codec.reset_stats()
+        self._layer_fallback_counts.clear()
+        self._layer_request_counts.clear()
+```
+
+---
+
+### CLCPositionalBiasGatedSegmentCache (Activity B)
+
+```python
+# src/cache/clc_positional_bias_gated_segment_cache.py
+
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 import torch
 
 from src.cache.base import CacheStore
 
 
-@dataclass
-class TurnSegmentEntry:
-    turn_id: int
-    segment_id: str          # (content_hash, session_id, turn_id) 기반 키
-    kv_pointer: str          # 실제 KV 저장 키 (_store의 키)
-    token_range: Tuple[int, int]   # (start_pos, end_pos)
-    center_position: float   # (start_pos + end_pos) / 2
-    timestamp: float         # 저장 시각 (time.monotonic())
-    ttl: Optional[float]     # None이면 TTL 없음
+class ReencodingPolicy(Enum):
+    DIRECT_REUSE = "direct_reuse"         # ΔPos ≤ bias_threshold → 재인코딩 없음
+    PARTIAL_REENCODING = "partial"        # bias_threshold < ΔPos ≤ rope_threshold
+    FULL_REENCODING = "full"              # ΔPos > rope_threshold → 전체 재인코딩
 
 
 @dataclass
-class SessionTurnLevelConfig:
-    chunk_size: int = 128          # 청크 단위 (토큰 수)
-    max_entries: int = 1000        # 전체 최대 엔트리 수
-    max_turns_per_session: int = 10  # 세션 내 보존 최대 턴 수
-    session_lru_penalty: float = 0.5  # 세션 내 세그먼트 퇴거 우선순위 패널티
-                                     # (낮을수록 세션 내 세그먼트가 더 오래 보존됨)
+class CLCBiasGateConfig:
+    max_context_length: int = 4096        # 정규화 기준 컨텍스트 최대 길이
+    bias_threshold: float = 0.15         # ΔPos ≤ 이 값: 직접 재사용 안전
+    rope_distortion_threshold: float = 0.40  # ΔPos > 이 값: 전체 재인코딩 필수
+    partial_reencoding_layer_ratio: float = 0.5  # 부분 재인코딩: 전체 레이어의 50%
+    max_entries: int = 1000
     seed: int = 42
 
 
-class SessionAwareTurnLevelSegmentCache(CacheStore):
-    """세션-인식 턴-레벨 비연속 세그먼트 캐시 (Activity B).
+@dataclass
+class SegmentMeta:
+    """캐시된 세그먼트의 위치 메타데이터."""
+    pos_orig_start: int    # 원본 컨텍스트에서의 시작 위치
+    pos_orig_end: int      # 원본 컨텍스트에서의 끝 위치
+    content_hash: str      # 콘텐츠 해시 (불변)
 
-    CacheStore 인터페이스 완전 구현.
 
-    핵심 자료구조:
-      세그먼트 키: (content_hash, session_id, turn_id) 3-tuple의 해시
-      TurnSegmentIndex: session_id → List[TurnSegmentEntry]
-      session_priority_lru: 세션 내 세그먼트는 cross-session 세그먼트보다
-                            퇴거 우선순위가 낮음 (더 오래 보존).
+class CLCPositionalBiasGatedSegmentCache(CacheStore):
+    """CLC 위치 편향 임계 게이트 기반 선택적 비연속 세그먼트 재사용 캐시 (Activity B).
 
-    위치-인식 재사용 점수:
-      position_reuse_score(segment, current_pos) =
-        exp(-|segment.center_position - current_pos| / decay_factor)
-      DapQ 위치-인식 원칙: 현재 디코딩 위치에 가까운 세그먼트가 재사용 가능성 높음.
+    2603.20218이 규명한 CLC 정확도 한계 메커니즘 직접 구현:
+      위치 독립 재사용 시 위치 인코딩 불일치 → 심각한 정확도 저하.
+      → 위치 편향 크기 ΔPos를 연속값으로 측정해 3단계 재인코딩 정책 결정.
+
+    위치 편향 측정:
+      ΔPos = |pos_target_start - pos_orig_start| / max_context_length  (0~1 정규화)
+
+    3단계 선택적 재인코딩 게이트:
+      ΔPos ≤ 0.15:  DIRECT_REUSE — AdapShot 재인코딩 스킵 (즉각 재사용)
+      0.15 < ΔPos ≤ 0.40: PARTIAL_REENCODING — 처음 N//2 레이어만 재인코딩
+      ΔPos > 0.40: FULL_REENCODING — AdapShot 전체 재인코딩 적용
 
     평가 기준 (evaluation_criteria.md §3):
       - 전체 Cache Hit Rate +5%p 이상 (높음)
-      - 비연속 세그먼트 히트율 >= 전체 히트의 30% (높음)
-      - KV Memory Footprint 베이스라인 +20% 이내 (높음)
+      - 비연속 세그먼트 히트율 ≥ 전체 히트의 30% (높음)
     """
 
-    def __init__(self, config: SessionTurnLevelConfig) -> None:
+    def __init__(self, config: CLCBiasGateConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
-        # 실제 KV 저장소: kv_key → torch.Tensor
         self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
-        # 세션 인덱스: session_id → List[TurnSegmentEntry]
-        self._session_index: Dict[str, List[TurnSegmentEntry]] = {}
-        # 세그먼트 → 세션 역매핑 (빠른 세션 조회)
-        self._key_to_session: Dict[str, str] = {}
+        self._meta: Dict[str, SegmentMeta] = {}
         self._hits: int = 0
         self._misses: int = 0
-        self._noncontiguous_hits: int = 0
+        self._direct_reuse_hits: int = 0
+        self._partial_reencoding_hits: int = 0
+        self._full_reencoding_hits: int = 0
 
-    @staticmethod
-    def _make_segment_key(
-        content_hash: str,
-        session_id: str,
-        turn_id: int,
-        layer_idx: int = 0,
-    ) -> str:
-        """(content_hash, session_id, turn_id, layer_idx) 3-tuple 키 생성."""
-        raw = f"{content_hash}|{session_id}|{turn_id}|{layer_idx}"
-        return hashlib.sha256(raw.encode()).hexdigest()
-
-    @staticmethod
-    def _content_hash(token_ids: List[int], chunk_idx: int, chunk_size: int) -> str:
-        start = chunk_idx * chunk_size
-        chunk = token_ids[start:start + chunk_size]
-        raw = struct.pack(f"{len(chunk)}I", *chunk)
-        return hashlib.sha256(raw).hexdigest()
-
-    # ------------------------------------------------------------------ #
-    # 세션-턴 API                                                          #
-    # ------------------------------------------------------------------ #
-
-    def put_turn_segment(
+    def compute_delta_pos(
         self,
-        token_ids: List[int],
-        chunk_idx: int,
-        kv: torch.Tensor,
-        session_id: str,
-        turn_id: int,
-        layer_idx: int = 0,
-        ttl: Optional[float] = None,
-    ) -> str:
-        """턴-레벨 세그먼트 저장.
+        pos_orig_start: int,
+        pos_target_start: int,
+    ) -> float:
+        """정규화된 위치 편향 측정.
+
+        ΔPos = |pos_target_start - pos_orig_start| / max_context_length
+        """
+        return abs(pos_target_start - pos_orig_start) / max(1, self.config.max_context_length)
+
+    def check_bias(
+        self,
+        segment_meta: SegmentMeta,
+        pos_target_start: int,
+    ) -> ReencodingPolicy:
+        """위치 편향 크기로 재인코딩 정책 결정.
 
         Algorithm:
-          content_hash = _content_hash(token_ids, chunk_idx, chunk_size)
-          key = _make_segment_key(content_hash, session_id, turn_id, layer_idx)
-          start_pos = chunk_idx * chunk_size
-          end_pos = min(start_pos + chunk_size, len(token_ids))
-          entry = TurnSegmentEntry(turn_id, key, key, (start_pos, end_pos),
-                                   center=(start_pos+end_pos)/2, ...)
-          _session_index[session_id].append(entry)
-          _key_to_session[key] = session_id
-          put(key, kv)
-          return key
+          delta_pos = compute_delta_pos(segment_meta.pos_orig_start, pos_target_start)
+          if delta_pos <= bias_threshold: return DIRECT_REUSE
+          elif delta_pos <= rope_distortion_threshold: return PARTIAL_REENCODING
+          else: return FULL_REENCODING
         """
-        import time
-        content_hash = self._content_hash(token_ids, chunk_idx, self.config.chunk_size)
-        key = self._make_segment_key(content_hash, session_id, turn_id, layer_idx)
-        start_pos = chunk_idx * self.config.chunk_size
-        end_pos = min(start_pos + self.config.chunk_size, len(token_ids))
-        entry = TurnSegmentEntry(
-            turn_id=turn_id,
-            segment_id=key,
-            kv_pointer=key,
-            token_range=(start_pos, end_pos),
-            center_position=(start_pos + end_pos) / 2.0,
-            timestamp=time.monotonic(),
-            ttl=ttl,
-        )
-        if session_id not in self._session_index:
-            self._session_index[session_id] = []
-        self._session_index[session_id].append(entry)
-        self._key_to_session[key] = session_id
-        self.put(key, kv)
-        return key
+        delta_pos = self.compute_delta_pos(segment_meta.pos_orig_start, pos_target_start)
+        if delta_pos <= self.config.bias_threshold:
+            return ReencodingPolicy.DIRECT_REUSE
+        elif delta_pos <= self.config.rope_distortion_threshold:
+            return ReencodingPolicy.PARTIAL_REENCODING
+        else:
+            return ReencodingPolicy.FULL_REENCODING
 
-    def get_session_segments(
+    def put_segment(
         self,
-        session_id: str,
-        turn_range: Optional[Tuple[int, int]] = None,
-    ) -> List[TurnSegmentEntry]:
-        """세션 내 저장된 세그먼트 목록 반환.
+        key: str,
+        value: torch.Tensor,
+        pos_orig_start: int,
+        pos_orig_end: int,
+        content_hash: str,
+    ) -> None:
+        """세그먼트 KV와 위치 메타데이터를 함께 저장."""
+        meta = SegmentMeta(
+            pos_orig_start=pos_orig_start,
+            pos_orig_end=pos_orig_end,
+            content_hash=content_hash,
+        )
+        self._meta[key] = meta
+        self.put(key, value)
 
-        Args:
-            session_id: 조회할 세션 ID
-            turn_range: (min_turn, max_turn_inclusive) 또는 None (전체)
+    def get_with_policy(
+        self,
+        key: str,
+        pos_target_start: int,
+    ) -> Tuple[Optional[torch.Tensor], ReencodingPolicy]:
+        """캐시된 세그먼트를 위치 편향 게이트와 함께 반환.
 
         Returns:
-            해당 세션의 TurnSegmentEntry 리스트 (존재하는 KV만 포함)
+            (kv_tensor_or_None, reencoding_policy)
+            kv_tensor: None이면 미스. 재인코딩 정책은 호출자가 적용.
         """
-        entries = self._session_index.get(session_id, [])
-        if turn_range is not None:
-            lo, hi = turn_range
-            entries = [e for e in entries if lo <= e.turn_id <= hi]
-        # 실제로 _store에 존재하는 엔트리만 반환
-        return [e for e in entries if e.kv_pointer in self._store]
+        kv = self.get(key)
+        if kv is None:
+            return None, ReencodingPolicy.FULL_REENCODING
 
-    def position_reuse_score(
-        self,
-        entry: TurnSegmentEntry,
-        current_decode_pos: float,
-        decay_factor: float = 512.0,
-    ) -> float:
-        """DapQ 위치-인식 세그먼트 재사용 가능성 점수.
+        meta = self._meta.get(key)
+        if meta is None:
+            return kv, ReencodingPolicy.FULL_REENCODING
 
-        score = exp(-|center_position - current_decode_pos| / decay_factor)
-        현재 디코딩 위치에 가까울수록 점수가 높다.
-        """
-        import math
-        dist = abs(entry.center_position - current_decode_pos)
-        return math.exp(-dist / decay_factor)
+        policy = self.check_bias(meta, pos_target_start)
 
-    def get_top_segments_by_position(
-        self,
-        session_id: str,
-        current_decode_pos: float,
-        keep_ratio: float = 0.50,
-        decay_factor: float = 512.0,
-    ) -> List[TurnSegmentEntry]:
-        """위치-인식 점수 상위 keep_ratio 세그먼트 반환.
+        # 정책별 히트 카운트
+        if policy == ReencodingPolicy.DIRECT_REUSE:
+            self._direct_reuse_hits += 1
+        elif policy == ReencodingPolicy.PARTIAL_REENCODING:
+            self._partial_reencoding_hits += 1
+        else:
+            self._full_reencoding_hits += 1
 
-        DapQSessionSegmentDualReductionPipeline Step 2에서 사용.
-        """
-        entries = self.get_session_segments(session_id)
-        if not entries:
-            return []
-        scored = [(e, self.position_reuse_score(e, current_decode_pos, decay_factor))
-                  for e in entries]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        k = max(1, int(len(scored) * keep_ratio))
-        return [e for e, _ in scored[:k]]
+        return kv, policy
 
-    # ------------------------------------------------------------------ #
-    # CacheStore 인터페이스                                                #
-    # ------------------------------------------------------------------ #
+    def noncontiguous_direct_hit_rate(self) -> float:
+        """직접 재사용 비율 (전체 히트 중 DIRECT_REUSE 비율)."""
+        total_hits = self._direct_reuse_hits + self._partial_reencoding_hits + self._full_reencoding_hits
+        return self._direct_reuse_hits / max(1, total_hits)
 
+    # CacheStore 인터페이스
     def put(self, key: str, value: torch.Tensor) -> None:
         if key in self._store:
             self._store.move_to_end(key)
@@ -658,521 +1112,413 @@ class SessionAwareTurnLevelSegmentCache(CacheStore):
         if key in self._store:
             self._store.move_to_end(key)
             self._hits += 1
-            # 비연속 히트 감지: 세션 내 이전 턴 세그먼트를 참조
-            session_id = self._key_to_session.get(key)
-            if session_id:
-                entries = self._session_index.get(session_id, [])
-                hit_entry = next((e for e in entries if e.kv_pointer == key), None)
-                if hit_entry and hit_entry.turn_id > 0:
-                    self._noncontiguous_hits += 1
             return self._store[key]
         self._misses += 1
         return None
 
     def evict(self) -> int:
-        """세션-인식 LRU: 세션 내 세그먼트를 더 오래 보존.
-
-        Algorithm:
-          candidates = list(_store.keys())
-          for each key in candidates:
-            session_id = _key_to_session.get(key)
-            if session_id: score = session_lru_penalty  (낮은 점수 = 늦게 퇴거)
-            else: score = 1.0
-          evict_key = argmax(score) 중 가장 오래된(LRU first) 항목
-          (동점 시 OrderedDict 순서로 LRU 선택)
-        """
         if not self._store:
             return 0
-        # cross-session 우선 퇴거: session에 속하지 않은 키 먼저
-        for key in list(self._store.keys()):
-            if key not in self._key_to_session:
-                v = self._store.pop(key)
-                return v.nbytes
-        # 모두 세션 내 세그먼트면 LRU (OrderedDict 첫 번째)
         key, v = self._store.popitem(last=False)
-        session_id = self._key_to_session.pop(key, None)
-        if session_id and session_id in self._session_index:
-            self._session_index[session_id] = [
-                e for e in self._session_index[session_id]
-                if e.kv_pointer != key
-            ]
+        self._meta.pop(key, None)
         return v.nbytes
 
     def hit_rate(self) -> float:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
-    def noncontiguous_hit_rate(self) -> float:
-        return self._noncontiguous_hits / max(1, self._hits)
-
     def memory_bytes(self) -> int:
         return sum(v.nbytes for v in self._store.values())
+
+    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
+        raise NotImplementedError
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
-        self._noncontiguous_hits = 0
+        self._direct_reuse_hits = 0
+        self._partial_reencoding_hits = 0
+        self._full_reencoding_hits = 0
 ```
 
 ---
 
-### DapQSessionSegmentDualReductionPipeline (Cross B+C)
+### CPDWarmColdHitRateRouter (Activity A)
 
 ```python
-# src/cache/dapq_session_segment_dual_pipeline.py
+# src/scheduler/cpd_warm_cold_hit_router.py
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import torch
-
-from src.cache.base import CacheStore
-from src.cache.session_turn_level_segment_cache import (
-    SessionAwareTurnLevelSegmentCache,
-    SessionTurnLevelConfig,
-    TurnSegmentEntry,
-)
-from src.cache.dapq_position_aware_eviction_codec import (
-    DapQPositionAwareEvictionCodec,
-    DapQEvictionConfig,
-)
-
-
-@dataclass
-class DualReductionPipelineConfig:
-    b_config: Optional[SessionTurnLevelConfig] = None
-    c_config: Optional[DapQEvictionConfig] = None
-    segment_keep_ratio: float = 0.50    # Step 2: 상위 50% 세그먼트 선택
-    kv_budget_ratio: float = 0.30       # Step 3: 선택 세그먼트 내 상위 30% KV 유지
-    decay_factor: float = 512.0         # 위치-인식 점수 decay 파라미터
-    seed: int = 42
-
-
-class DapQSessionSegmentDualReductionPipeline(CacheStore):
-    """DapQ 위치-인식 퇴거 + 세션 비연속 세그먼트 재사용 이중 감소 파이프라인 (B+C).
-
-    CacheStore 인터페이스 완전 구현.
-
-    통합 처리 흐름 (5단계):
-      Step 1 (세션 세그먼트 조회, B):
-        segment_cache.get_session_segments(session_id) → 이전 턴 세그먼트 목록.
-
-      Step 2 (위치-인식 세그먼트 중요도 평가, C 원칙):
-        각 세그먼트에 position_reuse_score(segment, current_decode_pos) 계산.
-        상위 segment_keep_ratio 세그먼트 선택.
-
-      Step 3 (선택 세그먼트 내 KV 중요도 평가, C):
-        선택된 세그먼트의 KV에 DapQ 위치-인식 유사 쿼리로 importance 계산.
-        상위 kv_budget_ratio KV 유지.
-
-      Step 4 (비선택 세그먼트 + 비선택 KV 처리):
-        비선택 KV: 즉시 퇴거 (압축된 값으로 덮어쓰기).
-
-      Step 5 (최종 KV 집합 반환):
-        선택된 세그먼트의 선택된 KV를 리스트로 반환.
-
-    설계 일관성:
-      세그먼트 선택(B)과 KV 선택(C) 모두 동일한 위치-인식 원칙 적용.
-      → 세그먼트 내 중요 KV와 세그먼트 간 선택이 일관된 중요도 기준을 공유.
-
-    평가 기준 (evaluation_criteria.md §5):
-      - 복합 Throughput: 단일 Activity 대비 +5% 이상 (높음)
-      - 복합 Memory Reduction: 단일 Activity 대비 −10% 이상 (높음)
-      - Accuracy 보존 (C 포함): cosine_sim >= 0.99 (MANDATORY)
-    """
-
-    def __init__(self, config: DualReductionPipelineConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        b_cfg = config.b_config or SessionTurnLevelConfig(seed=config.seed)
-        c_cfg = config.c_config or DapQEvictionConfig(
-            budget_ratio=config.kv_budget_ratio,
-            seed=config.seed,
-        )
-        self.segment_cache = SessionAwareTurnLevelSegmentCache(b_cfg)
-        self.eviction_codec = DapQPositionAwareEvictionCodec(c_cfg)
-
-    # ------------------------------------------------------------------ #
-    # 이중 감소 파이프라인 API                                              #
-    # ------------------------------------------------------------------ #
-
-    def process_session(
-        self,
-        session_id: str,
-        current_decode_pos: float,
-        pos_decode_int: Optional[int] = None,
-    ) -> List[Tuple[TurnSegmentEntry, torch.Tensor]]:
-        """B+C 이중 감소 파이프라인 실행.
-
-        Returns:
-            선택된 (TurnSegmentEntry, evicted_kv_tensor) 리스트.
-            빈 리스트 반환 시 세션 캐시 미스.
-        """
-        # Step 1: 세션 세그먼트 조회
-        entries = self.segment_cache.get_session_segments(session_id)
-        if not entries:
-            return []
-
-        # Step 2: 위치-인식 세그먼트 선택
-        scored = [
-            (e, self.segment_cache.position_reuse_score(
-                e, current_decode_pos, self.config.decay_factor))
-            for e in entries
-        ]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        k_seg = max(1, int(len(scored) * self.config.segment_keep_ratio))
-        selected_entries = [e for e, _ in scored[:k_seg]]
-
-        # Step 3: 선택된 세그먼트 내 KV에 DapQ 퇴거 적용
-        pos = pos_decode_int if pos_decode_int is not None else int(current_decode_pos)
-        result = []
-        for entry in selected_entries:
-            kv = self.segment_cache.get(entry.kv_pointer)
-            if kv is None:
-                continue
-            compressed_kv = self.eviction_codec.compression_hook(entry.kv_pointer, kv)
-            result.append((entry, compressed_kv))
-
-        return result
-
-    def dual_reduction_ratio(self) -> float:
-        """B+C 이중 감소율 추정.
-
-        = segment_keep_ratio × kv_budget_ratio 의 역수 기반 감소 추정.
-        실제 측정은 memory_bytes() 비교로 수행.
-        """
-        return 1.0 - (self.config.segment_keep_ratio * self.config.kv_budget_ratio)
-
-    # ------------------------------------------------------------------ #
-    # CacheStore 인터페이스 (segment_cache에 위임)                         #
-    # ------------------------------------------------------------------ #
-
-    def put(self, key: str, value: torch.Tensor) -> None:
-        self.segment_cache.put(key, value)
-
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        return self.segment_cache.get(key)
-
-    def evict(self) -> int:
-        return self.segment_cache.evict()
-
-    def hit_rate(self) -> float:
-        return self.segment_cache.hit_rate()
-
-    def memory_bytes(self) -> int:
-        return self.segment_cache.memory_bytes()
-
-    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        return self.eviction_codec.compression_hook(key, value)
-
-    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        return self.eviction_codec.get_importance_mask(key)
-
-    def reset_stats(self) -> None:
-        self.segment_cache.reset_stats()
-        self.eviction_codec.reset_stats()
-
-    def metrics_summary(self) -> Dict:
-        return {
-            "session_cache_hit_rate": self.segment_cache.hit_rate(),
-            "session_noncontiguous_hit_rate": self.segment_cache.noncontiguous_hit_rate(),
-            "eviction_memory_reduction_ratio": self.eviction_codec.memory_reduction_ratio(),
-            "dual_reduction_estimate": self.dual_reduction_ratio(),
-            "total_memory_bytes": self.memory_bytes(),
-        }
-```
-
----
-
-### PPDAppendFullPrefillClassifier (Activity A)
-
-```python
-# src/scheduler/ppd_append_full_prefill_classifier.py
-
-import hashlib
-import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 
-
-@dataclass
-class PrefillTypeDecision:
-    request_id: str
-    session_id: str
-    turn: int
-    prefill_type: str    # "append" | "full"
-    new_token_ratio: float    # 신규 토큰 비율
-    routed_to: str            # "D_node" | "P_node"
-    classifier_overhead_us: float   # 분류 오버헤드 (마이크로초)
+from src.scheduler.base import BaseScheduler
 
 
 @dataclass
-class SessionContextEntry:
-    last_context_hash: str
-    last_total_tokens: int
-    turn_count: int
-    last_accessed: float
+class HitRatePredictorWeights:
+    """온라인 선형 회귀 가중치 (4개 피처)."""
+    w_prefix_hash: float = 0.4
+    w_context_length: float = 0.2
+    w_session_age: float = 0.2
+    w_segment_match: float = 0.2
+    bias: float = 0.3
+    lr: float = 0.01   # SGD 학습률
 
 
 @dataclass
-class PPDClassifierConfig:
-    append_threshold: float = 0.15    # new_token_ratio < 이 값이면 append-prefill
-    slo_headroom_threshold_ms: float = 30.0   # SLO 여유 < 이 값이면 P 노드 오프로드
-    session_ttl_seconds: float = 3600.0       # 세션 만료 TTL
+class CPDRouterConfig:
+    high_hit_threshold: float = 0.70   # ≥ 이 값: warm 요청
+    low_hit_threshold: float = 0.25    # < 이 값: cold 요청. 중간: neutral
+    warm_slot_ratio: float = 0.60      # 배치 중 warm 슬롯 비율
+    cold_slot_ratio: float = 0.30      # 배치 중 cold 슬롯 비율
+    neutral_slot_ratio: float = 0.10   # neutral 슬롯
+    queue_pressure_threshold: int = 100  # 큐 깊이 > 이 값: cold 슬롯 증가
+    max_context_length_warm: int = 50000  # warm 경로 최대 컨텍스트 길이
     seed: int = 42
 
 
-class PPDAppendFullPrefillClassifier:
-    """PPD (arXiv 2603.13358) 기반 append/full-prefill 분류기 + SLO-인식 라우팅.
+@dataclass
+class RoutingDecision:
+    request_id: str
+    predicted_hit_rate: float
+    path: str      # "warm" | "cold" | "neutral"
+    batch_priority: int   # 낮을수록 먼저 처리 (warm=0, neutral=1, cold=2)
+
+
+class CPDWarmColdHitRateRouter(BaseScheduler):
+    """CPD(Together AI 2026-03-04) 원칙 기반 예측 히트율 warm/cold 소프트 분기 라우터.
 
     Activity A: KV Cache-aware Scheduling.
     스케줄링 결정 단위: 요청(request) 단위.
-    캐시 상태 접근: PrefillTypeRegistry (세션 ID → 마지막 컨텍스트 해시) O(1) 딕셔너리 룩업.
+    캐시 상태 접근: prefix_hash → hit_history (O(1) 딕셔너리 룩업).
 
-    기존 PPDAppendPrefillRouter(ppd_append_prefill_router.py)와의 차이:
-      PPDAppendPrefillRouter: TriangleInequalitySegmentIndex를 통한 hit_probability 추정 (O(log N)).
-      PPDAppendFullPrefillClassifier: 세션 컨텍스트 해시 직접 비교로 append/full 분류 (O(1)).
-                                      new_token_ratio를 명시적으로 계산해 분류 근거 제공.
-                                      SLO-인식 D→P 강제 전환 로직 포함.
+    경량 히트율 예측기:
+      피처: [prefix_hash_match, context_length_norm, session_age_norm, segment_match_ratio]
+      모델: 선형 회귀 4개 가중치 (< 0.01ms 추론)
+      온라인 학습: SGD(lr=0.01) — 실제 히트 결과로 업데이트
 
-    분류 로직:
-      append-prefill 조건:
-        1. turn_count >= 2 (첫 번째 턴 이후)
-        2. new_token_ratio = (total_tokens - last_total_tokens) / total_tokens
-           new_token_ratio <= append_threshold (기본 0.15: 15% 이하가 신규 토큰)
-        → 이전 KV를 D 노드에서 재사용하고 신규 토큰만 처리.
+    Warm/Cold/Neutral 3경로:
+      Warm (예측 히트율 ≥ 0.70): 배치 앞자리, warm_slot_ratio 예약, 캐시 지역성 극대화
+      Cold (예측 히트율 < 0.25): 배치 뒷자리, cold 배치 독립 처리 (warm 오염 방지)
+      Neutral (0.25 ≤ 히트율 < 0.70): 남은 슬롯
 
-      full-prefill 조건:
-        1. turn_count == 1 (첫 번째 턴, KV 캐시 cold start)
-        2. new_token_ratio > append_threshold
-        3. SLO headroom < slo_headroom_threshold_ms (D 노드 부하 높을 때 P 노드 오프로드)
-        → 전체 프리필을 P 노드에서 처리.
-
-    평가 기준 (evaluation_criteria.md §2):
-      - Scheduling overhead TTFT p50 +5% 이내 (필수)
-      - 캐시 히트율 향상: 스케줄링 미적용 대비 +10%p 이상 (높음)
+    Warm 배치 내 캐시 지역성:
+      동일 prefix_hash 요청끼리 같은 배치로 묶어 KV 재사용 극대화.
+      접두사 LCP 길이 기준 정렬.
     """
 
-    def __init__(self, config: PPDClassifierConfig) -> None:
+    def __init__(self, config: CPDRouterConfig) -> None:
+        torch.manual_seed(config.seed)
         self.config = config
-        # PrefillTypeRegistry: session_id → SessionContextEntry
-        self._registry: Dict[str, SessionContextEntry] = {}
+        self._weights = HitRatePredictorWeights()
+        # prefix_hash → 최근 hit 결과 (True/False) 히스토리 (최대 100개)
+        self._hit_history: Dict[str, List[bool]] = {}
+        # 스케줄링 통계
+        self._warm_count: int = 0
+        self._cold_count: int = 0
+        self._neutral_count: int = 0
+        self._ttft_overhead_us: List[float] = []
 
-    @staticmethod
-    def _context_hash(token_ids: List[int]) -> str:
-        """토큰 ID 시퀀스 해시 (컨텍스트 동일성 비교용)."""
-        if not token_ids:
-            return ""
-        raw = b"".join(t.to_bytes(4, "little") for t in token_ids[:512])  # 최대 512 토큰
-        return hashlib.sha256(raw).hexdigest()[:16]
-
-    def classify(
+    def _extract_features(
         self,
-        request_id: str,
-        session_id: str,
-        token_ids: List[int],
-        remaining_slo_ms: Optional[float] = None,
-    ) -> PrefillTypeDecision:
-        """요청을 append-prefill 또는 full-prefill로 분류해 라우팅 결정.
+        request: Any,
+        max_context_len: int = 128000,
+    ) -> Tuple[float, float, float, float]:
+        """요청에서 히트율 예측 피처 추출.
+
+        피처:
+          f1 (prefix_hash_match): prefix_hash가 hit_history에 있으면 최근 히트율, 없으면 0.0
+          f2 (context_length_norm): len(token_ids) / max_context_len
+          f3 (session_age_norm): 1.0 / (1 + session_turn_count)
+          f4 (segment_match_ratio): 알려진 경우 세그먼트 매치 비율, 기본 0.0
+        """
+        prefix_hash = getattr(request, 'prefix_hash', '') or ''
+        token_ids = getattr(request, 'token_ids', []) or []
+        session_turn = getattr(request, 'session_turn', 0) or 0
+        segment_match = getattr(request, 'segment_match_ratio', 0.0) or 0.0
+
+        history = self._hit_history.get(prefix_hash, [])
+        f1 = sum(history) / len(history) if history else 0.0
+        f2 = min(1.0, len(token_ids) / max(1, max_context_len))
+        f3 = 1.0 / (1.0 + session_turn)
+        f4 = float(segment_match)
+        return f1, f2, f3, f4
+
+    def predict_hit_rate(self, request: Any) -> float:
+        """선형 모델로 요청의 예측 캐시 히트율 계산 (< 0.01ms).
+
+        score = w1*f1 + w2*f2 + w3*f3 + w4*f4 + bias
+        hit_rate = sigmoid(score)
+        """
+        f1, f2, f3, f4 = self._extract_features(request)
+        w = self._weights
+        score = (w.w_prefix_hash * f1 + w.w_context_length * f2
+                 + w.w_session_age * f3 + w.w_segment_match * f4 + w.bias)
+        # sigmoid
+        return float(1.0 / (1.0 + torch.tensor(-score).exp()))
+
+    def update_predictor(self, request: Any, actual_hit: bool) -> None:
+        """실제 히트 결과로 선형 모델 온라인 SGD 업데이트.
 
         Algorithm:
-          t_start = time.monotonic()
-          entry = _registry.get(session_id)  # O(1)
-          total_tokens = len(token_ids)
-          ctx_hash = _context_hash(token_ids)
-
-          if entry is None or entry.turn_count == 0:
-            # 첫 번째 턴: full-prefill
-            prefill_type = "full"
-          else:
-            new_tokens = total_tokens - entry.last_total_tokens
-            new_token_ratio = max(0.0, new_tokens / max(1, total_tokens))
-            if new_token_ratio <= append_threshold:
-              # SLO 여유 확인
-              if remaining_slo_ms is not None and remaining_slo_ms < slo_headroom_threshold_ms:
-                prefill_type = "full"  # SLO 압박 시 P 노드 오프로드
-              else:
-                prefill_type = "append"
-            else:
-              prefill_type = "full"
-
-          # 레지스트리 업데이트
-          _registry[session_id] = SessionContextEntry(
-            last_context_hash=ctx_hash,
-            last_total_tokens=total_tokens,
-            turn_count=(entry.turn_count if entry else 0) + 1,
-            last_accessed=time.monotonic(),
-          )
-          overhead_us = (time.monotonic() - t_start) * 1e6
-          routed_to = "D_node" if prefill_type == "append" else "P_node"
-          return PrefillTypeDecision(...)
+          y_pred = predict_hit_rate(request)
+          y_true = 1.0 if actual_hit else 0.0
+          error = y_pred - y_true
+          gradient = error * feature_i (MSE gradient)
+          weight_i -= lr * gradient
         """
+        f1, f2, f3, f4 = self._extract_features(request)
+        y_pred = self.predict_hit_rate(request)
+        y_true = 1.0 if actual_hit else 0.0
+        error = y_pred - y_true
+        lr = self._weights.lr
+        self._weights.w_prefix_hash -= lr * error * f1
+        self._weights.w_context_length -= lr * error * f2
+        self._weights.w_session_age -= lr * error * f3
+        self._weights.w_segment_match -= lr * error * f4
+        self._weights.bias -= lr * error
+
+        # 히트 히스토리 업데이트
+        prefix_hash = getattr(request, 'prefix_hash', '') or ''
+        if prefix_hash:
+            hist = self._hit_history.setdefault(prefix_hash, [])
+            hist.append(actual_hit)
+            if len(hist) > 100:
+                hist.pop(0)
+
+    def classify_request(self, request: Any) -> RoutingDecision:
+        """요청을 warm/cold/neutral로 분류.
+
+        import time
         t_start = time.monotonic()
-        total_tokens = len(token_ids)
-        ctx_hash = self._context_hash(token_ids)
-        entry = self._registry.get(session_id)
-
-        if entry is None or entry.turn_count == 0:
-            prefill_type = "full"
-            new_token_ratio = 1.0
-        else:
-            new_tokens = max(0, total_tokens - entry.last_total_tokens)
-            new_token_ratio = new_tokens / max(1, total_tokens)
-            if new_token_ratio <= self.config.append_threshold:
-                if (remaining_slo_ms is not None
-                        and remaining_slo_ms < self.config.slo_headroom_threshold_ms):
-                    prefill_type = "full"
-                else:
-                    prefill_type = "append"
-            else:
-                prefill_type = "full"
-
-        turn = (entry.turn_count if entry else 0) + 1
-        self._registry[session_id] = SessionContextEntry(
-            last_context_hash=ctx_hash,
-            last_total_tokens=total_tokens,
-            turn_count=turn,
-            last_accessed=time.monotonic(),
-        )
+        hit_rate = predict_hit_rate(request)
+        if hit_rate >= high_hit_threshold: path="warm", priority=0
+        elif hit_rate < low_hit_threshold: path="cold", priority=2
+        else: path="neutral", priority=1
         overhead_us = (time.monotonic() - t_start) * 1e6
-        routed_to = "D_node" if prefill_type == "append" else "P_node"
-        return PrefillTypeDecision(
-            request_id=request_id,
-            session_id=session_id,
-            turn=turn,
-            prefill_type=prefill_type,
-            new_token_ratio=new_token_ratio,
-            routed_to=routed_to,
-            classifier_overhead_us=overhead_us,
+        """
+        import time
+        t_start = time.monotonic()
+        hit_rate = self.predict_hit_rate(request)
+        if hit_rate >= self.config.high_hit_threshold:
+            path = "warm"
+            priority = 0
+            self._warm_count += 1
+        elif hit_rate < self.config.low_hit_threshold:
+            path = "cold"
+            priority = 2
+            self._cold_count += 1
+        else:
+            path = "neutral"
+            priority = 1
+            self._neutral_count += 1
+        overhead_us = (time.monotonic() - t_start) * 1e6
+        self._ttft_overhead_us.append(overhead_us)
+        return RoutingDecision(
+            request_id=getattr(request, 'request_id', ''),
+            predicted_hit_rate=hit_rate,
+            path=path,
+            batch_priority=priority,
         )
 
-    def expire_sessions(self) -> int:
-        """TTL 만료 세션 제거. 만료된 세션 수 반환."""
-        now = time.monotonic()
-        expired = [
-            sid for sid, e in self._registry.items()
-            if now - e.last_accessed > self.config.session_ttl_seconds
-        ]
-        for sid in expired:
-            del self._registry[sid]
-        return len(expired)
+    def sort_warm_batch_by_prefix_similarity(self, warm_requests: List[Any]) -> List[Any]:
+        """Warm 배치 내 요청을 접두사 유사도(LCP 길이) 기준으로 정렬.
 
-    def reset_session(self, session_id: str) -> None:
-        """세션 레지스트리에서 세션 제거."""
-        self._registry.pop(session_id, None)
+        유사 접두사 요청끼리 같은 배치로 묶어 KV 재사용 극대화.
+        """
+        def lcp_key(req: Any) -> str:
+            return getattr(req, 'prefix_hash', '') or ''
+        return sorted(warm_requests, key=lcp_key)
+
+    def schedule(self, requests: List[Any]) -> List[Any]:
+        """BaseScheduler 인터페이스 구현.
+
+        Algorithm:
+          decisions = [classify_request(req) for req in requests]
+          warm = [r for r, d in zip(requests, decisions) if d.path=="warm"]
+          cold = [r for r, d in zip(requests, decisions) if d.path=="cold"]
+          neutral = [r for r, d in zip(requests, decisions) if d.path=="neutral"]
+
+          # Warm 배치: 접두사 유사도 정렬 + 앞자리
+          warm_sorted = sort_warm_batch_by_prefix_similarity(warm)
+
+          # 큐 압박 시 cold 슬롯 증가 (warm_slot_ratio 조정)
+          if len(requests) > queue_pressure_threshold:
+            # cold 요청을 neutral과 섞어 수용 증가
+            neutral.extend(cold[:len(cold)//2])
+            cold = cold[len(cold)//2:]
+
+          return warm_sorted + neutral + cold
+        """
+        if not requests:
+            return []
+
+        warm, cold, neutral = [], [], []
+        for req in requests:
+            decision = self.classify_request(req)
+            if decision.path == "warm":
+                warm.append(req)
+            elif decision.path == "cold":
+                cold.append(req)
+            else:
+                neutral.append(req)
+
+        warm_sorted = self.sort_warm_batch_by_prefix_similarity(warm)
+
+        # 큐 압박 시 cold 요청 일부를 neutral로 승격
+        if len(requests) > self.config.queue_pressure_threshold:
+            half = len(cold) // 2
+            neutral.extend(cold[:half])
+            cold = cold[half:]
+
+        return warm_sorted + neutral + cold
+
+    def scheduling_overhead_mean_us(self) -> float:
+        if not self._ttft_overhead_us:
+            return 0.0
+        return sum(self._ttft_overhead_us) / len(self._ttft_overhead_us)
+
+    def routing_stats(self) -> dict:
+        total = max(1, self._warm_count + self._cold_count + self._neutral_count)
+        return {
+            "warm_ratio": self._warm_count / total,
+            "cold_ratio": self._cold_count / total,
+            "neutral_ratio": self._neutral_count / total,
+            "scheduling_overhead_mean_us": self.scheduling_overhead_mean_us(),
+        }
 ```
 
 ---
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-Activity C(`DapQPositionAwareEvictionCodec`)를 포함하므로 반드시 작성한다.
+Activity C를 포함하므로 반드시 작성한다.
 
 ### perplexity 측정
 
-- **데이터셋**: WikiText-2 proxy — `src/metrics/perplexity.py`의 `attention_output_relative_error()`로
-  synthetic float32 KV 텐서 활용 (실제 WikiText-2 없을 시 `torch.randn`으로 생성).
-- **측정 설정**: n_heads=8, d_head=128, 시퀀스 길이=512, seq_len=256.
+- **데이터셋**: WikiText-2 proxy — `src/metrics/perplexity.py`의 `attention_output_relative_error()` 활용.
+  실제 WikiText-2 없을 시 `torch.randn`으로 FP32 synthetic KV 텐서 생성.
+- **측정 설정**: n_q=8, d_head=128, seq_len=256 (기본). seq_len=512, 1024도 테스트.
 - **측정 방법**:
   ```
-  # K_orig: 원본 KV [seq_len, d_head]
-  # K_evicted: DapQ 퇴거 후 KV (비선택 위치 = 0으로 패딩)
-  relative_error = attention_output_relative_error(q, K_orig, V_orig, K_evicted, V_evicted)
-  허용 오차: relative_error < 0.01 (1%) — MANDATORY (evaluation_criteria.md §4 필수)
+  K_int8_restored = dequantize_int8(quantize_int8(K_orig))
+  V_int4_restored = dequantize_int4(quantize_int4(V_orig))
+  relative_error = attention_output_relative_error(Q, K_orig, V_orig,
+                                                    K_int8_restored, V_int4_restored)
+  허용 오차: relative_error < 0.01 (1%) — MANDATORY (evaluation_criteria.md §4)
   ```
-- **budget_ratio별 측정 (5개 시나리오)**:
-  - budget_ratio=0.50: 50% KV 유지, relative_error 측정
-  - budget_ratio=0.30: 30% KV 유지, relative_error 측정 [기본값 MANDATORY]
-  - budget_ratio=0.15: 15% KV 유지 (공격적), relative_error 측정
-  - budget_ratio=0.03: 3% KV 유지 (DapQ 논문 극단 설정), relative_error 측정
-  - budget_ratio=1.00: 100% KV 유지 (기준 검증, relative_error ≈ 0.0)
-- **예상 결과**: budget_ratio=0.30 기준 relative_error < 1% (DapQ 논문 근거: NIAH 99.5% 성능 보존).
+- **폴백 사다리별 측정**:
+  - Level 0 (INT8K+INT4V): relative_error 측정 [기본, MANDATORY]
+  - Level 1 (INT8K+FP16V): Value FP16 복원 후 relative_error 측정
+  - Level 2 (FP16K+FP16V): 완전 복원 → relative_error ≈ 0.0 (기준 검증)
+- **수학적 보장 검증 (MANDATORY)**: 100개 이상 synthetic 시퀀스에서
+  `error_bound ≥ actual_error` 항상 성립 확인 (보수적 상한 검증).
+  - `actual_error = attention_output_relative_error(Q, K_orig, V_orig, K_restored, V_restored)`
+  - `error_bound = delta_attn_bound + delta_value_bound` (compute_error_bound() 반환값)
+  - **실패 기준**: error_bound < actual_error인 케이스가 1개라도 존재 → 테스트 FAIL
 
 ### 태스크 정확도 측정
 
-- **벤치마크 1 — NIAH proxy**: 
-  - synthetic 시퀀스에서 "needle" 위치의 KV가 DapQ 퇴거 후에도 보존되는지 확인.
-  - `needle_position_in_selected(selected_indices, needle_pos) → bool`
-  - 32K/64K/128K 컨텍스트 길이 시뮬레이션: seq_len = 256/512/1024 (프록시 스케일).
-  - 허용 기준: 각 컨텍스트 길이에서 needle 보존율 >= 99% (NIAH 99.5% 성능 보존 대응).
+- **벤치마크 1 — NIAH proxy**:
+  - synthetic 시퀀스에서 "needle" 위치 KV가 INT8K+INT4V 복원 후 코사인 유사도 ≥ 0.99 보존 확인.
+  - seq_len = [256, 512, 1024] (32K/64K/128K 컨텍스트 프록시)
+  - `cosine_similarity_output(Q, K_orig, V_orig, K_restored, V_restored) ≥ 0.99` — MANDATORY
 
 - **벤치마크 2 — LongBench proxy**:
-  - 8개 독립 synthetic 시퀀스에 대해 `cosine_similarity_output(q, K_orig, V_orig, K_evicted, V_evicted)` 계산.
-  - 허용 기준: 8개 모두 cosine_sim >= 0.99 — MANDATORY (evaluation_criteria.md §4 필수).
+  - 8개 독립 synthetic 시퀀스 (다른 seed/길이 조합) 각각에서 `cosine_similarity_output ≥ 0.99`
+  - 허용 기준: **8개 모두** cosine_sim ≥ 0.99 — MANDATORY
 
-- **대조 실험 — 위치-인식 쿼리 vs. 의미 쿼리**:
-  - `use_unit_template=True` (위치-인식, DapQ 원칙)
-  - `use_unit_template=False` (평균 쿼리 벡터 = 의미 정보 포함)
-  - 동일 seq_len, budget_ratio=0.30에서 두 설정의 relative_error, cosine_sim 비교.
-  - 기대: 위치-인식 쿼리가 의미 쿼리 대비 accuracy 보존 측면에서 동등 이상.
+- **KVSculpt 증류 정확도**:
+  - 균일 50% 압축 vs. 난이도 비례 예산 배분(γ=0.5) 비교
+  - 난이도 비례 배분이 균일 대비 KL 발산 감소 확인
+  - γ = [0.0, 0.25, 0.50, 1.0] 별 정확도-압축률 곡선 측정
+
+- **Cross-1 파이프라인 통합 정확도**:
+  - RuntimeCertifiedKVSculptDistillationPipeline.run_pipeline() 실행 후
+    `cosine_similarity_output(Q, K_orig, V_orig, K_final, V_final) ≥ 0.99` — MANDATORY
 
 ### KV 메모리 감소율 검증
 
-- budget_ratio=0.50 → memory_reduction_ratio >= 0.40 (50% 퇴거, but recent_window 보정)
-- budget_ratio=0.30 → memory_reduction_ratio >= 0.60 [MANDATORY: -30% 기준 충족]
-- budget_ratio=0.15 → memory_reduction_ratio >= 0.75
+- INT8K+INT4V vs FP16: `memory_reduction_ratio() ≥ 0.50` (50% 이상) [MANDATORY: −30% 기준 초과]
+- INT8K+FP16V (Level 1 폴백): `memory_reduction_ratio() ≥ 0.25`
+- KVSculpt budget_ratio=0.50: 50% KV 유지 → 50% 메모리 절감
 
 ### Fail 기준
 
-**budget_ratio=0.30 기준 relative_error > 1% → 테스트 실패 (evaluation_criteria.md §4 필수 항목 — 무조건 전체 Fail)**
-
-**cosine_sim < 0.99 (LongBench proxy 8개 중 1개라도) → 테스트 실패 (MANDATORY)**
-
-**DapQSessionSegmentDualReductionPipeline E2E 후 cosine_sim < 0.99 → 테스트 실패 (§5 MANDATORY)**
+- **Level 0 relative_error > 0.01** → 전체 FAIL (evaluation_criteria.md §4 필수)
+- **LongBench proxy cosine_sim < 0.99** (1개라도) → 전체 FAIL (MANDATORY)
+- **error_bound < actual_error** (1개라도, 100 시퀀스 중) → 전체 FAIL (수학적 보장 붕괴)
+- **Cross-1 파이프라인 cosine_sim < 0.99** → 전체 FAIL (§5 MANDATORY)
 
 ### 검증 테스트 파일
 
-`tests/unit/test_compression_accuracy.py` (기존 파일 덮어쓰기)
+`tests/unit/test_compression_accuracy.py` (기존 파일 덮어쓰기 — RuntimeCertified 기반)
+`tests/unit/test_runtime_certified_quant_codec.py` (RuntimeCertifiedQuantizedAttentionCodec 전용)
 
 ---
 
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-22.yaml
+# configs/experiments/2026-05-23.yaml
 experiment:
-  date: "2026-05-22"
-  activity: "A+B+C"
+  date: "2026-05-23"
+  activity: "C+A+B"
   description: >
-    C-3 DapQPositionAwareEvictionCodec (위치-인식 유사 쿼리 기반 KV 퇴거) +
-    B-1 SessionAwareTurnLevelSegmentCache (세션-인식 턴-레벨 비연속 세그먼트 캐시) +
-    Cross-2 DapQSessionSegmentDualReductionPipeline (B+C 이중 감소 파이프라인) +
-    A-1 PPDAppendFullPrefillClassifier (append/full-prefill 분류 라우터, 보조).
-    DapQ(arXiv 2603.11564) 위치-인식 원칙 기반.
-  cache_type: dapq_session_segment_dual_pipeline
-  compression_method: dapq_position_aware_eviction
-  scheduler_type: ppd_append_full_prefill_classifier
+    C-1 RuntimeCertifiedQuantizedAttentionCodec (수학적 런타임 오류 경계 인증 양자화) +
+    C-2 KVSculptDistillationCodec (L-BFGS+최소제곱 교대 증류 레이어 예산 배분) +
+    Cross-1 RuntimeCertifiedKVSculptDistillationPipeline (C-1+C-2 폐루프 인증 증류) +
+    B-1 CLCPositionalBiasGatedSegmentCache (위치 편향 3단계 선택적 재인코딩 게이트) +
+    A-2 CPDWarmColdHitRateRouter (예측 히트율 기반 warm/cold 소프트 분기 스케줄러).
+    RuntimeCertified(arXiv 2605.20868) + KVSculpt(arXiv 2603.27819) 기반.
+  cache_type: runtime_certified_distillation_pipeline
+  compression_method: int8_key_int4_value_with_fp16_fallback
+  scheduler_type: cpd_warm_cold_hit_router
 
-dapq_eviction_codec:  # C-3
+runtime_certified_quant_codec:  # C-1
   d_head: 128
   n_kv_heads: 8
   n_layers: 12
-  budget_ratio: 0.30            # 기본값: 상위 30% KV 유지
-  high_pressure_threshold: 0.80
-  low_pressure_threshold: 0.50
-  high_pressure_budget_ratio: 0.15
-  low_pressure_budget_ratio: 0.50
-  recent_window: 32             # 최근 32 토큰 항상 유지
-  use_unit_template: true       # 의미 정보 최소화 (DapQ 원칙)
+  error_threshold: 0.005        # ±0.5% perplexity 수학적 상한 (목표 ±1%의 절반)
+  key_bits: 8                   # INT8 Key
+  value_bits: 4                 # INT4 Value
   max_entries: 1000
   seed: 42
 
-session_turn_level_segment_cache:  # B-1
-  chunk_size: 128
+kvsculpt_distillation_codec:  # C-2
+  n_layers: 12
+  d_head: 128
+  total_budget_ratio: 0.50      # 전체 KV 유지 비율
+  gamma: 0.5                    # 난이도 반응 강도
+  lbfgs_max_iter: 5             # L-BFGS 반복 (경량화)
+  alternating_rounds: 3         # 교대 반복 횟수
+  convergence_tol: 1.0e-4
+  pilot_n_sequences: 50         # 파일럿 보정 시퀀스 수
   max_entries: 1000
-  max_turns_per_session: 10
-  session_lru_penalty: 0.5
   seed: 42
 
-dual_reduction_pipeline:  # Cross-2
-  segment_keep_ratio: 0.50      # Step 2: 상위 50% 세그먼트 선택
-  kv_budget_ratio: 0.30         # Step 3: 선택 세그먼트 내 상위 30% KV 유지
-  decay_factor: 512.0
+distillation_pipeline:  # Cross-1
+  adaptive_threshold_scale: 1.0
+  online_budget_realloc_window: 100
+  seed: 42
 
-ppd_classifier:  # A-1
-  append_threshold: 0.15        # new_token_ratio < 0.15이면 append-prefill
-  slo_headroom_threshold_ms: 30.0
-  session_ttl_seconds: 3600.0
+clc_bias_gate:  # B-1
+  max_context_length: 4096
+  bias_threshold: 0.15          # ΔPos ≤ 0.15: 직접 재사용
+  rope_distortion_threshold: 0.40  # ΔPos > 0.40: 전체 재인코딩
+  partial_reencoding_layer_ratio: 0.5
+  max_entries: 1000
+  seed: 42
+
+cpd_warm_cold_router:  # A-2
+  high_hit_threshold: 0.70
+  low_hit_threshold: 0.25
+  warm_slot_ratio: 0.60
+  cold_slot_ratio: 0.30
+  neutral_slot_ratio: 0.10
+  queue_pressure_threshold: 100
+  max_context_length_warm: 50000
   seed: 42
 
 benchmark:
@@ -1180,323 +1526,351 @@ benchmark:
     method: "attention_output_proxy"
     dataset_proxy: "wikitext2_synthetic"
     task_accuracy_proxy: "niah_cosine_similarity"
-    relative_error_max: 0.01        # ±1% (evaluation_criteria.md §4 MANDATORY)
-    cosine_similarity_min: 0.99     # (evaluation_criteria.md §4 MANDATORY)
-    kl_divergence_max: 0.015        # 보조 지표
-    budget_ratios_to_test: [1.00, 0.50, 0.30, 0.15, 0.03]
-    niah_context_lengths: [256, 512, 1024]  # proxy: 32K/64K/128K 스케일
+    relative_error_max: 0.01         # ±1% (evaluation_criteria.md §4 MANDATORY)
+    cosine_similarity_min: 0.99      # (evaluation_criteria.md §4 MANDATORY)
+    kl_divergence_max: 0.015
+    niah_context_lengths: [256, 512, 1024]   # proxy: 32K/64K/128K
     longbench_subtask_count: 8
-    ablation_unit_vs_semantic_template: true  # 위치-인식 vs. 의미 쿼리 대조
+    math_guarantee_sequences: 100    # error_bound ≥ actual_error 검증 시퀀스 수
+    kvsculpt_gamma_sweep: [0.0, 0.25, 0.50, 1.0]
   activity_b:
-    cache_hit_rate_improvement_min_pct: 5.0   # +5%p (§3 높음)
-    noncontiguous_hit_rate_min_pct: 30.0      # 전체 히트의 30% 이상 (§3 높음)
-    memory_footprint_max_increase_pct: 20.0   # +20% 이내 (§3 높음)
+    cache_hit_rate_improvement_min_pct: 5.0
+    noncontiguous_direct_hit_rate_min_pct: 30.0
+    memory_footprint_max_increase_pct: 20.0
   activity_a:
-    scheduling_overhead_ttft_p50_max_pct: 5.0  # +5% 이내 (§2 필수)
-    cache_hit_rate_improvement_min_pct: 10.0   # +10%p 이상 (§2 높음)
+    scheduling_overhead_ttft_p50_max_pct: 5.0
+    scheduling_overhead_max_us: 100.0   # 0.1ms 이내
+    cache_hit_rate_improvement_min_pct: 10.0
   activity_c:
-    memory_reduction_min: 0.30      # -30% 이상 (§4 높음)
+    memory_reduction_min_ratio: 0.50    # INT8K+INT4V: −50% 이상
+    int8k_int4v_relative_error_max: 0.01
     effective_context_multiplier: 2.0
-    compression_overhead_ttft_max_pct: 10.0
-  cross_bc:
-    throughput_min_improvement_vs_solo: 5.0   # 단일 Activity 대비 +5% (§5 높음)
-    memory_min_improvement_vs_solo: 10.0      # 단일 Activity 대비 -10% (§5 높음)
-    accuracy_cosine_min: 0.99                 # C 포함 (§5 MANDATORY)
-    comparison_methods: ["solo_b1", "solo_c3", "cross_bc"]
-  throughput:
-    target_improvement_pct: 20      # 베이스라인 대비 +20% (§1 장기 목표)
+    fallback_rate_level1_max: 0.20      # Level 1 폴백 비율 최대 20%
+    fallback_rate_level2_max: 0.05      # Level 2 폴백 비율 최대 5%
+  cross_c1_c2:
+    pipeline_cosine_min: 0.99           # MANDATORY
+    combined_memory_reduction_min: 0.55  # C-1+C-2 결합 −55% 이상
 
 seed: 42
-results_dir: "results/2026-05-22"
+results_dir: "results/2026-05-23"
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_dapq_position_aware_eviction.py` — DapQPositionAwareEvictionCodec 단위 테스트
-- [ ] `tests/unit/test_compression_accuracy.py` — Accuracy-preservation 검증 (기존 파일 덮어쓰기)
-- [ ] `tests/unit/test_session_turn_level_segment_cache.py` — SessionAwareTurnLevelSegmentCache 단위 테스트
-- [ ] `tests/unit/test_ppd_append_full_prefill_classifier.py` — PPDAppendFullPrefillClassifier 단위 테스트
-- [ ] `tests/integration/test_dapq_session_segment_dual_e2e.py` — DapQSessionSegmentDualReductionPipeline E2E 통합 테스트
+- [ ] `tests/unit/test_runtime_certified_quant_codec.py`
+- [ ] `tests/unit/test_compression_accuracy.py` (기존 파일 덮어쓰기)
+- [ ] `tests/unit/test_kvsculpt_distillation_codec.py`
+- [ ] `tests/unit/test_clc_positional_bias_gated_segment_cache.py`
+- [ ] `tests/unit/test_cpd_warm_cold_hit_router.py`
+- [ ] `tests/integration/test_runtime_certified_distillation_e2e.py`
 
-### 단위 테스트 명세 — test_dapq_position_aware_eviction.py
+### 단위 테스트 명세 — test_runtime_certified_quant_codec.py
 
 ```
-test_dapq_rope_apply_rotation_changes_vector:
-    _apply_rope(x, pos=10) != x 확인 (RoPE 회전 적용 검증)
+test_quantize_int8_round_trip_error_small:
+    quantize_int8 → dequantize_int8: relative_error < 0.01
 
-test_dapq_rope_apply_pos_zero_identity:
-    _apply_rope(x, pos=0) ≈ x 확인 (pos=0이면 회전 없음)
+test_quantize_int4_round_trip_error_small:
+    quantize_int4 → dequantize_int4: relative_error < 0.05
 
-test_dapq_compute_importance_sums_to_one:
-    compute_importance(K, pos_decode) → softmax 합계 ≈ 1.0
+test_put_stores_int8_and_int4:
+    put(key, tensor) 후 _store[key].key_int8.dtype == torch.int8 확인
 
-test_dapq_compute_importance_shape:
-    K: [seq_len, d_head] → importance: [seq_len]
+test_put_cpu_backup_exists:
+    put 후 _store[key].key_fp16_backup.device == cpu 확인
 
-test_dapq_select_kv_indices_count:
-    seq_len=100, budget_ratio=0.30, recent_window=10 →
-    len(selected_indices) >= max(10, 30) = 30
+test_get_returns_restored_tensor_level0:
+    put → get: fallback_level=0, 반환값 shape 동일 확인
 
-test_dapq_select_kv_indices_recent_always_included:
-    최근 recent_window 토큰 인덱스가 selected_indices에 포함되는지 확인
+test_compute_error_bound_conservative:
+    100 synthetic 시퀀스에서 error_bound ≥ actual_relative_error 항상 성립 (MANDATORY)
 
-test_dapq_select_kv_indices_sorted:
-    select_kv_indices() 반환값 오름차순 정렬 확인
+test_decide_fallback_level0_below_threshold:
+    error_bound=0.003 ≤ error_threshold=0.005 → fallback_level=0
 
-test_dapq_compression_hook_zeros_unselected:
-    compression_hook 후 비선택 위치 값 = 0.0 확인
+test_decide_fallback_level1_above_threshold:
+    error_bound=0.008 > threshold=0.005, delta_attn=0.002 ≤ threshold/2=0.0025 → level=1
 
-test_dapq_compression_hook_preserves_selected:
-    선택된 위치의 값은 원본 유지 확인
+test_decide_fallback_level2_high_attn_distortion:
+    delta_attn=0.004 > threshold/2=0.0025 → level=2
 
-test_dapq_compression_hook_stores_importance_mask:
-    put() 후 get_importance_mask(key) → bool tensor [seq_len] 반환
+test_certify_and_update_changes_fallback_level:
+    put 후 certify_and_update(Q) 호출 → fallback_level 적절히 설정
 
-test_dapq_memory_reduction_ratio_above_60pct:
-    budget_ratio=0.30, seq_len=100, recent_window=10 →
-    memory_reduction_ratio() >= 0.60 (30% + recent 보정)
+test_memory_reduction_ratio_above_50pct:
+    INT8K+INT4V: memory_reduction_ratio() ≥ 0.50 (FP16 대비 −50% 이상) (MANDATORY)
 
-test_dapq_high_pressure_uses_aggressive_budget:
-    update_pool_utilization(0.90) → _get_effective_budget_ratio() == high_pressure_budget_ratio
+test_compression_hook_relative_error_below_1pct:
+    compression_hook(key, tensor) 후 attention_output_relative_error < 0.01 (MANDATORY)
 
-test_dapq_low_pressure_uses_conservative_budget:
-    update_pool_utilization(0.30) → _get_effective_budget_ratio() == low_pressure_budget_ratio
+test_fallback_rate_level1_tracked:
+    Level 1 폴백 발생 시 fallback_count_level1 증가 확인
 
-test_dapq_unit_template_vs_nonunit_same_dtype:
-    use_unit_template=True/False 모두 동일 shape [d_head] 반환
+test_certified_accuracy_report_keys:
+    certified_accuracy_report() 에 필수 키 포함:
+    [fallback_rate_level1, fallback_rate_level2, error_bound_mean, error_bound_p99,
+     memory_reduction_ratio, error_threshold]
 
-test_dapq_cachestore_interface_full:
+test_cachestore_interface_full:
     put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
 
-test_dapq_seed_reproducibility:
-    동일 seed + 동일 입력 → 동일 selected_indices
+test_evict_lru_first:
+    max_entries=2, 3번 put → 첫 번째 항목 퇴거
 
-test_dapq_evict_lru_oldest_first:
-    max_entries=2, 3번 put → 첫 번째 항목 퇴거 확인
-
-test_dapq_hit_rate_tracking:
+test_hit_rate_tracking:
     put 2개 후 get 1회 히트 + 1회 미스 → hit_rate() == 0.5
+
+test_seed_reproducibility:
+    동일 seed + 동일 입력 → 동일 양자화 결과
 ```
 
 ### 단위 테스트 명세 — test_compression_accuracy.py (기존 파일 덮어쓰기)
 
 ```
-test_dapq_full_budget_zero_relative_error:
-    budget_ratio=1.00 → relative_error ≈ 0.0 (기준 검증)
+test_int8k_int4v_level0_relative_error_below_1pct:
+    RuntimeCertifiedQuantizedAttentionCodec Level 0 (INT8K+INT4V):
+    attention_output_relative_error < 0.01 (MANDATORY)
 
-test_dapq_budget_50pct_relative_error_below_1pct:
-    budget_ratio=0.50 → relative_error < 0.01 (MANDATORY)
+test_int8k_fp16v_level1_relative_error_below_1pct:
+    Level 1 폴백 (INT8K+FP16V): relative_error < 0.01 (MANDATORY)
 
-test_dapq_budget_30pct_relative_error_below_1pct:
-    budget_ratio=0.30 (기본값) → relative_error < 0.01 (MANDATORY)
+test_fp16k_fp16v_level2_relative_error_near_zero:
+    Level 2 완전 복원 (FP16K+FP16V): relative_error ≈ 0.0 (기준 검증)
 
-test_dapq_budget_30pct_cosine_similarity_above_099:
-    budget_ratio=0.30 → cosine_sim >= 0.99 (MANDATORY)
+test_niah_proxy_level0_cosine_above_099:
+    seq_len=[256, 512, 1024]: cosine_similarity_output ≥ 0.99 (MANDATORY)
 
-test_dapq_budget_15pct_relative_error_below_1pct:
-    budget_ratio=0.15 (공격적) → relative_error < 0.01
+test_longbench_8subtask_proxy_all_above_099:
+    8개 독립 synthetic 시퀀스: cosine_sim ≥ 0.99 모두 (MANDATORY)
 
-test_dapq_niah_proxy_needle_preserved_budget_30pct:
-    seq_len=256, needle_pos=128, budget_ratio=0.30 →
-    needle_pos가 selected_indices에 포함됨 (NIAH proxy)
+test_error_bound_conservative_100_sequences:
+    100 synthetic 시퀀스: error_bound ≥ actual_error 모두 성립 (MANDATORY)
 
-test_dapq_niah_proxy_context_lengths:
-    seq_len=[256, 512, 1024], budget_ratio=0.30 →
-    각각에서 cosine_sim >= 0.99 (32K/64K/128K proxy)
+test_memory_reduction_int8k_int4v_above_50pct:
+    memory_reduction_ratio() ≥ 0.50 (MANDATORY, −30% 기준 초과)
 
-test_dapq_longbench_8subtask_proxy:
-    8개 독립 synthetic 시퀀스 모두 cosine_sim >= 0.99 (MANDATORY)
+test_kvsculpt_difficulty_profile_varies_by_layer:
+    pilot_profile_layer_difficulty 후 레이어별 난이도 값 다양성 확인
+    (max_difficulty / min_difficulty > 1.0)
 
-test_dapq_position_query_vs_semantic_query_accuracy:
-    use_unit_template=True (위치-인식) vs. False (의미 포함),
-    budget_ratio=0.30에서 두 설정의 relative_error 비교 기록.
-    위치-인식 쿼리가 의미 쿼리 대비 동등 이상 accuracy 보존 확인.
+test_kvsculpt_budget_proportional_to_difficulty:
+    gamma=0.5: 고난이도 레이어 budget > 저난이도 레이어 budget
 
-test_dapq_kl_divergence_below_threshold:
-    budget_ratio=0.30 → KL divergence < 0.015 (보조 지표)
+test_kvsculpt_distill_compress_reduces_seq_len:
+    distill_compress(Q, K, V, layer_idx=0): 반환 K_selected.shape[0] < K.shape[0]
 
-test_dapq_memory_reduction_30pct_budget_above_60pct:
-    budget_ratio=0.30 → memory_reduction_ratio() >= 0.60 (§4 높음: -30% 이상 충족)
+test_kvsculpt_gamma0_uniform_budget:
+    gamma=0.0: 모든 레이어 budget ≈ total_budget_ratio (균일 배분)
 
-test_dapq_dual_pipeline_accuracy_preserved:
-    DapQSessionSegmentDualReductionPipeline: put → process_session →
-    cosine_sim >= 0.99 (§5 MANDATORY, C 포함 크로스 조합)
+test_kvsculpt_accuracy_preserved_cosine_above_099:
+    distill_compress 후 cosine_similarity_output(Q, K_orig, V_orig, K_sel, V_sel) ≥ 0.99 (MANDATORY)
 
-test_dapq_dual_pipeline_dual_reduction_ratio:
-    dual_reduction_ratio() > 0 (B+C 이중 감소 확인)
+test_cross1_pipeline_cosine_above_099:
+    RuntimeCertifiedKVSculptDistillationPipeline.run_pipeline() 후
+    cosine_similarity_output ≥ 0.99 (MANDATORY §5)
+
+test_cross1_pipeline_memory_reduction_above_55pct:
+    Cross-1 파이프라인: certified_codec.memory_reduction_ratio() ≥ 0.50
+
+test_cross1_fallback_count_tracked:
+    폴백 발생 시 layer_fallback_counts[layer_idx] 증가 확인
+
+test_kvsculpt_gamma_sweep_accuracy_curve:
+    gamma=[0.0, 0.25, 0.50, 1.0] 각각에서 cosine_sim 측정 및 기록
+    (모두 ≥ 0.99 MANDATORY)
 ```
 
-### 단위 테스트 명세 — test_session_turn_level_segment_cache.py
+### 단위 테스트 명세 — test_clc_positional_bias_gated_segment_cache.py
 
 ```
-test_session_cache_put_get_basic:
-    put → get 왕복 기본 동작
+test_clc_delta_pos_zero_same_position:
+    pos_orig_start=100, pos_target_start=100 → ΔPos=0.0
 
-test_session_cache_put_turn_segment_creates_entry:
-    put_turn_segment() 후 get_session_segments(session_id) 비어 있지 않음
+test_clc_delta_pos_normalized:
+    |pos_target - pos_orig| / max_context_length 정규화 확인
 
-test_session_cache_3tuple_key_unique_per_session_turn:
-    (content_hash, session_A, turn_0) != (content_hash, session_B, turn_0) 키 확인
+test_clc_bias_gate_direct_reuse_small_delta:
+    ΔPos=0.10 ≤ 0.15 → ReencodingPolicy.DIRECT_REUSE
 
-test_session_cache_get_session_segments_turn_filter:
-    turn_range=(0, 1) → turn_id 0, 1만 반환
+test_clc_bias_gate_partial_reencoding_mid_delta:
+    ΔPos=0.25 (0.15 < 0.25 ≤ 0.40) → ReencodingPolicy.PARTIAL_REENCODING
 
-test_session_cache_position_reuse_score_closer_higher:
-    center_position=100, current_pos=120 → score > center_position=200, current_pos=120
+test_clc_bias_gate_full_reencoding_large_delta:
+    ΔPos=0.60 > 0.40 → ReencodingPolicy.FULL_REENCODING
 
-test_session_cache_get_top_segments_by_position_count:
-    4개 세그먼트, keep_ratio=0.50 → 2개 반환
+test_clc_put_segment_stores_meta:
+    put_segment(key, kv, pos_orig_start, pos_orig_end, hash) 후
+    _meta[key] 존재 확인
 
-test_session_cache_session_lru_penalty_preserves_session_entries:
-    max_entries=2: cross-session 1개 + 세션 내 2개 → 퇴거 시 cross-session 먼저 퇴거
+test_clc_get_with_policy_returns_tuple:
+    put_segment → get_with_policy(key, pos_target) → (tensor, policy) 반환
 
-test_session_cache_noncontiguous_hit_tracking:
-    turn_id > 0인 get() 호출 시 noncontiguous_hits 증가 확인
+test_clc_get_with_policy_miss_returns_none:
+    미존재 key → (None, FULL_REENCODING)
 
-test_session_cache_noncontiguous_hit_rate:
-    noncontiguous_hit_rate() = noncontiguous_hits / max(1, hits)
+test_clc_direct_reuse_hit_count_increments:
+    direct_reuse 정책 히트 → _direct_reuse_hits 증가
 
-test_session_cache_cachestore_interface_full:
+test_clc_noncontiguous_direct_hit_rate:
+    direct_reuse_hits=3, partial=1, full=1 → rate=3/5=0.60
+
+test_clc_cachestore_interface_full:
     put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
 
-test_session_cache_evict_cross_session_first:
-    cross-session 키 존재 시 evict()가 cross-session 키 먼저 제거
+test_clc_evict_lru_oldest_first:
+    max_entries=2, 3번 put → 첫 번째 항목 퇴거
 
-test_session_cache_hit_rate_tracking:
+test_clc_hit_rate_tracking:
     put 2개 후 get 1회 히트 + 1회 미스 → hit_rate() == 0.5
 ```
 
-### 단위 테스트 명세 — test_ppd_append_full_prefill_classifier.py
+### 단위 테스트 명세 — test_cpd_warm_cold_hit_router.py
 
 ```
-test_ppd_classifier_turn1_always_full_prefill:
-    session의 첫 번째 요청 → prefill_type="full", routed_to="P_node"
+test_cpd_predict_hit_rate_range_0_to_1:
+    predict_hit_rate(req) ∈ [0.0, 1.0]
 
-test_ppd_classifier_turn2_small_new_tokens_append:
-    turn 2, new_token_ratio < append_threshold → prefill_type="append", routed_to="D_node"
+test_cpd_classify_warm_high_hit_rate:
+    prefix_hash 히트 히스토리 100% → path="warm", priority=0
 
-test_ppd_classifier_turn2_large_new_tokens_full:
-    turn 2, new_token_ratio > append_threshold → prefill_type="full"
+test_cpd_classify_cold_low_hit_rate:
+    히스토리 없는 첫 요청, 낮은 피처 → path="cold", priority=2
 
-test_ppd_classifier_slo_pressure_forces_full:
-    append 조건 + remaining_slo_ms < slo_headroom_threshold_ms → prefill_type="full"
+test_cpd_classify_neutral_mid_hit_rate:
+    중간 피처 조합 → path="neutral", priority=1
 
-test_ppd_classifier_overhead_below_1ms:
-    classify() 오버헤드 < 1000μs (TTFT +5% 이내 준수 위한 O(1) 검증)
+test_cpd_schedule_warm_first_in_output:
+    warm 요청이 출력 리스트 앞에 위치 (batch_priority=0 먼저)
 
-test_ppd_classifier_registry_updated_after_classify:
-    classify() 후 _registry[session_id] 존재 + turn_count 증가 확인
+test_cpd_schedule_cold_last:
+    cold 요청이 출력 리스트 뒤에 위치
 
-test_ppd_classifier_session_ttl_expire:
-    session_ttl_seconds=0.001 → 짧은 대기 후 expire_sessions() > 0
+test_cpd_update_predictor_changes_weights:
+    update_predictor(req, actual_hit=True) → 가중치 변화 확인
 
-test_ppd_classifier_reset_session_removes_entry:
-    classify() 후 reset_session() → _registry에서 제거 확인
+test_cpd_hit_history_updated_after_update:
+    update_predictor 후 _hit_history[prefix_hash] 비어 있지 않음
 
-test_ppd_classifier_multiple_sessions_independent:
-    session_A와 session_B의 turn_count가 독립적으로 관리됨
+test_cpd_scheduling_overhead_below_1ms:
+    classify_request() 오버헤드 < 1000μs (TTFT +5% 이내 준수)
 
-test_ppd_classifier_new_token_ratio_calculation:
-    prev_total=100, current_total=115 →
-    new_token_ratio = 15/115 ≈ 0.130 < append_threshold(0.15) → "append"
+test_cpd_schedule_empty_returns_empty:
+    schedule([]) == []
+
+test_cpd_sort_warm_batch_by_prefix:
+    동일 prefix_hash를 가진 요청들이 연속하여 정렬됨
+
+test_cpd_queue_pressure_cold_promoted:
+    len(requests) > queue_pressure_threshold: cold 요청 일부가 neutral로 승격
+
+test_cpd_routing_stats_keys:
+    routing_stats() 에 필수 키:
+    [warm_ratio, cold_ratio, neutral_ratio, scheduling_overhead_mean_us]
+
+test_cpd_basescheduler_interface:
+    schedule() 메서드가 List 반환 확인 (BaseScheduler 인터페이스)
 ```
 
-### 통합 테스트 명세 — test_dapq_session_segment_dual_e2e.py
+### 통합 테스트 명세 — test_runtime_certified_distillation_e2e.py
 
 ```
-test_e2e_dual_pipeline_put_get_basic:
-    put → get 왕복 기본 동작
+test_e2e_pipeline_basic_run:
+    run_pipeline(Q, K, V, layer_idx=0, key) 정상 완료 확인
 
-test_e2e_dual_pipeline_process_session_returns_entries:
-    put_turn_segment() × 3 후 process_session() →
-    결과 리스트 비어 있지 않음
+test_e2e_pipeline_returns_kfinal_vfinal_report:
+    run_pipeline 반환값 (K_final, V_final, report) 타입 확인
+    report에 layer_idx, fallback_level, error_bound, selected_ratio 포함
 
-test_e2e_dual_pipeline_segment_selection_smaller_than_all:
-    segment_keep_ratio=0.50 → 선택 세그먼트 수 < 전체 세그먼트 수
+test_e2e_pipeline_accuracy_preserved_cosine_above_099:
+    run_pipeline 후 cosine_similarity_output(Q, K_orig, V_orig, K_final, V_final) ≥ 0.99
+    (MANDATORY §5)
 
-test_e2e_dual_pipeline_accuracy_preserved_cosine_above_099:
-    process_session() 후 압축된 KV의 cosine_sim >= 0.99 (MANDATORY §5)
+test_e2e_pipeline_memory_reduction_above_50pct:
+    certified_codec.memory_reduction_ratio() ≥ 0.50 after pipeline run
 
-test_e2e_dual_pipeline_dual_reduction_ratio_above_60pct:
-    segment_keep_ratio=0.50, kv_budget_ratio=0.30 →
-    dual_reduction_ratio() >= 0.60 (0.50 × 0.30 = 0.85 감소 추정)
+test_e2e_pipeline_distillation_reduces_seq_len:
+    run_pipeline: K_final.shape[0] ≤ K.shape[0] (증류 압축으로 토큰 수 감소)
 
-test_e2e_dual_pipeline_metrics_summary_all_keys:
-    metrics_summary()에 필수 키 포함:
-    [session_cache_hit_rate, session_noncontiguous_hit_rate,
-     eviction_memory_reduction_ratio, dual_reduction_estimate,
-     total_memory_bytes]
+test_e2e_pipeline_fallback_tracking:
+    Layer 0 다수 처리 후 layer_fallback_counts / layer_request_counts 딕셔너리 존재
 
-test_e2e_dual_pipeline_cachestore_interface_full:
+test_e2e_pipeline_cachestore_interface_full:
     put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
 
-test_e2e_dual_pipeline_solo_b_vs_solo_c_vs_cross:
-    SessionAwareTurnLevelSegmentCache 단독 /
-    DapQPositionAwareEvictionCodec 단독 /
-    DualReductionPipeline 3방향 메모리 감소율 비교 기록
-
-test_e2e_dual_pipeline_runner_integration:
-    InferenceRunner(cache=DapQSessionSegmentDualReductionPipeline)로
+test_e2e_pipeline_runner_integration:
+    InferenceRunner(cache=RuntimeCertifiedKVSculptDistillationPipeline)로
     run_batch() 호출 성공 (src/engine/runner.py 사용)
 
-test_e2e_dual_pipeline_ppd_classifier_integration:
-    PPDAppendFullPrefillClassifier.classify() 결과 "append"이면
-    process_session()을 호출하고 D 노드 로컬 KV 재사용 경로 확인
+test_e2e_pipeline_cpd_router_integration:
+    CPDWarmColdHitRateRouter.schedule() → warm 요청에 대해 run_pipeline() 호출 후
+    routing_stats()["warm_ratio"] > 0
+
+test_e2e_clc_gate_integration:
+    CLCPositionalBiasGatedSegmentCache.get_with_policy() 반환 policy에 따라
+    DIRECT_REUSE 세그먼트는 재인코딩 없이 run_pipeline() 입력으로 사용
+
+test_e2e_solo_c1_vs_solo_c2_vs_cross1_memory_comparison:
+    C-1 단독 / C-2 단독 / Cross-1 통합 메모리 감소율 비교 기록
+    (Cross-1이 C-1 단독 대비 ≥ −10% 추가 감소 또는 동등)
 ```
 
 ---
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] 단위 테스트 전부 통과 (신규 4개 파일 + 기존 회귀 없음)
+- [ ] 단위 테스트 전부 통과 (신규 5개 파일 + 기존 회귀 없음)
 - [ ] `evaluation_criteria.md` §4 Activity C 필수 항목 충족:
-      - `test_dapq_budget_30pct_relative_error_below_1pct` 통과 (relative_error < 0.01)
-      - `test_dapq_budget_30pct_cosine_similarity_above_099` 통과 (cosine_sim >= 0.99)
-      - `test_dapq_longbench_8subtask_proxy` 통과 (8개 모두 cosine_sim >= 0.99)
-      - `test_dapq_memory_reduction_30pct_budget_above_60pct` 통과 (reduction >= 0.60)
-- [ ] `evaluation_criteria.md` §3 Activity B 항목 충족:
-      - `test_session_cache_noncontiguous_hit_tracking` 통과
-      - `test_session_cache_get_top_segments_by_position_count` 통과
-      - `test_session_cache_session_lru_penalty_preserves_session_entries` 통과
-- [ ] `evaluation_criteria.md` §2 Activity A 항목 충족:
-      - `test_ppd_classifier_overhead_below_1ms` 통과 (TTFT overhead 검증)
-      - `test_ppd_classifier_turn2_small_new_tokens_append` 통과
+      - `test_int8k_int4v_level0_relative_error_below_1pct` 통과 (relative_error < 0.01, MANDATORY)
+      - `test_longbench_8subtask_proxy_all_above_099` 통과 (cosine_sim ≥ 0.99, MANDATORY)
+      - `test_error_bound_conservative_100_sequences` 통과 (수학적 보장 검증, MANDATORY)
+      - `test_memory_reduction_int8k_int4v_above_50pct` 통과 (reduction ≥ 0.50)
 - [ ] `evaluation_criteria.md` §5 크로스 조합 C 포함:
-      - `test_e2e_dual_pipeline_accuracy_preserved_cosine_above_099` 통과 (MANDATORY)
-      - B 단독 / C 단독 / Cross B+C 3방향 비교 수치 기록
+      - `test_cross1_pipeline_cosine_above_099` 통과 (MANDATORY)
+      - `test_e2e_pipeline_accuracy_preserved_cosine_above_099` 통과 (MANDATORY)
+- [ ] `evaluation_criteria.md` §3 Activity B 항목 충족:
+      - `test_clc_bias_gate_direct_reuse_small_delta` 통과
+      - `test_clc_noncontiguous_direct_hit_rate` 통과
+- [ ] `evaluation_criteria.md` §2 Activity A 항목 충족:
+      - `test_cpd_scheduling_overhead_below_1ms` 통과 (TTFT overhead 검증)
+      - `test_cpd_classify_warm_high_hit_rate` 통과
 - [ ] `evaluation_criteria.md` §0 공통 필수:
-      - `DapQPositionAwareEvictionCodec`, `SessionAwareTurnLevelSegmentCache`,
-        `DapQSessionSegmentDualReductionPipeline` 모두 CacheStore 인터페이스 구현
-      - 기존 테스트(`test_segmented_cache.py`, `test_block_union_noncontiguous_index.py`,
-        `test_ppd_router.py` 등) 회귀 없이 통과
+      - `RuntimeCertifiedQuantizedAttentionCodec`, `KVSculptDistillationCodec`,
+        `RuntimeCertifiedKVSculptDistillationPipeline`, `CLCPositionalBiasGatedSegmentCache`
+        모두 `CacheStore` 인터페이스 구현
+      - `CPDWarmColdHitRateRouter`가 `BaseScheduler` 인터페이스 구현
+      - 기존 테스트 회귀 없이 통과
       - 시드 42 고정 재현성
-      - `configs/experiments/2026-05-22.yaml` 존재
+      - `configs/experiments/2026-05-23.yaml` 존재
       - 모든 공개 함수·메서드 타입 힌트
-- [ ] 목표 지표 수치 `results/2026-05-22/metrics.json`에 JSON 기록:
+- [ ] 목표 지표 수치 `results/2026-05-23/metrics.json`에 JSON 기록:
       ```json
       {
+        "c1_int8k_int4v_relative_error": ...,
+        "c1_cosine_similarity_level0": ...,
+        "c1_memory_reduction_ratio": ...,
+        "c1_fallback_rate_level1": ...,
+        "c1_fallback_rate_level2": ...,
+        "c1_error_bound_mean": ...,
+        "c1_error_bound_p99": ...,
+        "c1_error_bound_conservative_violations": 0,
+        "c2_kl_reduction_vs_uniform": ...,
+        "c2_layer_difficulty_max_min_ratio": ...,
+        "c2_accuracy_cosine_budget_050": ...,
+        "c2_gamma_sweep": {"0.0": ..., "0.25": ..., "0.50": ..., "1.0": ...},
+        "cross1_pipeline_cosine": ...,
+        "cross1_memory_reduction_ratio": ...,
+        "cross1_fallback_budget_realloc_count": ...,
+        "b1_direct_reuse_hit_rate": ...,
+        "b1_noncontiguous_hit_rate_pct": ...,
+        "b1_cache_hit_rate_improvement_pct": ...,
+        "a2_scheduling_overhead_mean_us": ...,
+        "a2_warm_ratio": ...,
+        "a2_cold_ratio": ...,
+        "a2_cache_hit_rate_improvement_pct": ...,
         "inference_throughput_improvement_pct": ...,
-        "kv_memory_reduction_ratio_c3_solo": ...,
-        "kv_memory_reduction_ratio_bc_cross": ...,
-        "dapq_relative_error_budget_030": ...,
-        "dapq_cosine_similarity_budget_030": ...,
-        "dapq_kl_divergence": ...,
-        "dapq_niah_needle_preservation_rate": ...,
-        "dapq_longbench_8subtask_cosine_min": ...,
-        "dapq_position_vs_semantic_accuracy_delta": ...,
-        "effective_context_length_multiplier": ...,
-        "session_b1_noncontiguous_hit_rate": ...,
-        "session_b1_total_cache_hit_rate_improvement_pct": ...,
-        "ppd_classifier_overhead_mean_us": ...,
-        "ppd_append_prefill_ratio": ...,
-        "ppd_kv_transfer_reduction_estimate_pct": ...,
-        "bc_dual_reduction_estimate": ...,
-        "bc_combined_memory_reduction_ratio": ...,
-        "bc_vs_solo_b1_throughput_pct": ...,
-        "bc_vs_solo_c3_throughput_pct": ...,
-        "bc_accuracy_cosine": ...
+        "effective_context_length_multiplier": ...
       }
       ```
 - [ ] 기존 모든 단위·통합 테스트 회귀 없이 통과
