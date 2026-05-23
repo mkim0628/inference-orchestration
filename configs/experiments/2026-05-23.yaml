@@ -1,0 +1,91 @@
+experiment:
+  date: "2026-05-23"
+  activity: "C+A+B"
+  description: >
+    C-1 RuntimeCertifiedQuantizedAttentionCodec (수학적 런타임 오류 경계 인증 양자화) +
+    C-2 KVSculptDistillationCodec (L-BFGS+최소제곱 교대 증류 레이어 예산 배분) +
+    Cross-1 RuntimeCertifiedKVSculptDistillationPipeline (C-1+C-2 폐루프 인증 증류) +
+    B-1 CLCPositionalBiasGatedSegmentCache (위치 편향 3단계 선택적 재인코딩 게이트) +
+    A-2 CPDWarmColdHitRateRouter (예측 히트율 기반 warm/cold 소프트 분기 스케줄러).
+    RuntimeCertified(arXiv 2605.20868) + KVSculpt(arXiv 2603.27819) 기반.
+  cache_type: runtime_certified_distillation_pipeline
+  compression_method: int8_key_int4_value_with_fp16_fallback
+  scheduler_type: cpd_warm_cold_hit_router
+
+runtime_certified_quant_codec:  # C-1
+  d_head: 128
+  n_kv_heads: 8
+  n_layers: 12
+  error_threshold: 0.005        # ±0.5% perplexity 수학적 상한 (목표 ±1%의 절반)
+  key_bits: 8                   # INT8 Key
+  value_bits: 4                 # INT4 Value
+  max_entries: 1000
+  seed: 42
+
+kvsculpt_distillation_codec:  # C-2
+  n_layers: 12
+  d_head: 128
+  total_budget_ratio: 0.50      # 전체 KV 유지 비율
+  gamma: 0.5                    # 난이도 반응 강도
+  lbfgs_max_iter: 5             # L-BFGS 반복 (경량화)
+  alternating_rounds: 3         # 교대 반복 횟수
+  convergence_tol: 1.0e-4
+  pilot_n_sequences: 50         # 파일럿 보정 시퀀스 수
+  max_entries: 1000
+  seed: 42
+
+distillation_pipeline:  # Cross-1
+  adaptive_threshold_scale: 1.0
+  online_budget_realloc_window: 100
+  seed: 42
+
+clc_bias_gate:  # B-1
+  max_context_length: 4096
+  bias_threshold: 0.15          # ΔPos ≤ 0.15: 직접 재사용
+  rope_distortion_threshold: 0.40  # ΔPos > 0.40: 전체 재인코딩
+  partial_reencoding_layer_ratio: 0.5
+  max_entries: 1000
+  seed: 42
+
+cpd_warm_cold_router:  # A-2
+  high_hit_threshold: 0.70
+  low_hit_threshold: 0.25
+  warm_slot_ratio: 0.60
+  cold_slot_ratio: 0.30
+  neutral_slot_ratio: 0.10
+  queue_pressure_threshold: 100
+  max_context_length_warm: 50000
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    dataset_proxy: "wikitext2_synthetic"
+    task_accuracy_proxy: "niah_cosine_similarity"
+    relative_error_max: 0.01         # ±1% (evaluation_criteria.md §4 MANDATORY)
+    cosine_similarity_min: 0.99      # (evaluation_criteria.md §4 MANDATORY)
+    kl_divergence_max: 0.015
+    niah_context_lengths: [256, 512, 1024]   # proxy: 32K/64K/128K
+    longbench_subtask_count: 8
+    math_guarantee_sequences: 100    # error_bound >= actual_error 검증 시퀀스 수
+    kvsculpt_gamma_sweep: [0.0, 0.25, 0.50, 1.0]
+  activity_b:
+    cache_hit_rate_improvement_min_pct: 5.0
+    noncontiguous_direct_hit_rate_min_pct: 30.0
+    memory_footprint_max_increase_pct: 20.0
+  activity_a:
+    scheduling_overhead_ttft_p50_max_pct: 5.0
+    scheduling_overhead_max_us: 100.0   # 0.1ms 이내
+    cache_hit_rate_improvement_min_pct: 10.0
+  activity_c:
+    memory_reduction_min_ratio: 0.50    # INT8K+INT4V: -50% 이상
+    int8k_int4v_relative_error_max: 0.01
+    effective_context_multiplier: 2.0
+    fallback_rate_level1_max: 0.20      # Level 1 폴백 비율 최대 20%
+    fallback_rate_level2_max: 0.05      # Level 2 폴백 비율 최대 5%
+  cross_c1_c2:
+    pipeline_cosine_min: 0.99           # MANDATORY
+    combined_memory_reduction_min: 0.55  # C-1+C-2 결합 -55% 이상
+
+seed: 42
+results_dir: "results/2026-05-23"
