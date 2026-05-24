@@ -1,104 +1,120 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-22 대비):
-이전 사이클(2026-05-22)은 C+B+A 조합이었다:
-  - C-3 DapQPositionAwareEvictionCodec (위치-인식 유사 쿼리 기반 KV 퇴거)
-  - B-1 SessionAwareTurnLevelSegmentCache (세션-인식 턴-레벨 비연속 세그먼트 캐시)
-  - Cross DapQSessionSegmentDualReductionPipeline (B+C 이중 감소 파이프라인)
-  - A PPDAppendFullPrefillClassifier (append/full-prefill 분류기)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-23 대비):
+이전 사이클(2026-05-23)은 C+A+B 조합이었다:
+  - C-1 RuntimeCertifiedQuantizedAttentionCodec (수학적 런타임 오류 경계 인증 양자화)
+  - C-2 KVSculptDistillationCodec (L-BFGS+최소제곱 교대 증류 레이어 예산 배분)
+  - Cross-1 RuntimeCertifiedKVSculptDistillationPipeline (C-1+C-2 폐루프 인증 증류)
+  - B-1 CLCPositionalBiasGatedSegmentCache (위치 편향 3단계 선택적 재인코딩 게이트)
+  - A-2 CPDWarmColdHitRateRouter (예측 히트율 기반 warm/cold 소프트 분기 스케줄러)
 
-이번 사이클(2026-05-23)은 C+A 조합(B 포함)으로 전환된다.
-핵심 전환: Activity C의 accuracy-preserving 검증 방식이
-"경험적 벤치마크 사후 검증"에서 "런타임 수학적 오류 경계 사전 보장"으로 격상된다.
-Runtime-Certified(arXiv 2605.20868)의 이중 항 오류 분해 + 다단계 폴백 사다리가
-Activity C의 핵심 제약 "압축 정확도 delta ±1% 이내"를 수학적으로 보장한다.
+이번 사이클(2026-05-24)은 A+C 조합으로 전환된다.
+핵심 전환:
+  - Activity C 최우선: RuntimeCertified의 "수학적 사후 인증" 방식에서
+    TriAttention의 "pre-RoPE 공간 Q/K 집중도 기반 원천적 중요도 계산"으로 전환.
+    pre-RoPE 삼각함수 급수(arXiv 2604.04921)로 10.7x KV 절감 + 풀-어텐션 동등 정확도를
+    추론(reasoning) 워크로드에서 달성한다.
+  - Activity C 2순위: AttentionMatchingClosedFormCodec — 닫힌 형태 최소제곱 최적화로
+    50x 압착을 수 초 내 달성. KVSculpt L-BFGS 반복 최적화의 대안.
+  - Activity A: CPD 히트율 예측 라우터에서 DualPath 스토리지 NIC 이중 경로 로드 밸런서로
+    전환. P/D 분리 멀티 노드 환경에서 스토리지 NIC 포화 시 decode 노드 유휴 NIC를
+    중계 경로로 전환해 처리량 +40~96% 달성.
+  - Cross-1: DualPathTriAttentionCompressPipeline — A-1 이중 경로 + C-1 압축을
+    decode 노드에서 결합해 prefill 노드 전달 KV 크기를 추가 10.7x 감소.
 
 주요 변경:
-1. [Activity C 최우선 신규] RuntimeCertifiedQuantizedAttentionCodec:
-   INT8 Key + INT4 Value GPU 저장 + FP16 원본 RAM 보존.
-   이중 항 오류 분해(δ_attn_bound + δ_value_bound)로 헤드별·스텝별 오류 상한 계산.
-   다단계 폴백 사다리(Level 0→1→2)로 임계값 초과 시 FP16 복원.
-   기존 모든 C 기법의 "경험적 accuracy-preserving" 한계를 수학적 런타임 보장으로 격상.
-
-2. [Activity C Cross-1 신규] RuntimeCertifiedKVSculptDistillationPipeline:
-   C-1 RuntimeCertified 오류 경계 인증 + C-2 KVSculpt L-BFGS 증류 레이어 예산 배분
-   폐루프 온라인 예산 재배분 파이프라인.
-
-3. [Activity B 신규] CLCPositionalBiasGatedSegmentCache:
-   2603.20218 CLC 정확도 한계 메커니즘을 직접 구현.
-   ΔPos 연속값 측정 → 직접 재사용/부분 재인코딩/전체 재인코딩 3단계 선택적 게이트.
-
-4. [Activity A 신규] CPDWarmColdHitRateRouter:
-   예측 캐시 히트율 기반 warm/cold/neutral 3경로 소프트 분기.
-   CPD(Together AI 2026-03-04) 원칙을 단일 노드 경량 히트율 예측기로 구현.
-
-5. [보존 파일] 이전 사이클 구현 파일
-   (dapq_position_aware_eviction_codec.py, session_turn_level_segment_cache.py,
-   dapq_session_segment_dual_pipeline.py, ppd_append_full_prefill_classifier.py 등)은
-   수정하지 않는다. 기존 단위·통합 테스트가 회귀 없이 통과해야 한다.
+1. [신규] src/cache/triattention_pre_rope_kv_selector_codec.py (C-1, 최우선)
+2. [신규] src/cache/attention_matching_closed_form_codec.py (C-2)
+3. [신규] src/scheduler/dualpath_nic_load_balancer.py (A-1)
+4. [신규] src/engine/dualpath_triattention_pipeline.py (Cross-1, A+C)
+5. [신규] configs/triattention_budget_policy.yaml
+6. [신규] configs/attention_matching_ref_query_config.yaml
+7. [신규] configs/experiments/2026-05-24.yaml
+8. [신규] 단위·통합 테스트 4종
+9. [보존] 이전 사이클 구현 파일 전부 수정 금지.
+    특히 runtime_certified_quant_codec.py, kvsculpt_distillation_codec.py,
+    runtime_certified_distillation_pipeline.py, clc_positional_bias_gated_segment_cache.py,
+    cpd_warm_cold_hit_router.py, tri_attention_codec.py 등
+    기존 단위·통합 테스트 회귀 없이 통과해야 한다.
 -->
 
-# Spec — 2026-05-23: RuntimeCertified KV Quantization + CPD Warm/Cold Routing + CLC Bias Gate
+# Spec — 2026-05-24: TriAttention pre-RoPE KV Selector + DualPath NIC Load Balancer + Attention Matching Closed-Form Codec
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-23.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-24.md`
 
-**최우선 구현 타겟**: C-1 `RuntimeCertifiedQuantizedAttentionCodec`
+**최우선 구현 타겟**: C-1 `TriAttentionPreRoPEKVSelectorCodec`
 
 **해결하려는 문제**:
 
-- **Activity C (RuntimeCertified 수학적 인증)**: 기존 모든 KV 압축 기법이 accuracy-preserving을
-  오프라인 벤치마크로만 경험적으로 검증하고 런타임에 오류 경계를 보장하지 못한다.
-  Runtime-Certified(arXiv 2605.20868)의 이중 항 오류 분해(Key 양자화 어텐션 왜곡 + Value
-  재구성 오류)로 헤드별·스텝별 오류 상한을 온라인 계산하고, 임계값 초과 시 FP16 폴백으로
-  Activity C의 핵심 제약 "±1% 이내"를 수학적 런타임 보장으로 격상한다.
+- **Activity C (TriAttention pre-RoPE 삼각함수 KV 선택)**: 기존 KV 퇴거 기법들은
+  post-RoPE 공간의 어텐션 점수나 양자화 오류 경계에 의존해 중요도를 추정한다.
+  TriAttention(arXiv 2604.04921)은 pre-RoPE 공간에서 Q/K 벡터가 고정 비제로 중심
+  주변에 집중(concentration)된다는 사실을 수학적으로 증명하고, 이 집중도를 삼각함수
+  급수로 정형화해 위치-거리 선호도 점수를 계산한다. 추론(reasoning) 워크로드에서
+  AIME25 풀-어텐션 동등 정확도(40.8%)를 유지하면서 10.7x KV 메모리 절감을 달성한다.
+  Q/K 집중도 메트릭(conc_Q)으로 삼각함수 거리 선호도와 Q/K 노름 기반 점수를
+  자동 균형 조정해 불안정한 환경에서도 accuracy-preserving이 보장된다.
 
-- **Activity C Cross-1 (RuntimeCertified+KVSculpt 폐루프)**: C-1 오류 경계 인증과
-  C-2 KVSculpt 레이어별 난이도 비례 증류 예산 배분을 결합해 "압축 + 온라인 인증 + 예산 재배분"
-  폐루프 파이프라인을 달성한다. 레이어별 압축 난이도 100× 차이(KVSculpt 실증)를 고려한
-  비균일 예산 배분으로 동일 메모리 예산에서 더 낮은 오류 상한을 달성한다.
+  주의: 기존 `src/cache/tri_attention_codec.py`는 순수 코덱(non-CacheStore)이며
+  Fourier 계수를 calibration으로 학습한다. 이번 신규 파일
+  `triattention_pre_rope_kv_selector_codec.py`는 CacheStore 인터페이스를 구현하고
+  Q/K 집중도 메트릭 + 삼각함수 거리 선호도로 training-free 중요도를 계산한다.
+  두 파일은 별개이며 기존 파일을 수정하지 않는다.
 
-- **Activity B (CLC 위치 편향 게이트)**: 2603.20218이 규명한 "위치 독립 재사용 시 위치 인코딩
-  불일치로 정확도 저하" 메커니즘을 경량 게이트로 구현해, ΔPos ≤ 0.15인 세그먼트만 직접
-  재사용하고 그 외에만 재인코딩을 선택적으로 적용한다.
+- **Activity C (AttentionMatching 닫힌 형태 최소제곱 압착)**: 기존 KVSculpt(05-23 C-2)
+  는 L-BFGS 반복 최적화로 증류 압축을 수행해 속도가 느리다. Attention Matching
+  (arXiv 2602.16284)은 어텐션 출력 보존과 어텐션 매스 보존 목표 함수에 대해 닫힌 형태
+  최소제곱 해가 존재함을 보이고, 이를 통해 50x 압축을 수 초 내 달성한다.
 
-- **Activity A (CPD Warm/Cold 분기)**: cold prefill(캐시 미스 대형 프리필)이 warm 요청
-  TTFT를 오염시키는 구조적 병목을 단일 노드에서 경량 히트율 예측 라우터로 해결한다.
+- **Activity A (DualPath 스토리지 NIC 이중 경로 로드 밸런서)**: P/D 분리 클러스터에서
+  단일 "저장소->prefill 노드" 경로가 스토리지 NIC 포화를 유발하고 decode 노드의
+  스토리지 NIC는 유휴 상태로 낭비된다. DualPath(arXiv 2602.21548)의 핵심 통찰을
+  KV 로드 라우팅 정책에 적용해, NIC 포화 시 유휴 decode 노드를 중계 경로로 전환하는
+  "NIC-부하 인식 KV 이중 경로 라우터"를 구현한다.
+
+- **Cross-1 (DualPath+TriAttention A+C 파이프라인)**: 이중 경로로 KV가 decode 노드를
+  경유할 때 TriAttention 압축을 decode 노드에서 실행해 "중계 decode 노드의 유휴 GPU
+  컴퓨팅을 KV 압축에 활용"한다. RDMA로 전달되는 KV 크기가 추가 10.7x 감소해
+  곱연산적 복합 효과가 발생한다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [x] Activity A: KV Cache-aware Scheduling (CPDWarmColdHitRateRouter)
-- [x] Activity B: Non-Contiguous KV Cache Reuse (CLCPositionalBiasGatedSegmentCache)
-- [x] Activity C: KV Cache Compression (RuntimeCertifiedQuantizedAttentionCodec + KVSculptDistillationCodec + Cross-1 Pipeline)
+- [x] Activity A: KV Cache-aware Scheduling (DualPathNICLoadBalancer, 멀티 노드 P/D 분리)
+- [ ] Activity B: Non-Contiguous KV Cache Reuse (이번 사이클 최우선 아님)
+- [x] Activity C: KV Cache Compression (TriAttentionPreRoPEKVSelectorCodec C-1 + AttentionMatchingClosedFormCodec C-2)
 
 ---
 
 ## 목표
 
-- [ ] 목표 1 (evaluation_criteria.md §4 Activity C 필수): perplexity 변화 ±1% 이내
-      — `attention_output_relative_error(q, K_orig, V_orig, K_int8, V_int4) < 0.01` (MANDATORY)
-      — INT8K+INT4V 모드, 폴백 사다리 활성화 상태
-- [ ] 목표 2 (evaluation_criteria.md §4 Activity C 필수): downstream 태스크 정확도 ±1% 이내
-      — NIAH proxy: needle 보존율 ≥ 99% (32K/64K/128K 컨텍스트 프록시)
-      — LongBench 8개 서브태스크 proxy: `cosine_similarity_output ≥ 0.99` (MANDATORY)
-- [ ] 목표 3 (evaluation_criteria.md §4 높음): KV Memory Reduction ≥ −30%
-      — INT8K+INT4V: FP16 대비 −50~65% 목표 (필수 −30% 이상)
-- [ ] 목표 4 (evaluation_criteria.md §4 높음): Effective Context Length 동일 메모리 2× 이상
-      — INT8K+INT4V 압축으로 확보한 메모리로 더 긴 컨텍스트 수용
-- [ ] 목표 5 (evaluation_criteria.md §4 C 추가 검증): 수학적 오류 경계 보수성 검증
-      — 100 시퀀스에서 error_bound ≥ actual_error 항상 성립 (MANDATORY for C-1)
-      — fallback_rate_level1, fallback_rate_level2 측정 및 JSON 기록
-- [ ] 목표 6 (evaluation_criteria.md §3 Activity B 높음): 전체 Cache Hit Rate +5%p 이상
-      — CLCPositionalBiasGatedSegmentCache 직접 재사용 허용으로 히트율 향상
-- [ ] 목표 7 (evaluation_criteria.md §3 Activity B 높음): 비연속 세그먼트 히트율 ≥ 전체 히트의 30%
-      — ΔPos ≤ 0.15 세그먼트 직접 재사용으로 비연속 히트 증가
-- [ ] 목표 8 (evaluation_criteria.md §2 Activity A 필수): Scheduling overhead TTFT p50 +5% 이내
-      — 히트율 예측 선형 모델 < 0.01ms 오버헤드
-- [ ] 목표 9 (evaluation_criteria.md §5 크로스 조합): 복합 적용 후 accuracy ±1% 이내 (MANDATORY)
-      — Cross-1 RuntimeCertified+KVSculpt 폐루프 파이프라인 후 cosine_sim ≥ 0.99
-- [ ] 목표 10 (evaluation_criteria.md §1 처리량 높음): 처리량 베이스라인 +20% 이상
-      — INT8K+INT4V 메모리 절감 → 배치 크기 증가 → 처리량 향상
+- [ ] 목표 1 (evaluation_criteria.md §4 필수): perplexity 변화 ±1% 이내
+      — WikiText-2 proxy: `attention_output_relative_error < 0.01`
+      — C-1: kv_budget_ratio=0.093(추론) / 0.20(비추론) 각각 측정
+      — C-2: compression_ratio=5x/10x/20x/50x 각각 측정
+- [ ] 목표 2 (evaluation_criteria.md §4 필수): downstream 태스크 정확도 ±1% 이내
+      — C-1 AIME25 proxy: `cosine_similarity_output >= 0.99`
+      — LongBench 8개 서브태스크 proxy: cosine similarity >= 0.99
+      — C-2: NIAH(128K 컨텍스트 proxy) + LongBench 8개 서브태스크
+- [ ] 목표 3 (evaluation_criteria.md §4 높음): KV Memory Reduction >= -30%
+      — C-1: -89% 이상 (kv_budget_ratio=0.093, 추론 태스크)
+      — C-2: -92% 이상 (50x 압착)
+- [ ] 목표 4 (evaluation_criteria.md §4 높음): Effective Context Length 동일 메모리 2x 이상
+- [ ] 목표 5 (evaluation_criteria.md §4 C 추가): pre-RoPE vs. post-RoPE 신호 대조
+      — C-1: kv_budget_ratio [5%, 9.3%, 15%, 20%, 30%] 별 정확도 곡선
+      — C-1: `{conc_Q_mean, conc_K_mean, kv_budget_ratio, is_reasoning_task}` JSON 기록
+- [ ] 목표 6 (evaluation_criteria.md §2 필수): Scheduling overhead TTFT p50 +5% 이내
+      — A-1: decide_routing() 총 오버헤드 < 0.1ms/요청, TTFT +2% 이내
+- [ ] 목표 7 (evaluation_criteria.md §2 높음): 캐시 히트율 스케줄링 미적용 대비 +10%p 이상
+- [ ] 목표 8 (evaluation_criteria.md §5 필수, C 포함): Cross-1 복합 accuracy ±1% 이내
+      — cosine_similarity >= 0.99
+- [ ] 목표 9 (evaluation_criteria.md §1 높음): 처리량 베이스라인 +20% 이상
+      — C-1: KV 10.7x 절감 -> 배치 크기 증가 -> 처리량 향상
+      — A-1: 스토리지 I/O 병목 해소 -> +40~96%
+- [ ] 목표 10 (evaluation_criteria.md §4 높음): 압축 오버헤드 TTFT +10% 이내
+      — C-1: pre-RoPE 집중도 계산 < 1ms/디코딩 스텝 (GPU 병렬화)
+      — C-2: 닫힌 형태 최소제곱 < 1ms/세그먼트 (m=32 기준)
 
 ---
 
@@ -108,36 +124,37 @@ Activity C의 핵심 제약 "압축 정확도 delta ±1% 이내"를 수학적으
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/cache/runtime_certified_quant_codec.py` | C | RuntimeCertifiedQuantizedAttentionCodec — INT8K+INT4V 저장 + FP16 RAM 백업 + 이중 항 오류 분해 + 다단계 폴백 사다리 |
-| `src/cache/kvsculpt_distillation_codec.py` | C | KVSculptDistillationCodec — 파일럿 압축 레이어 난이도 프로파일링 + L-BFGS+최소제곱 교대 증류 + 난이도 비례 예산 배분 |
-| `src/cache/runtime_certified_distillation_pipeline.py` | C (Cross-1) | RuntimeCertifiedKVSculptDistillationPipeline — C-1+C-2 폐루프 인증 증류 파이프라인 |
-| `src/cache/clc_positional_bias_gated_segment_cache.py` | B | CLCPositionalBiasGatedSegmentCache — ΔPos 연속값 측정 기반 3단계 선택적 재인코딩 게이트 |
-| `src/scheduler/cpd_warm_cold_hit_router.py` | A | CPDWarmColdHitRateRouter — 예측 캐시 히트율 기반 warm/cold/neutral 3경로 소프트 분기 |
-| `tests/unit/test_runtime_certified_quant_codec.py` | C | RuntimeCertifiedQuantizedAttentionCodec 단위 테스트 |
-| `tests/unit/test_compression_accuracy.py` | C | Accuracy-preservation 검증 (기존 파일 덮어쓰기 — RuntimeCertified 기반으로 전환) |
-| `tests/unit/test_kvsculpt_distillation_codec.py` | C | KVSculptDistillationCodec 단위 테스트 |
-| `tests/unit/test_clc_positional_bias_gated_segment_cache.py` | B | CLCPositionalBiasGatedSegmentCache 단위 테스트 |
-| `tests/unit/test_cpd_warm_cold_hit_router.py` | A | CPDWarmColdHitRateRouter 단위 테스트 |
-| `tests/integration/test_runtime_certified_distillation_e2e.py` | C Cross-1 | RuntimeCertifiedKVSculptDistillationPipeline E2E 통합 테스트 |
-| `configs/experiments/2026-05-23.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `src/cache/triattention_pre_rope_kv_selector_codec.py` | C (최우선) | TriAttentionPreRoPEKVSelectorCodec — pre-RoPE Q/K 집중도 메트릭 + 삼각함수 거리 선호도 점수 + 집중도 가중 결합으로 상위 kv_budget_ratio KV 선택. CacheStore 인터페이스 구현. |
+| `src/cache/attention_matching_closed_form_codec.py` | C (2순위) | AttentionMatchingClosedFormCodec — 레퍼런스 쿼리 기반 어텐션 출력/매스 보존 닫힌 형태 최소제곱 최적화로 m_c 토큰으로 KV 압착. CacheStore 인터페이스 구현. |
+| `src/scheduler/dualpath_nic_load_balancer.py` | A | DualPathNICLoadBalancer — 스토리지 NIC 부하 모니터 + 단일/이중 경로 KV 로드 전환 결정. BaseScheduler 상속. |
+| `src/engine/dualpath_triattention_pipeline.py` | A+C (Cross-1) | DualPathTriAttentionCompressPipeline — A-1 이중 경로 + C-1 TriAttention 압축을 decode 노드에서 순차 실행. |
+| `configs/triattention_budget_policy.yaml` | C | C-1 kv_budget_ratio 정책 설정 |
+| `configs/attention_matching_ref_query_config.yaml` | C | C-2 레퍼런스 쿼리 구성 설정 |
+| `configs/experiments/2026-05-24.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `tests/unit/test_triattention_pre_rope_kv_selector_codec.py` | C | C-1 단위 테스트 |
+| `tests/unit/test_attention_matching_closed_form_codec.py` | C | C-2 단위 테스트 |
+| `tests/unit/test_dualpath_nic_load_balancer.py` | A | A-1 단위 테스트 |
+| `tests/integration/test_dualpath_triattention_pipeline_e2e.py` | A+C Cross-1 | E2E 통합 테스트 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `configs/kvsculpt_layer_difficulty_profile.yaml` | KVSculpt 파일럿 실행 후 자동 생성 (테스트에서 생성) |
-| `configs/clc_bias_gate_thresholds.yaml` | CLCPositionalBiasGate 임계값 설정 자동 생성 |
+| `tests/unit/test_compression_accuracy.py` | C-1/C-2 accuracy 검증 케이스 추가 (기존 케이스 유지) |
 
-**주의**: `src/cache/base.py`는 변경하지 않는다. 이전 사이클 구현 파일 모두 수정 금지.
+**보존 불변 파일**: `src/cache/base.py` 및 이전 사이클 구현 파일 전부
+(runtime_certified_quant_codec.py, kvsculpt_distillation_codec.py,
+runtime_certified_distillation_pipeline.py, clc_positional_bias_gated_segment_cache.py,
+cpd_warm_cold_hit_router.py, tri_attention_codec.py 등) 수정 금지.
 
 ---
 
 ## 알고리즘 상세
 
-### RuntimeCertifiedQuantizedAttentionCodec (Activity C — 최우선)
+### TriAttentionPreRoPEKVSelectorCodec (Activity C — 최우선)
 
 ```python
-# src/cache/runtime_certified_quant_codec.py
+# src/cache/triattention_pre_rope_kv_selector_codec.py
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -148,427 +165,329 @@ from src.cache.base import CacheStore
 
 
 @dataclass
-class RuntimeCertifiedConfig:
+class TriAttentionSelectorConfig:
     d_head: int = 128
     n_kv_heads: int = 8
-    n_layers: int = 12
-    error_threshold: float = 0.005      # Level 0→1 폴백 임계값 (0.5% = ±1%의 절반)
-    key_bits: int = 8                   # INT8 Key
-    value_bits: int = 4                 # INT4 Value
+    rope_base: float = 10000.0
+    kv_budget_ratio_reasoning: float = 0.093    # 추론 태스크 (10.7x 절감)
+    kv_budget_ratio_default: float = 0.20       # 비추론 태스크 (보수적)
+    high_pressure_threshold: float = 0.80       # KV 풀 점유율 고압 임계값
+    high_pressure_extra_reduction: float = 0.10 # 고압 시 추가 10% 감소
     max_entries: int = 1000
     seed: int = 42
 
 
 @dataclass
-class CertifiedKVEntry:
-    """GPU에 저장되는 압축 KV 엔트리."""
-    key_int8: torch.Tensor        # [seq_len, d_head] INT8
-    value_int4_packed: torch.Tensor  # [seq_len, d_head//2] packed INT4 (2토큰/바이트)
-    key_scale: torch.Tensor       # [seq_len] FP16 per-token scale
-    key_zero: torch.Tensor        # [seq_len] FP16 per-token zero
-    value_scale: torch.Tensor     # [seq_len] FP16 per-token scale
-    value_zero: torch.Tensor      # [seq_len] FP16 per-token zero
-    # RAM 백업 (비동기 복원용)
-    key_fp16_backup: torch.Tensor    # CPU에 보존
-    value_fp16_backup: torch.Tensor  # CPU에 보존
-    fallback_level: int = 0          # 0=INT8K+INT4V, 1=INT8K+FP16V, 2=FP16K+FP16V
+class SelectorKVEntry:
+    selected_kv: torch.Tensor      # [n_kept, d_head] FP16
+    kept_indices: torch.Tensor     # [n_kept] int64
+    original_seq_len: int
+    conc_q: float
+    conc_k: float
+    kv_budget_ratio: float
+    is_reasoning_task: bool
 
 
-class RuntimeCertifiedQuantizedAttentionCodec(CacheStore):
-    """Runtime-Certified Bounded-Error Quantized Attention KV Cache (arXiv 2605.20868).
+class TriAttentionPreRoPEKVSelectorCodec(CacheStore):
+    """TriAttention pre-RoPE Q/K 집중도 삼각함수 KV 선택 코덱 (arXiv 2604.04921).
 
-    Activity C: KV Cache Compression — 수학적 런타임 오류 경계 인증.
+    Activity C: training-free, accuracy-preserving KV 선택.
 
-    계층화 KV 구조:
-      GPU HBM: INT8 Key + INT4 Value (압축 저장, 속도 최적화)
-      시스템 RAM: FP16 원본 Key + Value (비동기 D2H 전송, 폴백 복원용)
+    핵심 알고리즘:
+      1. pre-RoPE Q 중심 mu_Q = mean(Q, dim=0) 계산.
+      2. Q 집중도: conc_Q = ||mu_Q||_2 / mean(||q_t||_2)  in [0, 1].
+      3. 삼각함수 급수 거리 선호도 점수:
+           dist_pref(k_i) = sum_{d=1}^{d_k/2} [|mu_Q[2d-1]| * cos(theta_d * |pos_i - pos_q|)
+                                               + |mu_Q[2d]|   * sin(theta_d * |pos_i - pos_q|)]
+           theta_d = rope_base^(-2d/d_k)
+      4. K 노름 보조 점수: norm_score(k_i) = ||k_i|| / max(||k_j||)
+      5. 집중도 가중 결합:
+           importance(k_i) = conc_Q * dist_pref(k_i) + (1 - conc_Q) * norm_score(k_i)
+      6. 상위 n_keep = max(1, int(N * kv_budget_ratio)) 토큰 선택.
 
-    이중 항 오류 분해 (Two-Term Error Decomposition):
-      δ_attn_bound: Key 양자화로 인한 어텐션 분포 왜곡 상한
-        = max_q_norm × ||K - K_int8_restored||_F / (√d × softmax_min)
-      δ_value_bound: Value 양자화 후 어텐션 가중합 오차 상한
-        = max_attn_weight × max_i ||v_i - v_int4_restored_i||
-      error_bound = δ_attn_bound + δ_value_bound  (삼각 부등식)
-
-    다단계 폴백 사다리:
-      Level 0 (INT8K+INT4V): error_bound ≤ error_threshold → 정상 운영
-      Level 1 (INT8K+FP16V): error_bound > error_threshold → Value FP16 복원
-      Level 2 (FP16K+FP16V): δ_attn_bound > error_threshold/2 → Key+Value FP16 복원
-
-    accuracy-preserving 근거:
-      (1) error_threshold=0.005: ±0.5% perplexity delta 수학적 상한 (목표 ±1%의 절반)
-      (2) 오류 상한이 실제 오류를 항상 상회하는 보수적 상한 (수학적 증명)
-      (3) 최악의 경우 FP16 완전 복원 → accuracy delta = 0
+    CacheStore 인터페이스:
+      - put(key, value): 단순 저장 (압축 없음, 호환성)
+      - put_compressed(key, Q, K, V, ...): 압축 저장 (권장)
+      - get(key): 선택된 KV 텐서 반환
+      - evict(): FIFO 퇴거
+      - hit_rate(), memory_bytes(), reset_stats()
     """
 
-    def __init__(self, config: RuntimeCertifiedConfig) -> None:
+    def __init__(self, config: TriAttentionSelectorConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
-        self._store: Dict[str, CertifiedKVEntry] = {}
+        self._store: Dict[str, SelectorKVEntry] = {}
         self._hits: int = 0
         self._misses: int = 0
-        self._fallback_count_level1: int = 0
-        self._fallback_count_level2: int = 0
-        self._total_requests: int = 0
-        self._error_bounds: List[float] = []   # 오류 경계 분포 추적
-
-    # ------------------------------------------------------------------ #
-    # 양자화 / 역양자화 유틸리티                                            #
-    # ------------------------------------------------------------------ #
+        self._conc_q_history: List[float] = []
+        self._conc_k_history: List[float] = []
+        # RoPE 주파수 사전 계산: theta_d = rope_base^(-2d/d_k), d=1..d_k/2
+        half_d = config.d_head // 2
+        d_indices = torch.arange(1, half_d + 1, dtype=torch.float32)
+        self._rope_freqs: torch.Tensor = config.rope_base ** (-2.0 * d_indices / config.d_head)
 
     @staticmethod
-    def _quantize_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-token INT8 대칭 양자화.
+    def compute_concentration(vecs: torch.Tensor) -> float:
+        """Q 또는 K 벡터 집합의 집중도.
 
-        Algorithm:
-          scale = max(|x|, dim=-1) / 127.0   # [seq_len]
-          x_int8 = round(x / scale.unsqueeze(-1)).clamp(-127, 127).to(int8)
-          zero = zeros_like(scale)
-          return x_int8, scale, zero
-        """
-        scale = x.abs().amax(dim=-1).clamp(min=1e-8) / 127.0  # [seq_len]
-        x_int8 = (x / scale.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
-        zero = torch.zeros_like(scale)
-        return x_int8, scale.to(torch.float16), zero.to(torch.float16)
-
-    @staticmethod
-    def _dequantize_int8(
-        x_int8: torch.Tensor,
-        scale: torch.Tensor,
-        zero: torch.Tensor,
-    ) -> torch.Tensor:
-        """INT8 역양자화 → FP32."""
-        return x_int8.float() * scale.float().unsqueeze(-1) + zero.float().unsqueeze(-1)
-
-    @staticmethod
-    def _quantize_int4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-token INT4 대칭 양자화 (packed: 2값/바이트로 압축).
-
-        Algorithm:
-          scale = max(|x|, dim=-1) / 7.0     # [seq_len]
-          x_int4 = round(x / scale.unsqueeze(-1)).clamp(-7, 7)  # [seq_len, d_head]
-          # INT4 packing: 인접한 두 값을 한 바이트에 저장
-          # packed[i, j] = (x_int4[i, 2j] & 0x0F) | ((x_int4[i, 2j+1] & 0x0F) << 4)
-          packed = _pack_int4(x_int4)  # [seq_len, d_head//2] uint8
-          zero = zeros_like(scale)
-          return packed, scale, zero
-        """
-        scale = x.abs().amax(dim=-1).clamp(min=1e-8) / 7.0
-        x_clamped = (x / scale.unsqueeze(-1)).round().clamp(-7, 7).to(torch.int8)
-        # INT4 packing: 짝수 인덱스를 low nibble, 홀수를 high nibble
-        d = x.shape[-1]
-        if d % 2 != 0:
-            pad = torch.zeros(*x.shape[:-1], 1, dtype=torch.int8, device=x.device)
-            x_clamped = torch.cat([x_clamped, pad], dim=-1)
-            d += 1
-        low = (x_clamped[..., 0::2] & 0x0F).to(torch.uint8)
-        high = ((x_clamped[..., 1::2] & 0x0F) << 4).to(torch.uint8)
-        packed = (low | high)  # [seq_len, d//2]
-        zero = torch.zeros_like(scale)
-        return packed, scale.to(torch.float16), zero.to(torch.float16)
-
-    @staticmethod
-    def _dequantize_int4(
-        packed: torch.Tensor,   # [seq_len, d_head//2] uint8
-        scale: torch.Tensor,    # [seq_len] FP16
-        zero: torch.Tensor,     # [seq_len] FP16
-        d_head: int,
-    ) -> torch.Tensor:
-        """INT4 역양자화 → FP32."""
-        low = (packed & 0x0F).to(torch.int8)
-        high = ((packed >> 4) & 0x0F).to(torch.int8)
-        # sign extension for INT4 (range -7..7)
-        low = torch.where(low > 7, low - 16, low)
-        high = torch.where(high > 7, high - 16, high)
-        # interleave: [seq_len, d_head]
-        seq_len = packed.shape[0]
-        x_int4 = torch.stack([low, high], dim=-1).reshape(seq_len, -1)
-        x_int4 = x_int4[..., :d_head]
-        return x_int4.float() * scale.float().unsqueeze(-1) + zero.float().unsqueeze(-1)
-
-    # ------------------------------------------------------------------ #
-    # 이중 항 오류 분해                                                     #
-    # ------------------------------------------------------------------ #
-
-    def compute_error_bound(
-        self,
-        Q: torch.Tensor,         # [n_q, d_head] FP32 쿼리
-        K_orig: torch.Tensor,    # [seq_len, d_head] FP32 원본 Key
-        K_restored: torch.Tensor,  # [seq_len, d_head] FP32 복원 Key (INT8 역양자화)
-        V_restored: torch.Tensor,  # [seq_len, d_head] FP32 복원 Value (INT4 역양자화)
-        V_orig: Optional[torch.Tensor] = None,  # FP16 원본 Value (Level 1 이상)
-    ) -> Tuple[float, float, float]:
-        """이중 항 오류 분해로 헤드별 오류 상한 계산.
-
-        Returns:
-            (error_bound, delta_attn_bound, delta_value_bound)
-
-        Algorithm:
-          # 항 1: Key 양자화 어텐션 분포 왜곡 상한
-          scale = 1 / sqrt(d_head)
-          attn_orig = softmax(Q @ K_orig.T * scale, dim=-1)  # [n_q, seq_len]
-          attn_rest = softmax(Q @ K_restored.T * scale, dim=-1)
-          delta_attn_bound = (attn_orig - attn_rest).abs().max().item()
-
-          # 항 2: Value 재구성 오류 상한
-          key_diff_norm = (K_orig - K_restored).norm(dim=-1).max().item()
-          max_q_norm = Q.norm(dim=-1).max().item()
-          softmax_min = attn_orig.min().clamp(min=1e-8).item()
-          delta_attn_bound_theory = max_q_norm * key_diff_norm / (sqrt(d_head) * softmax_min)
-          # (실용적: 직접 계산값 사용)
-
-          if V_orig is not None:
-            val_diff = (V_orig - V_restored).norm(dim=-1)
-            max_attn_weight = attn_orig.max().item()
-            delta_value_bound = max_attn_weight * val_diff.max().item()
-          else:
-            delta_value_bound = (attn_orig @ (V_restored - V_restored)).norm().item()
-            # V_orig 없으면 INT4 복원값으로 추정
-
-          error_bound = delta_attn_bound + delta_value_bound
-          return error_bound, delta_attn_bound, delta_value_bound
-        """
-        scale = self.config.d_head ** -0.5
-        Q_f = Q.float()
-        K_orig_f = K_orig.float()
-        K_rest_f = K_restored.float()
-        V_rest_f = V_restored.float()
-
-        attn_orig = F.softmax(Q_f @ K_orig_f.T * scale, dim=-1)   # [n_q, seq_len]
-        attn_rest = F.softmax(Q_f @ K_rest_f.T * scale, dim=-1)
-
-        delta_attn_bound = float((attn_orig - attn_rest).abs().max())
-
-        if V_orig is not None:
-            V_orig_f = V_orig.float()
-            val_diff = (V_orig_f - V_rest_f).norm(dim=-1)  # [seq_len]
-            max_attn_weight = float(attn_orig.max())
-            delta_value_bound = max_attn_weight * float(val_diff.max())
-        else:
-            # V_orig 없는 경우: attn_rest 기반 추정
-            out_rest = attn_rest @ V_rest_f
-            delta_value_bound = float(out_rest.norm()) * 0.01   # 보수적 1% 추정
-
-        error_bound = delta_attn_bound + delta_value_bound
-        return error_bound, delta_attn_bound, delta_value_bound
-
-    # ------------------------------------------------------------------ #
-    # 폴백 사다리 결정                                                      #
-    # ------------------------------------------------------------------ #
-
-    def decide_fallback_level(
-        self,
-        error_bound: float,
-        delta_attn_bound: float,
-    ) -> int:
-        """오류 경계 기반 폴백 레벨 결정.
-
-        Level 0: error_bound ≤ error_threshold → INT8K+INT4V 정상
-        Level 1: error_bound > error_threshold → INT8K+FP16V
-        Level 2: delta_attn_bound > error_threshold/2 → FP16K+FP16V
-        """
-        if error_bound <= self.config.error_threshold:
-            return 0
-        if delta_attn_bound <= self.config.error_threshold / 2:
-            return 1  # Value만 FP16 복원
-        return 2      # Key+Value FP16 복원 (완전 정확)
-
-    # ------------------------------------------------------------------ #
-    # CacheStore 인터페이스                                                #
-    # ------------------------------------------------------------------ #
-
-    def put(self, key: str, value: torch.Tensor) -> None:
-        """KV 텐서를 INT8K+INT4V로 압축 저장 + FP16 원본 CPU 보존.
+        conc = ||mean(vecs)||_2 / mean(||vecs||_2)  clamped to [0, 1]
 
         Args:
-            key: 캐시 키
-            value: [seq_len, d_head] FP16 또는 FP32 KV 텐서
-                   (단순화: value가 Key 텐서를 대표. 실제 구현에서 K/V 분리 필요)
+            vecs: [T, d_head] FP32
+
+        Returns:
+            float in [0, 1]
+        """
+        vecs_f = vecs.float()
+        mu = vecs_f.mean(dim=0)
+        mu_norm = float(mu.norm())
+        mean_norms = float(vecs_f.norm(dim=-1).mean())
+        raw = mu_norm / (mean_norms + 1e-8)
+        return float(min(max(raw, 0.0), 1.0))
+
+    def compute_dist_pref_scores(
+        self,
+        mu_q: torch.Tensor,           # [d_head] FP32
+        key_positions: torch.Tensor,  # [N] int64
+        pos_q: int,
+    ) -> torch.Tensor:
+        """삼각함수 급수 거리 선호도 점수.
+
+        dist_pref(k_i) = sum_{d=1}^{d_k/2}
+            [|mu_Q[2d-1]| * cos(theta_d * |pos_i - pos_q|)
+           + |mu_Q[2d]|   * sin(theta_d * |pos_i - pos_q|)]
+
+        Returns:
+            [N] FP32
+        """
+        device = mu_q.device
+        rope_freqs = self._rope_freqs.to(device=device, dtype=torch.float32)
+        delta_pos = (key_positions.float() - float(pos_q)).abs()  # [N]
+        phase = delta_pos.unsqueeze(1) * rope_freqs.unsqueeze(0)  # [N, d_k/2]
+        half_d = self.config.d_head // 2
+        mu_odd  = mu_q.float()[0::2][:half_d].abs()  # |mu_Q[2d-1]|
+        mu_even = mu_q.float()[1::2][:half_d].abs()  # |mu_Q[2d]|
+        scores = mu_odd.unsqueeze(0) * torch.cos(phase) \
+               + mu_even.unsqueeze(0) * torch.sin(phase)  # [N, d_k/2]
+        return scores.sum(dim=-1)  # [N]
+
+    def select_kv(
+        self,
+        Q: torch.Tensor,                          # [T_q, d_head] pre-RoPE
+        K: torch.Tensor,                          # [N, d_head] pre-RoPE
+        V: torch.Tensor,                          # [N, d_head]
+        key_positions: Optional[torch.Tensor] = None,  # [N] int64
+        pos_q: int = 0,
+        is_reasoning_task: bool = False,
+        kv_pool_pressure: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, float]:
+        """집중도 + 삼각함수 선호도로 중요 KV 선택.
+
+        Returns:
+            (K_selected, V_selected, kept_indices, conc_q, conc_k, kv_budget_ratio)
 
         Algorithm:
-          1. value를 FP16으로 변환 후 CPU에 backup 저장 (비동기 D2H)
-          2. INT8 양자화: key_int8, key_scale, key_zero
-          3. INT4 양자화: value_int4_packed, value_scale, value_zero
-          4. CertifiedKVEntry 생성 + _store에 저장
-          5. max_entries 초과 시 evict()
+          budget = kv_budget_ratio_reasoning if is_reasoning_task else kv_budget_ratio_default
+          if kv_pool_pressure >= high_pressure_threshold:
+              budget *= (1.0 - high_pressure_extra_reduction)
+          n_keep = max(1, int(N * budget))
+
+          mu_q = Q.float().mean(dim=0)
+          conc_q = compute_concentration(Q)
+          conc_k = compute_concentration(K)
+
+          if key_positions is None:
+              key_positions = torch.arange(N)
+          dist_pref = compute_dist_pref_scores(mu_q, key_positions, pos_q)
+
+          k_norms = K.norm(dim=-1)
+          norm_score = k_norms / (k_norms.max() + 1e-8)
+
+          importance = conc_q * dist_pref + (1.0 - conc_q) * norm_score
+          kept_indices = importance.topk(n_keep).indices.sort().values
+
+          return K[kept_indices], V[kept_indices], kept_indices, conc_q, conc_k, budget
         """
+        Q_f = Q.float()
+        K_f = K.float()
+        N = K_f.shape[0]
+        device = K_f.device
+
+        # 1. 예산 비율
+        if is_reasoning_task:
+            budget = self.config.kv_budget_ratio_reasoning
+        else:
+            budget = self.config.kv_budget_ratio_default
+        if kv_pool_pressure >= self.config.high_pressure_threshold:
+            budget = budget * (1.0 - self.config.high_pressure_extra_reduction)
+        n_keep = max(1, int(N * budget))
+
+        # 2. 집중도
+        mu_q = Q_f.mean(dim=0)
+        conc_q = self.compute_concentration(Q_f)
+        conc_k = self.compute_concentration(K_f)
+
+        # 3. 삼각함수 거리 선호도
+        if key_positions is None:
+            key_positions = torch.arange(N, dtype=torch.int64, device=device)
+        dist_pref = self.compute_dist_pref_scores(mu_q, key_positions, pos_q)
+
+        # 4. K 노름 보조 점수
+        k_norms = K_f.norm(dim=-1)
+        norm_score = k_norms / (k_norms.max() + 1e-8)
+
+        # 5. 집중도 가중 결합
+        importance = conc_q * dist_pref + (1.0 - conc_q) * norm_score
+
+        # 6. 상위 n_keep 선택
+        kept_indices = importance.topk(n_keep).indices.sort().values
+
+        self._conc_q_history.append(conc_q)
+        self._conc_k_history.append(conc_k)
+
+        return (
+            K[kept_indices].to(K.dtype),
+            V[kept_indices].to(V.dtype),
+            kept_indices,
+            conc_q,
+            conc_k,
+            budget,
+        )
+
+    @staticmethod
+    def detect_reasoning_task(prompt_text: str) -> bool:
+        """<think> 태그 포함 여부로 추론 태스크 감지."""
+        return "<think>" in prompt_text or "</think>" in prompt_text
+
+    # ---- CacheStore 인터페이스 ----
+
+    def put(self, key: str, value: torch.Tensor) -> None:
+        """단순 저장 (압축 없음 — Q 정보 없이 호출되는 경우 호환성)."""
         if key in self._store:
             return
         if len(self._store) >= self.config.max_entries:
             self.evict()
-
-        x = value.float()
-        # FP16 원본 CPU 백업
-        fp16_backup = value.detach().cpu().to(torch.float16)
-
-        # INT8 Key 양자화
-        k_int8, k_scale, k_zero = self._quantize_int8(x)
-
-        # INT4 Value 양자화 (동일 텐서 사용 — K/V 분리 시 별도 처리)
-        v_int4_packed, v_scale, v_zero = self._quantize_int4(x)
-
-        entry = CertifiedKVEntry(
-            key_int8=k_int8,
-            value_int4_packed=v_int4_packed,
-            key_scale=k_scale,
-            key_zero=k_zero,
-            value_scale=v_scale,
-            value_zero=v_zero,
-            key_fp16_backup=fp16_backup,
-            value_fp16_backup=fp16_backup,
-            fallback_level=0,
+        seq_len = value.shape[0]
+        entry = SelectorKVEntry(
+            selected_kv=value.detach().clone(),
+            kept_indices=torch.arange(seq_len, dtype=torch.int64),
+            original_seq_len=seq_len,
+            conc_q=0.5,
+            conc_k=0.5,
+            kv_budget_ratio=self.config.kv_budget_ratio_default,
+            is_reasoning_task=False,
         )
         self._store[key] = entry
 
+    def put_compressed(
+        self,
+        key: str,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        key_positions: Optional[torch.Tensor] = None,
+        pos_q: int = 0,
+        is_reasoning_task: bool = False,
+        kv_pool_pressure: float = 0.0,
+    ) -> SelectorKVEntry:
+        """KV 선택 후 압축 저장 (권장)."""
+        if key in self._store:
+            return self._store[key]
+        if len(self._store) >= self.config.max_entries:
+            self.evict()
+        K_sel, V_sel, kept_idx, conc_q, conc_k, budget = self.select_kv(
+            Q, K, V, key_positions, pos_q, is_reasoning_task, kv_pool_pressure
+        )
+        entry = SelectorKVEntry(
+            selected_kv=K_sel.detach().clone(),
+            kept_indices=kept_idx,
+            original_seq_len=K.shape[0],
+            conc_q=conc_q,
+            conc_k=conc_k,
+            kv_budget_ratio=budget,
+            is_reasoning_task=is_reasoning_task,
+        )
+        self._store[key] = entry
+        return entry
+
     def get(self, key: str) -> Optional[torch.Tensor]:
-        """압축 KV 복원. 폴백 레벨에 따라 INT8/INT4 또는 FP16 복원."""
         if key not in self._store:
             self._misses += 1
             return None
         self._hits += 1
-        self._total_requests += 1
+        return self._store[key].selected_kv
 
-        entry = self._store[key]
-        d = self.config.d_head
-
-        # INT8 Key 역양자화
-        K_restored = self._dequantize_int8(entry.key_int8, entry.key_scale, entry.key_zero)
-        # INT4 Value 역양자화
-        V_restored = self._dequantize_int4(entry.value_int4_packed, entry.value_scale, entry.value_zero, d)
-
-        # 폴백 레벨에 따라 복원
-        if entry.fallback_level == 0:
-            return K_restored.to(torch.float16)
-        elif entry.fallback_level == 1:
-            # Value FP16 복원
-            self._fallback_count_level1 += 1
-            return entry.value_fp16_backup.float().to(torch.float16)
-        else:
-            # Level 2: Key+Value FP16 완전 복원
-            self._fallback_count_level2 += 1
-            return entry.key_fp16_backup.float().to(torch.float16)
-
-    def certify_and_update(
-        self,
-        key: str,
-        Q: torch.Tensor,
-    ) -> Tuple[int, float]:
-        """런타임 오류 경계 계산 및 폴백 레벨 업데이트.
-
-        Returns:
-            (new_fallback_level, error_bound)
-
-        호출 시점: 디코딩 스텝마다 어텐션 계산 전
-        """
-        if key not in self._store:
-            return 0, 0.0
-
-        entry = self._store[key]
-        d = self.config.d_head
-
-        K_restored = self._dequantize_int8(entry.key_int8, entry.key_scale, entry.key_zero)
-        V_restored = self._dequantize_int4(entry.value_int4_packed, entry.value_scale, entry.value_zero, d)
-        K_orig = entry.key_fp16_backup.float()
-        V_orig = entry.value_fp16_backup.float()
-
-        error_bound, delta_attn, _ = self.compute_error_bound(
-            Q.float(), K_orig, K_restored, V_restored, V_orig
-        )
-        self._error_bounds.append(error_bound)
-
-        new_level = self.decide_fallback_level(error_bound, delta_attn)
-        entry.fallback_level = new_level
-        return new_level, error_bound
+    def get_entry(self, key: str) -> Optional[SelectorKVEntry]:
+        return self._store.get(key)
 
     def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        """INT8K+INT4V 압축 후 복원값 반환 (accuracy 검증용)."""
-        x = value.float()
-        k_int8, k_scale, k_zero = self._quantize_int8(x)
-        v_int4_packed, v_scale, v_zero = self._quantize_int4(x)
-        K_restored = self._dequantize_int8(k_int8, k_scale, k_zero)
-        return K_restored.to(value.dtype)
+        """노름 기반 단순 압축 훅 (Q 없이 호출 시 fallback)."""
+        N = value.shape[0]
+        budget = self.config.kv_budget_ratio_default
+        n_keep = max(1, int(N * budget))
+        norms = value.float().norm(dim=-1)
+        kept = norms.topk(n_keep).indices.sort().values
+        return value[kept]
 
     def evict(self) -> int:
-        """LRU: 첫 번째 항목 퇴거."""
         if not self._store:
             return 0
-        key = next(iter(self._store))
-        entry = self._store.pop(key)
-        return entry.key_int8.nbytes + entry.value_int4_packed.nbytes
+        k = next(iter(self._store))
+        entry = self._store.pop(k)
+        return entry.selected_kv.nbytes
 
     def hit_rate(self) -> float:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
     def memory_bytes(self) -> int:
-        total = 0
-        for entry in self._store.values():
-            total += entry.key_int8.nbytes + entry.value_int4_packed.nbytes
-        return total
-
-    def memory_bytes_fp16_equivalent(self) -> int:
-        """FP16 동등 메모리 (압축 전 크기 추정)."""
-        total = 0
-        for entry in self._store.values():
-            seq_len = entry.key_int8.shape[0]
-            d = self.config.d_head
-            total += seq_len * d * 2 * 2  # K+V, FP16=2bytes
-        return total
+        return sum(e.selected_kv.nbytes for e in self._store.values())
 
     def memory_reduction_ratio(self) -> float:
-        """INT8K+INT4V vs FP16 메모리 감소율."""
-        fp16_equiv = self.memory_bytes_fp16_equivalent()
-        if fp16_equiv == 0:
+        """선택된 KV 대비 원본 FP16 동등 메모리 감소율."""
+        total_selected = 0
+        total_original = 0
+        for e in self._store.values():
+            d = e.selected_kv.shape[-1]
+            total_selected += e.selected_kv.nbytes
+            total_original += e.original_seq_len * d * 2  # FP16=2bytes
+        if total_original == 0:
             return 0.0
-        return 1.0 - self.memory_bytes() / fp16_equiv
+        return 1.0 - total_selected / total_original
 
-    def fallback_rate_level1(self) -> float:
-        return self._fallback_count_level1 / max(1, self._total_requests)
-
-    def fallback_rate_level2(self) -> float:
-        return self._fallback_count_level2 / max(1, self._total_requests)
-
-    def error_bound_stats(self) -> dict:
-        if not self._error_bounds:
-            return {"mean": 0.0, "p99": 0.0, "max": 0.0}
-        t = torch.tensor(self._error_bounds)
+    def concentration_stats(self) -> dict:
+        """conc_Q/conc_K 분포 통계 (JSON 기록용)."""
+        if not self._conc_q_history:
+            return {"conc_q_mean": 0.0, "conc_k_mean": 0.0}
         return {
-            "mean": float(t.mean()),
-            "p99": float(t.quantile(0.99)),
-            "max": float(t.max()),
-        }
-
-    def certified_accuracy_report(self) -> dict:
-        """배치 완료 시 자동 생성되는 정확도 인증 리포트."""
-        return {
-            "fallback_rate_level1": self.fallback_rate_level1(),
-            "fallback_rate_level2": self.fallback_rate_level2(),
-            "error_bound_mean": self.error_bound_stats()["mean"],
-            "error_bound_p99": self.error_bound_stats()["p99"],
-            "memory_reduction_ratio": self.memory_reduction_ratio(),
-            "error_threshold": self.config.error_threshold,
+            "conc_q_mean": float(sum(self._conc_q_history) / len(self._conc_q_history)),
+            "conc_k_mean": float(sum(self._conc_k_history) / len(self._conc_k_history)),
         }
 
     def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        raise NotImplementedError("RuntimeCertifiedQuantizedAttentionCodec does not support importance masking.")
+        """kept_indices 기반 bool 마스크 [original_seq_len] 반환."""
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        mask = torch.zeros(entry.original_seq_len, dtype=torch.bool)
+        mask[entry.kept_indices] = True
+        return mask
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
-        self._fallback_count_level1 = 0
-        self._fallback_count_level2 = 0
-        self._total_requests = 0
-        self._error_bounds = []
+        self._conc_q_history.clear()
+        self._conc_k_history.clear()
 ```
 
 ---
 
-### KVSculptDistillationCodec (Activity C — 2순위)
+### AttentionMatchingClosedFormCodec (Activity C — 2순위)
 
 ```python
-# src/cache/kvsculpt_distillation_codec.py
+# src/cache/attention_matching_closed_form_codec.py
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
@@ -577,815 +496,674 @@ from src.cache.base import CacheStore
 
 
 @dataclass
-class KVSculptConfig:
-    n_layers: int = 12
+class AttentionMatchingConfig:
     d_head: int = 128
-    total_budget_ratio: float = 0.50      # 전체 KV 유지 비율 (기본 50%)
-    gamma: float = 0.5                    # 난이도 반응 강도 (γ=0: 균일 배분)
-    lbfgs_max_iter: int = 5               # L-BFGS 반복 횟수 (경량화)
-    alternating_rounds: int = 3           # 교대 반복 횟수
-    convergence_tol: float = 1e-4         # 수렴 기준 KL 발산 변화량
-    pilot_n_sequences: int = 50           # 파일럿 압축 보정 시퀀스 수
+    n_ref_queries: int = 32       # 레퍼런스 쿼리 수 m
+    compression_ratio: int = 50   # 압착 비율 (50x)
+    alternating_rounds: int = 3   # K_c/V_c 교대 최적화 반복 횟수
     max_entries: int = 1000
     seed: int = 42
 
 
-class KVSculptDistillationCodec(CacheStore):
-    """KVSculpt: KV Cache Compression as Distillation (arXiv 2603.27819).
+@dataclass
+class CompactKVEntry:
+    compact_k: torch.Tensor     # [m_c, d_head] FP32
+    compact_v: torch.Tensor     # [m_c, d_head] FP32
+    ref_queries: torch.Tensor   # [m, d_head] FP32
+    original_seq_len: int
+    compression_ratio_actual: float
 
-    Activity C: 파일럿 압축 → 레이어별 KL 발산 난이도 프로파일링 →
-                난이도 비례 예산 배분 → L-BFGS Key + 최소제곱 Value 교대 최적화.
+
+class AttentionMatchingClosedFormCodec(CacheStore):
+    """Attention Matching 닫힌 형태 최소제곱 잠재 공간 KV 압착 코덱 (arXiv 2602.16284).
+
+    Activity C: KV Cache Compression.
 
     핵심 알고리즘:
-      1. 파일럿 실행: 균일 50% 압축으로 레이어별 KL 발산(난이도) 측정.
-      2. 난이도 비례 예산: budget(l) = total × (1 + γ × norm_difficulty(l)).
-         고난이도 레이어 → 더 많은 KV 유지 (낮은 압축률).
-      3. L-BFGS Key 최적화: min KL(attn_orig || attn_compressed).
-      4. 최소제곱 Value: 어텐션 가중합 보존하는 토큰 budget(l)개 선택.
-      5. 교대 반복 (3회).
+      Step 1: Q_ref 구성 (m=32, 균등 샘플링 + 중요도 혼합).
+      Step 2: 어텐션 매스 매칭 — 닫힌 형태 K_c:
+        A_orig = softmax(Q_ref K_orig^T / sqrt(d))           # [m, N]
+        K_c = sqrt(d) * Q_ref_pinv * log(A_orig + eps)       의사역행렬 기반
+        Q_ref_pinv = (Q_ref^T Q_ref)^{-1} Q_ref^T           # [d_head, m]
+        계산 복잡도: O(m^3) = O(32^3) < 0.1ms
+      Step 3: 어텐션 출력 매칭 — 닫힌 형태 V_c:
+        A_c = softmax(Q_ref K_c^T / sqrt(d))                 # [m, m_c]
+        V_c = A_c_pinv * A_orig * V_orig                     의사역행렬 기반
+        계산 복잡도: O(m_c^3) < 1ms (m_c = N / compression_ratio)
+      Step 4: K_c/V_c 교대 최적화 alternating_rounds=3회.
 
-    레이어 간 압축 난이도 최대 100× 차이 (KVSculpt 원논문 실증):
-      → 균일 예산 배분은 비효율적. 난이도 비례 배분으로 동일 메모리에서 더 낮은 KL.
+    accuracy-preserving 근거:
+      - 닫힌 형태 해: 파라미터화 범위 내 전역 최솟값 보장.
+      - 어텐션 출력 보존 목표 함수: 모델 출력에 직접 영향하는 벡터를 직접 최소화.
+      - compression_ratio=10x: accuracy delta ±0.2% 이내 (보수적 추정).
+      - compression_ratio=50x: Cartridges 수준 ±0.5% 이내 (원논문 기반).
     """
 
-    def __init__(self, config: KVSculptConfig) -> None:
+    def __init__(self, config: AttentionMatchingConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
-        self._store: Dict[str, torch.Tensor] = {}
+        self._store: Dict[str, CompactKVEntry] = {}
         self._hits: int = 0
         self._misses: int = 0
-        # 레이어별 난이도 프로파일 [n_layers] (초기: 균일)
-        self._layer_difficulty: torch.Tensor = torch.ones(config.n_layers)
-        self._layer_budget: torch.Tensor = torch.full((config.n_layers,), config.total_budget_ratio)
-        self._profile_done: bool = False
 
-    def pilot_profile_layer_difficulty(
-        self,
-        calibration_sequences: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-        # List of (Q, K, V) per sequence, each [seq_len, d_head]
-    ) -> None:
-        """파일럿 압축 실행으로 레이어별 KL 발산 난이도 프로파일링.
+    def build_ref_queries(self, Q_context: torch.Tensor) -> torch.Tensor:
+        """레퍼런스 쿼리 Q_ref 구성.
 
-        Algorithm:
-          for each layer l:
-            kl_divergences = []
-            for each (Q, K, V) in calibration_sequences:
-              # 균일 50% 압축
-              budget_k = max(1, int(seq_len * 0.5))
-              selected_idx = topk(importance_scores(Q, K), budget_k).indices
-              K_compressed = K[selected_idx]
-              V_compressed = V[selected_idx]
-              Q_adj = Q  # 쿼리 고정
-              attn_full = softmax(Q @ K.T / √d)
-              # K_compressed로 full-size 어텐션 근사 (패딩 없음 → KL 직접)
-              attn_comp = softmax(Q @ K_compressed.T / √d)
-              kl = KL(attn_full[:, selected_idx] || attn_comp)
-              kl_divergences.append(kl)
-            difficulty[l] = mean(kl_divergences)
+        구성: 균등 샘플링(m//2) + 노름 기반 중요도 상위(m//2) 혼합.
 
-          # 정규화 + 난이도 비례 예산 배분
-          norm_diff = (difficulty - difficulty.min()) / (difficulty.max() - difficulty.min() + 1e-8)
-          raw_budget = total_budget_ratio * (1 + gamma * norm_diff)  # [n_layers]
-          # 예산 보존: sum(budget) = n_layers * total_budget_ratio
-          budget = raw_budget / raw_budget.mean() * total_budget_ratio
-
-          _layer_difficulty = difficulty
-          _layer_budget = budget.clamp(0.1, 0.9)
-          _profile_done = True
-        """
-        n_layers = self.config.n_layers
-        kl_per_layer = torch.zeros(n_layers)
-
-        for layer_idx in range(n_layers):
-            kl_list = []
-            for Q, K, V in calibration_sequences:
-                Q_f, K_f = Q.float(), K.float()
-                seq_len = K_f.shape[0]
-                budget_k = max(1, int(seq_len * 0.5))
-                scale = self.config.d_head ** -0.5
-                scores = (Q_f @ K_f.T) * scale   # [n_q, seq_len]
-                importance = scores.mean(dim=0)   # [seq_len] — 평균 쿼리 중요도
-                selected_idx = importance.topk(budget_k).indices.sort().values
-                K_comp = K_f[selected_idx]
-                attn_full = F.softmax(Q_f @ K_f.T * scale, dim=-1)     # [n_q, seq_len]
-                attn_comp = F.softmax(Q_f @ K_comp.T * scale, dim=-1)  # [n_q, budget_k]
-                # KL 발산: 압축 후 분포의 엔트로피 변화 근사
-                attn_full_sel = attn_full[:, selected_idx] + 1e-10
-                attn_comp_clamp = attn_comp + 1e-10
-                kl = F.kl_div(attn_comp_clamp.log(), attn_full_sel, reduction="batchmean").item()
-                kl_list.append(max(0.0, kl))
-            kl_per_layer[layer_idx] = float(torch.tensor(kl_list).mean()) if kl_list else 0.0
-
-        self._layer_difficulty = kl_per_layer
-        # 난이도 비례 예산 배분
-        dmin, dmax = kl_per_layer.min(), kl_per_layer.max()
-        norm_diff = (kl_per_layer - dmin) / (dmax - dmin + 1e-8)
-        raw_budget = self.config.total_budget_ratio * (1 + self.config.gamma * norm_diff)
-        self._layer_budget = (raw_budget / raw_budget.mean() * self.config.total_budget_ratio).clamp(0.1, 0.9)
-        self._profile_done = True
-
-    def get_layer_budget(self, layer_idx: int) -> float:
-        """레이어별 KV 유지 비율 반환."""
-        if not self._profile_done:
-            return self.config.total_budget_ratio
-        idx = min(layer_idx, self.config.n_layers - 1)
-        return float(self._layer_budget[idx])
-
-    def distill_compress(
-        self,
-        Q: torch.Tensor,   # [n_q, d_head]
-        K: torch.Tensor,   # [seq_len, d_head]
-        V: torch.Tensor,   # [seq_len, d_head]
-        layer_idx: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """L-BFGS Key + 최소제곱 Value 교대 증류 압축.
+        Args:
+            Q_context: [T, d_head] FP32
 
         Returns:
-            (selected_indices, K_selected, V_selected)
-            selected_indices: [budget_k] int64
+            Q_ref: [m, d_head] FP32
 
         Algorithm:
-          budget_ratio = get_layer_budget(layer_idx)
-          budget_k = max(1, int(seq_len * budget_ratio))
+          m = n_ref_queries
+          T = Q_context.shape[0]
+          half_m = m // 2
+          uniform_step = max(1, T // half_m)
+          uniform_idx = arange(0, T, uniform_step)[:half_m]
+          norms = Q_context.norm(dim=-1)
+          top_idx = norms.topk(m - len(uniform_idx)).indices
+          all_idx = unique(cat([uniform_idx, top_idx]))[:m]
+          if len(all_idx) < m: pad with repetition
+          return Q_context[all_idx[:m]]
+        """
+        m = self.config.n_ref_queries
+        T = Q_context.shape[0]
+        half_m = m // 2
 
-          # 초기 토큰 선택: 어텐션 중요도 기반
-          importance = softmax(Q @ K.T / √d, dim=-1).mean(dim=0)  # [seq_len]
-          selected_idx = topk(importance, budget_k).indices.sort().values
+        uniform_step = max(1, T // max(1, half_m))
+        uniform_idx = torch.arange(0, T, uniform_step, device=Q_context.device)[:half_m]
+
+        norms = Q_context.float().norm(dim=-1)
+        top_m = m - len(uniform_idx)
+        top_idx = norms.topk(min(top_m, T)).indices
+
+        all_idx = torch.unique(torch.cat([uniform_idx, top_idx]))[:m]
+        if len(all_idx) < m:
+            repeat_times = (m - len(all_idx)) // max(1, len(all_idx)) + 1
+            pad = all_idx.repeat(repeat_times)[: m - len(all_idx)]
+            all_idx = torch.cat([all_idx, pad])
+
+        return Q_context.float()[all_idx[:m]]
+
+    def closed_form_k(
+        self,
+        Q_ref: torch.Tensor,   # [m, d_head]
+        K_orig: torch.Tensor,  # [N, d_head]
+    ) -> torch.Tensor:
+        """어텐션 매스 매칭 닫힌 형태 K_c.
+
+        A_orig = softmax(Q_ref K_orig^T / sqrt(d))  # [m, N]
+        K_c^T = sqrt(d) * Q_ref_pinv * log(A_orig + eps)
+        Q_ref_pinv = (Q_ref^T Q_ref)^{-1} Q_ref^T   # [d_head, m]
+
+        Returns:
+            K_c_full: [N, d_head] — 이후 어텐션 중요도로 m_c개 선택
+        """
+        scale = self.config.d_head ** -0.5
+        A_orig = F.softmax(Q_ref @ K_orig.T * scale, dim=-1)  # [m, N]
+        log_A = torch.log(A_orig + 1e-10)                      # [m, N]
+
+        QTQ = Q_ref.T @ Q_ref  # [d_head, d_head]
+        try:
+            QTQ_inv = torch.linalg.inv(
+                QTQ + 1e-6 * torch.eye(QTQ.shape[0], device=QTQ.device, dtype=QTQ.dtype)
+            )
+        except Exception:
+            QTQ_inv = torch.linalg.pinv(QTQ)
+        Q_pinv = QTQ_inv @ Q_ref.T  # [d_head, m]
+
+        K_c_T = (self.config.d_head ** 0.5) * (Q_pinv @ log_A)  # [d_head, N]
+        return K_c_T.T  # [N, d_head]
+
+    def closed_form_v(
+        self,
+        Q_ref: torch.Tensor,     # [m, d_head]
+        K_c: torch.Tensor,       # [m_c, d_head]
+        A_orig_sel: torch.Tensor,  # [m, m_c] A_orig 중 선택된 열만
+        V_orig: torch.Tensor,    # [N, d_head]
+    ) -> torch.Tensor:
+        """어텐션 출력 매칭 닫힌 형태 V_c.
+
+        A_c = softmax(Q_ref K_c^T / sqrt(d))   # [m, m_c]
+        V_c = A_c_pinv * A_orig_sel * V_orig
+
+        Returns:
+            V_c: [m_c, d_head]
+        """
+        scale = self.config.d_head ** -0.5
+        A_c = F.softmax(Q_ref @ K_c.T * scale, dim=-1)  # [m, m_c]
+        try:
+            ATA = A_c.T @ A_c  # [m_c, m_c]
+            ATA_inv = torch.linalg.inv(
+                ATA + 1e-6 * torch.eye(ATA.shape[0], device=ATA.device, dtype=ATA.dtype)
+            )
+            A_pinv = ATA_inv @ A_c.T  # [m_c, m]
+        except Exception:
+            A_pinv = torch.linalg.pinv(A_c)  # [m_c, m]
+
+        target = A_orig_sel.T @ V_orig[: A_orig_sel.shape[1]]  # [m_c, d_head] — 선택 V
+        # 더 정확한 버전: A_orig_sel @ V_orig 재계산
+        # A_orig_sel: [m, m_c], V_orig: [N, d_head]
+        # target = (A_orig_sel).sum(dim=1) @ V_orig 의 근사
+        target = A_c @ (A_orig_sel.T @ V_orig[:A_orig_sel.shape[1]])  # [m, d_head]
+        V_c = A_pinv @ target  # [m_c, d_head]
+        return V_c
+
+    def compact(
+        self,
+        Q_context: torch.Tensor,  # [T, d_head]
+        K_orig: torch.Tensor,     # [N, d_head]
+        V_orig: torch.Tensor,     # [N, d_head]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """닫힌 형태 최소제곱으로 K/V를 m_c 토큰으로 압착.
+
+        Returns:
+            (K_c, V_c, Q_ref)
+            K_c: [m_c, d_head], V_c: [m_c, d_head], Q_ref: [m, d_head]
+
+        Algorithm:
+          Q_ref = build_ref_queries(Q_context)
+          N = K_orig.shape[0]
+          m_c = max(1, N // compression_ratio)
+          A_orig = softmax(Q_ref K_orig^T / sqrt(d))    # [m, N]
 
           for round in range(alternating_rounds):
-            # L-BFGS Key 최적화: minimize KL(attn_full || attn_compressed_selected)
-            # (경량화: 중요도 재계산으로 토큰 재선택)
-            attn_target = softmax(Q @ K.T / √d, dim=-1)   # [n_q, seq_len]
-            for lbfgs_iter in range(lbfgs_max_iter):
-              importance = (Q @ K[selected_idx].T / √d).mean(dim=0)  # [budget_k]
-              # importance 기반 재정렬 (soft L-BFGS 근사)
-              selected_idx = topk(importance, budget_k).indices.sort().values
+            K_c_full = closed_form_k(Q_ref, K_orig)     # [N, d_head]
+            # 어텐션 중요도로 m_c 토큰 선택
+            attn_importance = A_orig.mean(dim=0)          # [N]
+            top_mc_idx = topk(attn_importance, m_c).sort()
+            K_c = K_c_full[top_mc_idx]                    # [m_c, d_head]
+            # 닫힌 형태 V_c
+            A_orig_sel = A_orig[:, top_mc_idx]            # [m, m_c]
+            V_c = closed_form_v(Q_ref, K_c, A_orig_sel, V_orig)
 
-            # 최소제곱 Value: 선택된 토큰의 Value 그대로 유지
-            # (V_selected = V[selected_idx])
-
-            # 수렴 체크
-            kl_before = KL(attn_target || softmax(Q @ K[selected_idx].T / √d))
-            if |kl_before - kl_prev| < convergence_tol: break
-            kl_prev = kl_before
-
-          return selected_idx, K[selected_idx], V[selected_idx]
+          return K_c, V_c, Q_ref
         """
-        Q_f, K_f, V_f = Q.float(), K.float(), V.float()
-        seq_len = K_f.shape[0]
-        budget_ratio = self.get_layer_budget(layer_idx)
-        budget_k = max(1, int(seq_len * budget_ratio))
+        Q_f = Q_context.float()
+        K_f = K_orig.float()
+        V_f = V_orig.float()
+        N = K_f.shape[0]
+        m_c = max(1, N // self.config.compression_ratio)
         scale = self.config.d_head ** -0.5
 
-        # 초기 선택: 어텐션 중요도
-        scores = (Q_f @ K_f.T) * scale      # [n_q, seq_len]
-        importance_init = F.softmax(scores, dim=-1).mean(dim=0)   # [seq_len]
-        selected_idx = importance_init.topk(budget_k).indices.sort().values
+        Q_ref = self.build_ref_queries(Q_f)
+        A_orig = F.softmax(Q_ref @ K_f.T * scale, dim=-1)  # [m, N]
 
-        attn_target = F.softmax(scores, dim=-1)  # [n_q, seq_len]
-        kl_prev = float('inf')
-
+        K_c = None
+        V_c = None
         for _ in range(self.config.alternating_rounds):
-            # L-BFGS Key 최적화 (경량화: 반복적 중요도 재계산)
-            for _ in range(self.config.lbfgs_max_iter):
-                scores_sel = (Q_f @ K_f[selected_idx].T) * scale   # [n_q, budget_k]
-                importance_sel = F.softmax(scores_sel, dim=-1).mean(dim=0)  # [budget_k]
-                # 가장 중요도 낮은 선택 토큰을 비선택 중 중요도 높은 토큰으로 교체
-                full_importance = importance_init.clone()
-                full_importance[selected_idx] = importance_sel
-                new_selected = full_importance.topk(budget_k).indices.sort().values
-                if torch.equal(new_selected, selected_idx):
-                    break
-                selected_idx = new_selected
-
-            # 수렴 체크
-            scores_sel = (Q_f @ K_f[selected_idx].T) * scale
-            attn_sel = F.softmax(scores_sel, dim=-1) + 1e-10
-            attn_tgt_sel = attn_target[:, selected_idx] + 1e-10
-            kl_now = F.kl_div(attn_sel.log(), attn_tgt_sel, reduction="batchmean").item()
-            if abs(kl_now - kl_prev) < self.config.convergence_tol:
-                break
-            kl_prev = kl_now
-
-        return selected_idx, K[selected_idx], V[selected_idx]
-
-    # CacheStore 인터페이스
-    def put(self, key: str, value: torch.Tensor) -> None:
-        if key in self._store:
-            return
-        if len(self._store) >= self.config.max_entries:
-            self.evict()
-        self._store[key] = value.detach().clone()
-
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        if key in self._store:
-            self._hits += 1
-            return self._store[key]
-        self._misses += 1
-        return None
-
-    def evict(self) -> int:
-        if not self._store:
-            return 0
-        key = next(iter(self._store))
-        v = self._store.pop(key)
-        return v.nbytes
-
-    def hit_rate(self) -> float:
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
-
-    def memory_bytes(self) -> int:
-        return sum(v.nbytes for v in self._store.values())
-
-    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        return value  # 단순 저장; distill_compress()는 별도 호출
-
-    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        raise NotImplementedError
-
-    def reset_stats(self) -> None:
-        self._hits = 0
-        self._misses = 0
-```
-
----
-
-### RuntimeCertifiedKVSculptDistillationPipeline (Cross-1, C-1+C-2)
-
-```python
-# src/cache/runtime_certified_distillation_pipeline.py
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import torch
-
-from src.cache.base import CacheStore
-from src.cache.runtime_certified_quant_codec import (
-    RuntimeCertifiedQuantizedAttentionCodec, RuntimeCertifiedConfig
-)
-from src.cache.kvsculpt_distillation_codec import (
-    KVSculptDistillationCodec, KVSculptConfig
-)
-
-
-@dataclass
-class DistillationPipelineConfig:
-    c1_config: Optional[RuntimeCertifiedConfig] = None
-    c2_config: Optional[KVSculptConfig] = None
-    adaptive_threshold_scale: float = 1.0   # 난이도 높은 레이어의 임계값 강화 계수
-    online_budget_realloc_window: int = 100  # 폴백 비율 집계 윈도우 (배치 수)
-    seed: int = 42
-
-
-class RuntimeCertifiedKVSculptDistillationPipeline(CacheStore):
-    """RuntimeCertified + KVSculpt 폐루프 인증 증류 압축 파이프라인 (Cross-1, C-1+C-2).
-
-    통합 처리 흐름:
-      Step 1 (오프라인): KVSculpt 파일럿 실행 → 레이어별 KL 발산 난이도 프로파일.
-      Step 2 (오프라인): 난이도 비례 초기 예산 배분.
-      Step 3 (프리필): 레이어별 L-BFGS + 최소제곱 교대 증류 압축 → 압축 KV 선택.
-      Step 4 (디코딩): RuntimeCertified 이중 항 오류 경계 계산 (헤드별·스텝별).
-      Step 5 (온라인): error_bound > adaptive_threshold(layer) 시 예산 즉각 증가.
-      Step 6 (폴백): 예산 증가 후에도 초과하면 FP16 폴백.
-
-    adaptive_threshold(layer_l) = error_threshold / (1 + norm_difficulty(l))
-      → 난이도 높은 레이어는 더 엄격한 임계값 적용.
-
-    폐루프 품질 제어:
-      이전 N 배치 폴백 비율 누적 → 폴백이 잦은 레이어는 다음 배치에서 예산 증가.
-    """
-
-    def __init__(self, config: DistillationPipelineConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        c1_cfg = config.c1_config or RuntimeCertifiedConfig(seed=config.seed)
-        c2_cfg = config.c2_config or KVSculptConfig(seed=config.seed)
-        self.certified_codec = RuntimeCertifiedQuantizedAttentionCodec(c1_cfg)
-        self.distillation_codec = KVSculptDistillationCodec(c2_cfg)
-        self._layer_fallback_counts: Dict[int, int] = {}
-        self._layer_request_counts: Dict[int, int] = {}
-
-    def run_pipeline(
-        self,
-        Q: torch.Tensor,   # [n_q, d_head]
-        K: torch.Tensor,   # [seq_len, d_head]
-        V: torch.Tensor,   # [seq_len, d_head]
-        layer_idx: int,
-        cache_key: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        """증류 압축 + 런타임 인증 통합 실행.
-
-        Returns:
-            (K_final, V_final, report_dict)
-        """
-        # Step 3: KVSculpt 증류 압축
-        selected_idx, K_distilled, V_distilled = self.distillation_codec.distill_compress(
-            Q, K, V, layer_idx
-        )
-
-        # Step 3b: RuntimeCertified INT8K+INT4V 압축 (증류된 K/V에 적용)
-        self.certified_codec.put(cache_key, K_distilled)
-
-        # Step 4: 오류 경계 계산
-        fallback_level, error_bound = self.certified_codec.certify_and_update(cache_key, Q)
-
-        # Step 5: 온라인 예산 재배분
-        self._layer_request_counts[layer_idx] = self._layer_request_counts.get(layer_idx, 0) + 1
-        if fallback_level > 0:
-            self._layer_fallback_counts[layer_idx] = self._layer_fallback_counts.get(layer_idx, 0) + 1
-            # 예산 증가: 현재 레이어 budget을 10% 상향
-            if self.distillation_codec._profile_done:
-                n = self.distillation_codec.config.n_layers
-                idx = min(layer_idx, n - 1)
-                self.distillation_codec._layer_budget[idx] = min(
-                    0.9, float(self.distillation_codec._layer_budget[idx]) + 0.05
+            K_c_full = self.closed_form_k(Q_ref, K_f)       # [N, d_head]
+            attn_importance = A_orig.mean(dim=0)              # [N]
+            top_mc_idx = attn_importance.topk(m_c).indices.sort().values
+            K_c = K_c_full[top_mc_idx]                        # [m_c, d_head]
+            A_orig_sel = A_orig[:, top_mc_idx]                # [m, m_c]
+            # V_c: closed-form
+            A_c = F.softmax(Q_ref @ K_c.T * scale, dim=-1)   # [m, m_c]
+            try:
+                ATA = A_c.T @ A_c
+                ATA_inv = torch.linalg.inv(
+                    ATA + 1e-6 * torch.eye(ATA.shape[0], device=ATA.device, dtype=ATA.dtype)
                 )
+                A_pinv = ATA_inv @ A_c.T                       # [m_c, m]
+            except Exception:
+                A_pinv = torch.linalg.pinv(A_c)
+            # target: A_orig * V_orig = [m, d_head]
+            target_v = A_orig @ V_f                            # [m, d_head]
+            V_c = A_pinv @ target_v                            # [m_c, d_head]
+            # A_orig 갱신
+            A_orig = F.softmax(Q_ref @ K_f.T * scale, dim=-1)
 
-        # Step 6: 최종 K/V 결정
-        K_final = K_distilled if fallback_level == 0 else K
-        V_final = V_distilled if fallback_level == 0 else V
+        return K_c.to(K_orig.dtype), V_c.to(V_orig.dtype), Q_ref
 
-        report = {
-            "layer_idx": layer_idx,
-            "fallback_level": fallback_level,
-            "error_bound": error_bound,
-            "selected_ratio": len(selected_idx) / max(1, K.shape[0]),
-        }
-        return K_final, V_final, report
+    # ---- CacheStore 인터페이스 ----
 
-    # CacheStore 인터페이스 (certified_codec에 위임)
     def put(self, key: str, value: torch.Tensor) -> None:
-        self.certified_codec.put(key, value)
-
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        return self.certified_codec.get(key)
-
-    def evict(self) -> int:
-        return self.certified_codec.evict()
-
-    def hit_rate(self) -> float:
-        return self.certified_codec.hit_rate()
-
-    def memory_bytes(self) -> int:
-        return self.certified_codec.memory_bytes() + self.distillation_codec.memory_bytes()
-
-    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        return self.certified_codec.compression_hook(key, value)
-
-    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        raise NotImplementedError
-
-    def reset_stats(self) -> None:
-        self.certified_codec.reset_stats()
-        self.distillation_codec.reset_stats()
-        self._layer_fallback_counts.clear()
-        self._layer_request_counts.clear()
-```
-
----
-
-### CLCPositionalBiasGatedSegmentCache (Activity B)
-
-```python
-# src/cache/clc_positional_bias_gated_segment_cache.py
-
-from collections import OrderedDict
-from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
-import torch
-
-from src.cache.base import CacheStore
-
-
-class ReencodingPolicy(Enum):
-    DIRECT_REUSE = "direct_reuse"         # ΔPos ≤ bias_threshold → 재인코딩 없음
-    PARTIAL_REENCODING = "partial"        # bias_threshold < ΔPos ≤ rope_threshold
-    FULL_REENCODING = "full"              # ΔPos > rope_threshold → 전체 재인코딩
-
-
-@dataclass
-class CLCBiasGateConfig:
-    max_context_length: int = 4096        # 정규화 기준 컨텍스트 최대 길이
-    bias_threshold: float = 0.15         # ΔPos ≤ 이 값: 직접 재사용 안전
-    rope_distortion_threshold: float = 0.40  # ΔPos > 이 값: 전체 재인코딩 필수
-    partial_reencoding_layer_ratio: float = 0.5  # 부분 재인코딩: 전체 레이어의 50%
-    max_entries: int = 1000
-    seed: int = 42
-
-
-@dataclass
-class SegmentMeta:
-    """캐시된 세그먼트의 위치 메타데이터."""
-    pos_orig_start: int    # 원본 컨텍스트에서의 시작 위치
-    pos_orig_end: int      # 원본 컨텍스트에서의 끝 위치
-    content_hash: str      # 콘텐츠 해시 (불변)
-
-
-class CLCPositionalBiasGatedSegmentCache(CacheStore):
-    """CLC 위치 편향 임계 게이트 기반 선택적 비연속 세그먼트 재사용 캐시 (Activity B).
-
-    2603.20218이 규명한 CLC 정확도 한계 메커니즘 직접 구현:
-      위치 독립 재사용 시 위치 인코딩 불일치 → 심각한 정확도 저하.
-      → 위치 편향 크기 ΔPos를 연속값으로 측정해 3단계 재인코딩 정책 결정.
-
-    위치 편향 측정:
-      ΔPos = |pos_target_start - pos_orig_start| / max_context_length  (0~1 정규화)
-
-    3단계 선택적 재인코딩 게이트:
-      ΔPos ≤ 0.15:  DIRECT_REUSE — AdapShot 재인코딩 스킵 (즉각 재사용)
-      0.15 < ΔPos ≤ 0.40: PARTIAL_REENCODING — 처음 N//2 레이어만 재인코딩
-      ΔPos > 0.40: FULL_REENCODING — AdapShot 전체 재인코딩 적용
-
-    평가 기준 (evaluation_criteria.md §3):
-      - 전체 Cache Hit Rate +5%p 이상 (높음)
-      - 비연속 세그먼트 히트율 ≥ 전체 히트의 30% (높음)
-    """
-
-    def __init__(self, config: CLCBiasGateConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        self._store: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self._meta: Dict[str, SegmentMeta] = {}
-        self._hits: int = 0
-        self._misses: int = 0
-        self._direct_reuse_hits: int = 0
-        self._partial_reencoding_hits: int = 0
-        self._full_reencoding_hits: int = 0
-
-    def compute_delta_pos(
-        self,
-        pos_orig_start: int,
-        pos_target_start: int,
-    ) -> float:
-        """정규화된 위치 편향 측정.
-
-        ΔPos = |pos_target_start - pos_orig_start| / max_context_length
-        """
-        return abs(pos_target_start - pos_orig_start) / max(1, self.config.max_context_length)
-
-    def check_bias(
-        self,
-        segment_meta: SegmentMeta,
-        pos_target_start: int,
-    ) -> ReencodingPolicy:
-        """위치 편향 크기로 재인코딩 정책 결정.
-
-        Algorithm:
-          delta_pos = compute_delta_pos(segment_meta.pos_orig_start, pos_target_start)
-          if delta_pos <= bias_threshold: return DIRECT_REUSE
-          elif delta_pos <= rope_distortion_threshold: return PARTIAL_REENCODING
-          else: return FULL_REENCODING
-        """
-        delta_pos = self.compute_delta_pos(segment_meta.pos_orig_start, pos_target_start)
-        if delta_pos <= self.config.bias_threshold:
-            return ReencodingPolicy.DIRECT_REUSE
-        elif delta_pos <= self.config.rope_distortion_threshold:
-            return ReencodingPolicy.PARTIAL_REENCODING
-        else:
-            return ReencodingPolicy.FULL_REENCODING
-
-    def put_segment(
-        self,
-        key: str,
-        value: torch.Tensor,
-        pos_orig_start: int,
-        pos_orig_end: int,
-        content_hash: str,
-    ) -> None:
-        """세그먼트 KV와 위치 메타데이터를 함께 저장."""
-        meta = SegmentMeta(
-            pos_orig_start=pos_orig_start,
-            pos_orig_end=pos_orig_end,
-            content_hash=content_hash,
-        )
-        self._meta[key] = meta
-        self.put(key, value)
-
-    def get_with_policy(
-        self,
-        key: str,
-        pos_target_start: int,
-    ) -> Tuple[Optional[torch.Tensor], ReencodingPolicy]:
-        """캐시된 세그먼트를 위치 편향 게이트와 함께 반환.
-
-        Returns:
-            (kv_tensor_or_None, reencoding_policy)
-            kv_tensor: None이면 미스. 재인코딩 정책은 호출자가 적용.
-        """
-        kv = self.get(key)
-        if kv is None:
-            return None, ReencodingPolicy.FULL_REENCODING
-
-        meta = self._meta.get(key)
-        if meta is None:
-            return kv, ReencodingPolicy.FULL_REENCODING
-
-        policy = self.check_bias(meta, pos_target_start)
-
-        # 정책별 히트 카운트
-        if policy == ReencodingPolicy.DIRECT_REUSE:
-            self._direct_reuse_hits += 1
-        elif policy == ReencodingPolicy.PARTIAL_REENCODING:
-            self._partial_reencoding_hits += 1
-        else:
-            self._full_reencoding_hits += 1
-
-        return kv, policy
-
-    def noncontiguous_direct_hit_rate(self) -> float:
-        """직접 재사용 비율 (전체 히트 중 DIRECT_REUSE 비율)."""
-        total_hits = self._direct_reuse_hits + self._partial_reencoding_hits + self._full_reencoding_hits
-        return self._direct_reuse_hits / max(1, total_hits)
-
-    # CacheStore 인터페이스
-    def put(self, key: str, value: torch.Tensor) -> None:
+        """단순 저장 (Q 없이 호출 시 압착 없음)."""
         if key in self._store:
-            self._store.move_to_end(key)
             return
         if len(self._store) >= self.config.max_entries:
             self.evict()
-        self._store[key] = value.detach().clone()
+        seq_len = value.shape[0]
+        entry = CompactKVEntry(
+            compact_k=value.float().detach().clone(),
+            compact_v=value.float().detach().clone(),
+            ref_queries=torch.zeros(self.config.n_ref_queries, self.config.d_head),
+            original_seq_len=seq_len,
+            compression_ratio_actual=1.0,
+        )
+        self._store[key] = entry
+
+    def put_compact(
+        self,
+        key: str,
+        Q_context: torch.Tensor,
+        K_orig: torch.Tensor,
+        V_orig: torch.Tensor,
+    ) -> CompactKVEntry:
+        """압착 후 저장 (권장)."""
+        if key in self._store:
+            return self._store[key]
+        if len(self._store) >= self.config.max_entries:
+            self.evict()
+        K_c, V_c, Q_ref = self.compact(Q_context, K_orig, V_orig)
+        m_c = K_c.shape[0]
+        N = K_orig.shape[0]
+        entry = CompactKVEntry(
+            compact_k=K_c.detach().clone(),
+            compact_v=V_c.detach().clone(),
+            ref_queries=Q_ref.detach().clone(),
+            original_seq_len=N,
+            compression_ratio_actual=float(N) / max(1, m_c),
+        )
+        self._store[key] = entry
+        return entry
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        if key in self._store:
-            self._store.move_to_end(key)
-            self._hits += 1
-            return self._store[key]
-        self._misses += 1
-        return None
+        if key not in self._store:
+            self._misses += 1
+            return None
+        self._hits += 1
+        return self._store[key].compact_k
+
+    def get_compact_kv(self, key: str) -> Optional[CompactKVEntry]:
+        return self._store.get(key)
+
+    def compression_hook(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        """노름 기반 토큰 선택 fallback (Q 없이 호출 시)."""
+        N = value.shape[0]
+        m_c = max(1, N // self.config.compression_ratio)
+        norms = value.float().norm(dim=-1)
+        kept = norms.topk(m_c).indices.sort().values
+        return value[kept]
 
     def evict(self) -> int:
         if not self._store:
             return 0
-        key, v = self._store.popitem(last=False)
-        self._meta.pop(key, None)
-        return v.nbytes
+        k = next(iter(self._store))
+        entry = self._store.pop(k)
+        return entry.compact_k.nbytes + entry.compact_v.nbytes
 
     def hit_rate(self) -> float:
         total = self._hits + self._misses
         return self._hits / total if total > 0 else 0.0
 
     def memory_bytes(self) -> int:
-        return sum(v.nbytes for v in self._store.values())
+        return sum(e.compact_k.nbytes + e.compact_v.nbytes for e in self._store.values())
+
+    def memory_reduction_ratio(self) -> float:
+        total_compact = 0
+        total_original = 0
+        for e in self._store.values():
+            d = e.compact_k.shape[-1]
+            total_compact += e.compact_k.nbytes + e.compact_v.nbytes
+            total_original += e.original_seq_len * d * 2 * 2  # K+V FP16
+        if total_original == 0:
+            return 0.0
+        return 1.0 - total_compact / total_original
 
     def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        raise NotImplementedError
+        raise NotImplementedError("AttentionMatchingClosedFormCodec does not support importance masking.")
 
     def reset_stats(self) -> None:
         self._hits = 0
         self._misses = 0
-        self._direct_reuse_hits = 0
-        self._partial_reencoding_hits = 0
-        self._full_reencoding_hits = 0
 ```
 
 ---
 
-### CPDWarmColdHitRateRouter (Activity A)
+### DualPathNICLoadBalancer (Activity A)
 
 ```python
-# src/scheduler/cpd_warm_cold_hit_router.py
+# src/scheduler/dualpath_nic_load_balancer.py
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+import time
 import torch
 
 from src.scheduler.base import BaseScheduler
 
 
 @dataclass
-class HitRatePredictorWeights:
-    """온라인 선형 회귀 가중치 (4개 피처)."""
-    w_prefix_hash: float = 0.4
-    w_context_length: float = 0.2
-    w_session_age: float = 0.2
-    w_segment_match: float = 0.2
-    bias: float = 0.3
-    lr: float = 0.01   # SGD 학습률
-
-
-@dataclass
-class CPDRouterConfig:
-    high_hit_threshold: float = 0.70   # ≥ 이 값: warm 요청
-    low_hit_threshold: float = 0.25    # < 이 값: cold 요청. 중간: neutral
-    warm_slot_ratio: float = 0.60      # 배치 중 warm 슬롯 비율
-    cold_slot_ratio: float = 0.30      # 배치 중 cold 슬롯 비율
-    neutral_slot_ratio: float = 0.10   # neutral 슬롯
-    queue_pressure_threshold: int = 100  # 큐 깊이 > 이 값: cold 슬롯 증가
-    max_context_length_warm: int = 50000  # warm 경로 최대 컨텍스트 길이
-    seed: int = 42
+class NodeNICStatus:
+    node_id: str
+    node_type: str           # "prefill" | "decode"
+    nic_utilization: float   # 0.0~1.0
+    active_dual_path: int    # 현재 이중 경로 KV 로드 수
+    last_updated: float      # time.monotonic()
 
 
 @dataclass
 class RoutingDecision:
     request_id: str
-    predicted_hit_rate: float
-    path: str      # "warm" | "cold" | "neutral"
-    batch_priority: int   # 낮을수록 먼저 처리 (warm=0, neutral=1, cold=2)
+    path: str                         # "single" | "dual"
+    relay_decode_node_id: Optional[str]
+    prefill_nic_utilization: float
+    decision_latency_ms: float
 
 
-class CPDWarmColdHitRateRouter(BaseScheduler):
-    """CPD(Together AI 2026-03-04) 원칙 기반 예측 히트율 warm/cold 소프트 분기 라우터.
+@dataclass
+class DualPathNICConfig:
+    nic_saturation_threshold: float = 0.80
+    idle_nic_threshold: float = 0.30
+    max_dual_path_per_node: int = 4
+    nic_monitor_interval_ms: float = 200.0
+    stale_threshold_ms: float = 1000.0
+    seed: int = 42
 
-    Activity A: KV Cache-aware Scheduling.
-    스케줄링 결정 단위: 요청(request) 단위.
-    캐시 상태 접근: prefix_hash → hit_history (O(1) 딕셔너리 룩업).
 
-    경량 히트율 예측기:
-      피처: [prefix_hash_match, context_length_norm, session_age_norm, segment_match_ratio]
-      모델: 선형 회귀 4개 가중치 (< 0.01ms 추론)
-      온라인 학습: SGD(lr=0.01) — 실제 히트 결과로 업데이트
+class DualPathNICLoadBalancer(BaseScheduler):
+    """DualPath 스토리지 NIC 유휴율 인식 KV 로드 밸런서 (arXiv 2602.21548).
 
-    Warm/Cold/Neutral 3경로:
-      Warm (예측 히트율 ≥ 0.70): 배치 앞자리, warm_slot_ratio 예약, 캐시 지역성 극대화
-      Cold (예측 히트율 < 0.25): 배치 뒷자리, cold 배치 독립 처리 (warm 오염 방지)
-      Neutral (0.25 ≤ 히트율 < 0.70): 남은 슬롯
+    Activity A: KV Cache-aware Scheduling — 멀티 노드 P/D 분리.
 
-    Warm 배치 내 캐시 지역성:
-      동일 prefix_hash 요청끼리 같은 배치로 묶어 KV 재사용 극대화.
-      접두사 LCP 길이 기준 정렬.
+    스케줄링 결정 단위: KV 로드 요청(request) 단위.
+    캐시 상태 접근: NodeNICStatus dict O(1) 룩업.
+
+    멀티 노드 환경:
+      - 스토리지 NIC (스토리지 네트워크)와 컴퓨트 NIC (RDMA) 물리적 분리 가정.
+      - gRPC heartbeat 200ms 주기로 각 노드 NIC 사용률 수집.
+      - 단일 경로: 저장소 -> prefill 노드 (기본).
+      - 이중 경로: 저장소 -> decode 노드(idle NIC) -> prefill 노드 (RDMA).
+      - 이중 경로가 모델 실행 RDMA 채널과 간섭하지 않도록 스토리지/컴퓨트 네트워크 분리.
+
+    경로 결정 알고리즘:
+      if prefill_nic_util < nic_saturation_threshold (0.80):
+          -> 단일 경로 (기본)
+      elif len(idle_decode_nodes) > 0:
+          -> 이중 경로, min_load_first + round-robin으로 relay node 선택
+      else:
+          -> 단일 경로 (포화지만 대안 없음)
+
+    오버헤드: NIC 부하 조회 O(1) + idle decode 탐색 O(N_decode) < 0.1ms/요청.
     """
 
-    def __init__(self, config: CPDRouterConfig) -> None:
+    def __init__(self, config: DualPathNICConfig) -> None:
         torch.manual_seed(config.seed)
         self.config = config
-        self._weights = HitRatePredictorWeights()
-        # prefix_hash → 최근 hit 결과 (True/False) 히스토리 (최대 100개)
-        self._hit_history: Dict[str, List[bool]] = {}
-        # 스케줄링 통계
-        self._warm_count: int = 0
-        self._cold_count: int = 0
-        self._neutral_count: int = 0
-        self._ttft_overhead_us: List[float] = []
+        self._node_status: Dict[str, NodeNICStatus] = {}
+        self._single_path_count: int = 0
+        self._dual_path_count: int = 0
+        self._decision_latencies_ms: List[float] = []
+        self._rr_index: int = 0
 
-    def _extract_features(
+    def update_nic_status(
         self,
-        request: Any,
-        max_context_len: int = 128000,
-    ) -> Tuple[float, float, float, float]:
-        """요청에서 히트율 예측 피처 추출.
-
-        피처:
-          f1 (prefix_hash_match): prefix_hash가 hit_history에 있으면 최근 히트율, 없으면 0.0
-          f2 (context_length_norm): len(token_ids) / max_context_len
-          f3 (session_age_norm): 1.0 / (1 + session_turn_count)
-          f4 (segment_match_ratio): 알려진 경우 세그먼트 매치 비율, 기본 0.0
-        """
-        prefix_hash = getattr(request, 'prefix_hash', '') or ''
-        token_ids = getattr(request, 'token_ids', []) or []
-        session_turn = getattr(request, 'session_turn', 0) or 0
-        segment_match = getattr(request, 'segment_match_ratio', 0.0) or 0.0
-
-        history = self._hit_history.get(prefix_hash, [])
-        f1 = sum(history) / len(history) if history else 0.0
-        f2 = min(1.0, len(token_ids) / max(1, max_context_len))
-        f3 = 1.0 / (1.0 + session_turn)
-        f4 = float(segment_match)
-        return f1, f2, f3, f4
-
-    def predict_hit_rate(self, request: Any) -> float:
-        """선형 모델로 요청의 예측 캐시 히트율 계산 (< 0.01ms).
-
-        score = w1*f1 + w2*f2 + w3*f3 + w4*f4 + bias
-        hit_rate = sigmoid(score)
-        """
-        f1, f2, f3, f4 = self._extract_features(request)
-        w = self._weights
-        score = (w.w_prefix_hash * f1 + w.w_context_length * f2
-                 + w.w_session_age * f3 + w.w_segment_match * f4 + w.bias)
-        # sigmoid
-        return float(1.0 / (1.0 + torch.tensor(-score).exp()))
-
-    def update_predictor(self, request: Any, actual_hit: bool) -> None:
-        """실제 히트 결과로 선형 모델 온라인 SGD 업데이트.
-
-        Algorithm:
-          y_pred = predict_hit_rate(request)
-          y_true = 1.0 if actual_hit else 0.0
-          error = y_pred - y_true
-          gradient = error * feature_i (MSE gradient)
-          weight_i -= lr * gradient
-        """
-        f1, f2, f3, f4 = self._extract_features(request)
-        y_pred = self.predict_hit_rate(request)
-        y_true = 1.0 if actual_hit else 0.0
-        error = y_pred - y_true
-        lr = self._weights.lr
-        self._weights.w_prefix_hash -= lr * error * f1
-        self._weights.w_context_length -= lr * error * f2
-        self._weights.w_session_age -= lr * error * f3
-        self._weights.w_segment_match -= lr * error * f4
-        self._weights.bias -= lr * error
-
-        # 히트 히스토리 업데이트
-        prefix_hash = getattr(request, 'prefix_hash', '') or ''
-        if prefix_hash:
-            hist = self._hit_history.setdefault(prefix_hash, [])
-            hist.append(actual_hit)
-            if len(hist) > 100:
-                hist.pop(0)
-
-    def classify_request(self, request: Any) -> RoutingDecision:
-        """요청을 warm/cold/neutral로 분류.
-
-        import time
-        t_start = time.monotonic()
-        hit_rate = predict_hit_rate(request)
-        if hit_rate >= high_hit_threshold: path="warm", priority=0
-        elif hit_rate < low_hit_threshold: path="cold", priority=2
-        else: path="neutral", priority=1
-        overhead_us = (time.monotonic() - t_start) * 1e6
-        """
-        import time
-        t_start = time.monotonic()
-        hit_rate = self.predict_hit_rate(request)
-        if hit_rate >= self.config.high_hit_threshold:
-            path = "warm"
-            priority = 0
-            self._warm_count += 1
-        elif hit_rate < self.config.low_hit_threshold:
-            path = "cold"
-            priority = 2
-            self._cold_count += 1
-        else:
-            path = "neutral"
-            priority = 1
-            self._neutral_count += 1
-        overhead_us = (time.monotonic() - t_start) * 1e6
-        self._ttft_overhead_us.append(overhead_us)
-        return RoutingDecision(
-            request_id=getattr(request, 'request_id', ''),
-            predicted_hit_rate=hit_rate,
-            path=path,
-            batch_priority=priority,
+        node_id: str,
+        node_type: str,
+        nic_utilization: float,
+        active_dual_path: int = 0,
+    ) -> None:
+        """노드 스토리지 NIC 부하 상태 갱신 (gRPC heartbeat 수신 시 호출)."""
+        self._node_status[node_id] = NodeNICStatus(
+            node_id=node_id,
+            node_type=node_type,
+            nic_utilization=float(nic_utilization),
+            active_dual_path=active_dual_path,
+            last_updated=time.monotonic(),
         )
 
-    def sort_warm_batch_by_prefix_similarity(self, warm_requests: List[Any]) -> List[Any]:
-        """Warm 배치 내 요청을 접두사 유사도(LCP 길이) 기준으로 정렬.
+    def _get_prefill_nic_utilization(self) -> float:
+        """현재 prefill 노드들의 최대 스토리지 NIC 사용률."""
+        now = time.monotonic()
+        utils = [
+            s.nic_utilization
+            for s in self._node_status.values()
+            if s.node_type == "prefill"
+            and (now - s.last_updated) * 1000 < self.config.stale_threshold_ms
+        ]
+        return max(utils) if utils else 0.0
 
-        유사 접두사 요청끼리 같은 배치로 묶어 KV 재사용 극대화.
+    def _get_idle_decode_nodes(self) -> List[NodeNICStatus]:
+        """idle NIC + 이중 경로 여유가 있는 decode 노드 목록 (min_load_first 정렬)."""
+        now = time.monotonic()
+        idle = [
+            s for s in self._node_status.values()
+            if s.node_type == "decode"
+            and s.nic_utilization < self.config.idle_nic_threshold
+            and s.active_dual_path < self.config.max_dual_path_per_node
+            and (now - s.last_updated) * 1000 < self.config.stale_threshold_ms
+        ]
+        return sorted(idle, key=lambda n: n.nic_utilization)
+
+    def decide_routing(self, request: Any) -> RoutingDecision:
+        """KV 로드 경로 결정.
+
+        Returns:
+            RoutingDecision with path="single" | "dual"
         """
-        def lcp_key(req: Any) -> str:
-            return getattr(req, 'prefix_hash', '') or ''
-        return sorted(warm_requests, key=lcp_key)
+        t_start = time.monotonic()
+        request_id = getattr(request, "request_id", str(id(request)))
+        prefill_nic_util = self._get_prefill_nic_utilization()
+
+        def _make_single() -> RoutingDecision:
+            self._single_path_count += 1
+            lat = (time.monotonic() - t_start) * 1000
+            self._decision_latencies_ms.append(lat)
+            return RoutingDecision(
+                request_id=request_id,
+                path="single",
+                relay_decode_node_id=None,
+                prefill_nic_utilization=prefill_nic_util,
+                decision_latency_ms=lat,
+            )
+
+        if prefill_nic_util < self.config.nic_saturation_threshold:
+            return _make_single()
+
+        idle_decode = self._get_idle_decode_nodes()
+        if not idle_decode:
+            return _make_single()
+
+        # 이중 경로: 라운드-로빈 + min_load_first
+        relay_node = idle_decode[self._rr_index % len(idle_decode)]
+        self._rr_index += 1
+        if relay_node.node_id in self._node_status:
+            self._node_status[relay_node.node_id].active_dual_path += 1
+        self._dual_path_count += 1
+
+        lat = (time.monotonic() - t_start) * 1000
+        self._decision_latencies_ms.append(lat)
+        return RoutingDecision(
+            request_id=request_id,
+            path="dual",
+            relay_decode_node_id=relay_node.node_id,
+            prefill_nic_utilization=prefill_nic_util,
+            decision_latency_ms=lat,
+        )
+
+    def complete_dual_path(self, decode_node_id: str) -> None:
+        """이중 경로 완료 시 decode 노드 active 카운트 감소."""
+        if decode_node_id in self._node_status:
+            s = self._node_status[decode_node_id]
+            s.active_dual_path = max(0, s.active_dual_path - 1)
 
     def schedule(self, requests: List[Any]) -> List[Any]:
-        """BaseScheduler 인터페이스 구현.
+        """BaseScheduler 인터페이스: 각 요청에 routing_decision 첨부 후 반환."""
+        result = []
+        for req in requests:
+            decision = self.decide_routing(req)
+            try:
+                req.routing_decision = decision
+            except AttributeError:
+                pass
+            result.append(req)
+        return result
+
+    def dual_path_ratio(self) -> float:
+        total = self._single_path_count + self._dual_path_count
+        return self._dual_path_count / max(1, total)
+
+    def p99_decision_latency_ms(self) -> float:
+        if not self._decision_latencies_ms:
+            return 0.0
+        s = sorted(self._decision_latencies_ms)
+        idx = min(int(len(s) * 0.99), len(s) - 1)
+        return s[idx]
+
+    def scheduling_stats(self) -> dict:
+        return {
+            "single_path_count": self._single_path_count,
+            "dual_path_count": self._dual_path_count,
+            "dual_path_ratio": self.dual_path_ratio(),
+            "decision_latency_p99_ms": self.p99_decision_latency_ms(),
+            "decision_latency_mean_ms": (
+                sum(self._decision_latencies_ms) / max(1, len(self._decision_latencies_ms))
+            ),
+        }
+
+    def reset_stats(self) -> None:
+        self._single_path_count = 0
+        self._dual_path_count = 0
+        self._decision_latencies_ms.clear()
+        self._rr_index = 0
+```
+
+---
+
+### DualPathTriAttentionCompressPipeline (Cross-1, A+C)
+
+```python
+# src/engine/dualpath_triattention_pipeline.py
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+import torch
+
+from src.cache.triattention_pre_rope_kv_selector_codec import (
+    TriAttentionPreRoPEKVSelectorCodec, TriAttentionSelectorConfig,
+)
+from src.scheduler.dualpath_nic_load_balancer import (
+    DualPathNICLoadBalancer, DualPathNICConfig, RoutingDecision,
+)
+
+
+@dataclass
+class DualPathTriAttentionPipelineConfig:
+    triattention_config: Optional[TriAttentionSelectorConfig] = None
+    dualpath_config: Optional[DualPathNICConfig] = None
+    seed: int = 42
+
+
+class DualPathTriAttentionCompressPipeline:
+    """DualPath NIC 이중 경로 + TriAttention pre-RoPE 압축 통합 파이프라인 (Cross-1).
+
+    통합 처리 흐름:
+      Step 1 (A-1): DualPathNICLoadBalancer — prefill NIC 포화 감지 -> idle decode 선택.
+      Step 2 (I/O 시뮬레이션): 스토리지 -> decode 노드 NIC로 원본 KV 로드.
+      Step 3 (C-1): decode 노드에서 TriAttentionPreRoPEKVSelectorCodec.select_kv() 실행.
+                     상위 kv_budget_ratio 중요 키만 유지 (10.7x 압축).
+      Step 4 (RDMA 시뮬레이션): 압축 KV를 decode -> prefill RDMA 전달.
+      Step 5: 압축 KV 반환 -> 표준 어텐션 커널 투입.
+
+    단일 경로 시: 압축 없이 K_full, V_full 반환.
+    이중 경로 시: TriAttention 압축 KV 반환 (kv_bytes 원본의 budget_ratio 비율).
+    """
+
+    def __init__(self, config: DualPathTriAttentionPipelineConfig) -> None:
+        torch.manual_seed(config.seed)
+        ta_cfg = config.triattention_config or TriAttentionSelectorConfig(seed=config.seed)
+        dp_cfg = config.dualpath_config or DualPathNICConfig(seed=config.seed)
+        self.triattention = TriAttentionPreRoPEKVSelectorCodec(ta_cfg)
+        self.dualpath_lb = DualPathNICLoadBalancer(dp_cfg)
+        self._pipeline_stats: List[dict] = []
+
+    def run_pipeline(
+        self,
+        request: Any,
+        Q: torch.Tensor,                          # [T_q, d_head] pre-RoPE
+        K_full: torch.Tensor,                     # [N, d_head]
+        V_full: torch.Tensor,                     # [N, d_head]
+        key_positions: Optional[torch.Tensor] = None,
+        pos_q: int = 0,
+        is_reasoning_task: bool = False,
+        kv_pool_pressure: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """이중 경로 라우팅 + TriAttention 압축 통합 실행.
+
+        Returns:
+            (K_final, V_final, pipeline_report)
 
         Algorithm:
-          decisions = [classify_request(req) for req in requests]
-          warm = [r for r, d in zip(requests, decisions) if d.path=="warm"]
-          cold = [r for r, d in zip(requests, decisions) if d.path=="cold"]
-          neutral = [r for r, d in zip(requests, decisions) if d.path=="neutral"]
+          routing = dualpath_lb.decide_routing(request)
 
-          # Warm 배치: 접두사 유사도 정렬 + 앞자리
-          warm_sorted = sort_warm_batch_by_prefix_similarity(warm)
+          if routing.path == "single":
+            return K_full, V_full, {path="single", ...}
 
-          # 큐 압박 시 cold 슬롯 증가 (warm_slot_ratio 조정)
-          if len(requests) > queue_pressure_threshold:
-            # cold 요청을 neutral과 섞어 수용 증가
-            neutral.extend(cold[:len(cold)//2])
-            cold = cold[len(cold)//2:]
+          # Step 3: decode 노드에서 TriAttention 압축
+          K_sel, V_sel, kept_idx, conc_q, conc_k, budget =
+              triattention.select_kv(Q, K_full, V_full, key_positions, pos_q,
+                                     is_reasoning_task, kv_pool_pressure)
 
-          return warm_sorted + neutral + cold
+          # Step 4: RDMA 전달 완료 처리
+          dualpath_lb.complete_dual_path(routing.relay_decode_node_id)
+
+          return K_sel, V_sel, {path="dual", compression_ratio=N/n_keep, ...}
         """
-        if not requests:
-            return []
+        routing: RoutingDecision = self.dualpath_lb.decide_routing(request)
 
-        warm, cold, neutral = [], [], []
-        for req in requests:
-            decision = self.classify_request(req)
-            if decision.path == "warm":
-                warm.append(req)
-            elif decision.path == "cold":
-                cold.append(req)
-            else:
-                neutral.append(req)
+        if routing.path == "single":
+            report = {
+                "path": "single",
+                "compression_ratio": 1.0,
+                "kv_bytes_transferred": K_full.nbytes + V_full.nbytes,
+                "routing_latency_ms": routing.decision_latency_ms,
+                "conc_q": None,
+                "conc_k": None,
+                "kv_budget_ratio": None,
+            }
+            self._pipeline_stats.append(report)
+            return K_full, V_full, report
 
-        warm_sorted = self.sort_warm_batch_by_prefix_similarity(warm)
+        # Step 3: TriAttention 압축
+        K_sel, V_sel, kept_idx, conc_q, conc_k, budget = self.triattention.select_kv(
+            Q, K_full, V_full, key_positions, pos_q, is_reasoning_task, kv_pool_pressure
+        )
+        n_keep = K_sel.shape[0]
+        N = K_full.shape[0]
+        actual_ratio = float(N) / max(1, n_keep)
 
-        # 큐 압박 시 cold 요청 일부를 neutral로 승격
-        if len(requests) > self.config.queue_pressure_threshold:
-            half = len(cold) // 2
-            neutral.extend(cold[:half])
-            cold = cold[half:]
+        # Step 4: RDMA 완료 처리
+        if routing.relay_decode_node_id:
+            self.dualpath_lb.complete_dual_path(routing.relay_decode_node_id)
 
-        return warm_sorted + neutral + cold
+        report = {
+            "path": "dual",
+            "relay_decode_node_id": routing.relay_decode_node_id,
+            "compression_ratio": actual_ratio,
+            "kv_bytes_transferred": K_sel.nbytes + V_sel.nbytes,
+            "kv_bytes_original": K_full.nbytes + V_full.nbytes,
+            "kv_size_reduction_ratio": 1.0 - (K_sel.nbytes + V_sel.nbytes) / max(
+                1, K_full.nbytes + V_full.nbytes
+            ),
+            "routing_latency_ms": routing.decision_latency_ms,
+            "conc_q": conc_q,
+            "conc_k": conc_k,
+            "kv_budget_ratio": budget,
+            "is_reasoning_task": is_reasoning_task,
+        }
+        self._pipeline_stats.append(report)
+        return K_sel, V_sel, report
 
-    def scheduling_overhead_mean_us(self) -> float:
-        if not self._ttft_overhead_us:
-            return 0.0
-        return sum(self._ttft_overhead_us) / len(self._ttft_overhead_us)
-
-    def routing_stats(self) -> dict:
-        total = max(1, self._warm_count + self._cold_count + self._neutral_count)
+    def pipeline_summary(self) -> dict:
+        if not self._pipeline_stats:
+            return {}
+        dual = [s for s in self._pipeline_stats if s["path"] == "dual"]
+        single = [s for s in self._pipeline_stats if s["path"] == "single"]
+        avg_cr = sum(s["compression_ratio"] for s in dual) / len(dual) if dual else 1.0
+        avg_sr = sum(s["kv_size_reduction_ratio"] for s in dual) / len(dual) if dual else 0.0
         return {
-            "warm_ratio": self._warm_count / total,
-            "cold_ratio": self._cold_count / total,
-            "neutral_ratio": self._neutral_count / total,
-            "scheduling_overhead_mean_us": self.scheduling_overhead_mean_us(),
+            "total_runs": len(self._pipeline_stats),
+            "dual_path_runs": len(dual),
+            "single_path_runs": len(single),
+            "dual_path_ratio": len(dual) / max(1, len(self._pipeline_stats)),
+            "avg_compression_ratio": avg_cr,
+            "avg_kv_size_reduction_ratio": avg_sr,
+            **self.dualpath_lb.scheduling_stats(),
+            **self.triattention.concentration_stats(),
         }
 ```
 
@@ -1395,482 +1173,262 @@ class CPDWarmColdHitRateRouter(BaseScheduler):
 
 Activity C를 포함하므로 반드시 작성한다.
 
-### perplexity 측정
+### C-1: TriAttentionPreRoPEKVSelectorCodec
 
-- **데이터셋**: WikiText-2 proxy — `src/metrics/perplexity.py`의 `attention_output_relative_error()` 활용.
-  실제 WikiText-2 없을 시 `torch.randn`으로 FP32 synthetic KV 텐서 생성.
-- **측정 설정**: n_q=8, d_head=128, seq_len=256 (기본). seq_len=512, 1024도 테스트.
+**perplexity 측정**:
+- **데이터셋**: WikiText-2 합성 proxy (`torch.randn`으로 FP32 synthetic Q/K/V 텐서 생성)
+- **측정 방법**: `attention_output_relative_error` 계산
+  ```
+  A_orig = softmax(Q K_orig^T / sqrt(d))      # [n_q, N]
+  K_sel, V_sel, ... = select_kv(Q, K_orig, V_orig, ...)
+  # 선택된 KV로 어텐션 계산
+  A_sel = softmax(Q K_sel^T / sqrt(d))         # [n_q, n_keep]
+  out_orig = A_orig @ V_orig                   # [n_q, d_head]
+  out_sel  = A_sel @ V_sel                     # [n_q, d_head]
+  relative_error = ||out_orig - out_sel||_F / ||out_orig||_F
+  ```
+  (out_orig와 out_sel은 차원이 다를 수 있으므로, 선택된 토큰에서만 비교하거나
+   full-size 재구성 후 비교하는 방식 두 가지 모두 측정)
+- **허용 오차**: `relative_error < 0.01` (±1% 이내, MANDATORY)
+- **테스트 설정**: n_q=8, d_head=128, N=256, kv_budget_ratio=0.20 (비추론)
+- **추론 태스크 설정**: N=256, kv_budget_ratio=0.093 (AIME25 proxy)
+
+**태스크 정확도 측정**:
+- **AIME25 추론 태스크 proxy**: kv_budget_ratio=0.093, `cosine_similarity_output >= 0.99`
+- **LongBench 8개 서브태스크 proxy**: 8개 독립 synthetic 시퀀스에서 각각 cosine_similarity >= 0.99
+- **허용 오차**: ±1% 이내 (MANDATORY)
+
+**추가 검증 실험**:
+1. kv_budget_ratio sweep: [5%, 9.3%, 15%, 20%, 30%] 별 relative_error 및 cosine_similarity 측정
+2. pre-RoPE vs. post-RoPE ablation:
+   - pre-RoPE 집중도 기반 선택 (conc_Q 정상 계산): 기본 설정
+   - post-RoPE 노름만 사용 (conc_Q=0으로 고정하여 norm_score만 사용): ablation
+   - 두 방식의 relative_error를 동일 시퀀스에서 직접 비교
+3. Q/K 집중도 분포: 100개 시퀀스에서 conc_Q_mean, conc_K_mean 측정 후 JSON 기록
+
+**검증 테스트 파일**: `tests/unit/test_compression_accuracy.py` (C-1 케이스 추가)
+
+---
+
+### C-2: AttentionMatchingClosedFormCodec
+
+**perplexity 측정**:
+- **데이터셋**: WikiText-2 합성 proxy
 - **측정 방법**:
   ```
-  K_int8_restored = dequantize_int8(quantize_int8(K_orig))
-  V_int4_restored = dequantize_int4(quantize_int4(V_orig))
-  relative_error = attention_output_relative_error(Q, K_orig, V_orig,
-                                                    K_int8_restored, V_int4_restored)
-  허용 오차: relative_error < 0.01 (1%) — MANDATORY (evaluation_criteria.md §4)
+  K_c, V_c, Q_ref = compact(Q_context, K_orig, V_orig)
+  A_orig = softmax(Q K_orig^T / sqrt(d))
+  A_compact = softmax(Q K_c^T / sqrt(d))
+  out_orig   = A_orig   @ V_orig
+  out_compact = A_compact @ V_c
+  relative_error = ||out_orig - out_compact||_F / ||out_orig||_F
   ```
-- **폴백 사다리별 측정**:
-  - Level 0 (INT8K+INT4V): relative_error 측정 [기본, MANDATORY]
-  - Level 1 (INT8K+FP16V): Value FP16 복원 후 relative_error 측정
-  - Level 2 (FP16K+FP16V): 완전 복원 → relative_error ≈ 0.0 (기준 검증)
-- **수학적 보장 검증 (MANDATORY)**: 100개 이상 synthetic 시퀀스에서
-  `error_bound ≥ actual_error` 항상 성립 확인 (보수적 상한 검증).
-  - `actual_error = attention_output_relative_error(Q, K_orig, V_orig, K_restored, V_restored)`
-  - `error_bound = delta_attn_bound + delta_value_bound` (compute_error_bound() 반환값)
-  - **실패 기준**: error_bound < actual_error인 케이스가 1개라도 존재 → 테스트 FAIL
+- **허용 오차**: compression_ratio=5x 시 relative_error < 0.01 (MANDATORY)
+- **참고**: compression_ratio=50x 시 relative_error < 0.05 (Cartridges 수준)
 
-### 태스크 정확도 측정
+**태스크 정확도 측정**:
+- **NIAH proxy**: 128K 컨텍스트 proxy (N=1024 시퀀스), cosine_similarity >= 0.99
+- **LongBench 8개 서브태스크**: cosine_similarity >= 0.99
+- **허용 오차**: compression_ratio=10x 이하에서 ±1% 이내 (MANDATORY)
 
-- **벤치마크 1 — NIAH proxy**:
-  - synthetic 시퀀스에서 "needle" 위치 KV가 INT8K+INT4V 복원 후 코사인 유사도 ≥ 0.99 보존 확인.
-  - seq_len = [256, 512, 1024] (32K/64K/128K 컨텍스트 프록시)
-  - `cosine_similarity_output(Q, K_orig, V_orig, K_restored, V_restored) ≥ 0.99` — MANDATORY
+**추가 검증 실험**:
+1. compression_ratio sweep: [5, 10, 20, 50] 별 relative_error 곡선 측정
+2. KVSculptDistillationCodec 대비 비교:
+   - 동일 compression_ratio(50%)에서 양쪽 relative_error 직접 측정 비교
+   - 닫힌 형태 해(alternating_rounds=1) vs. KVSculpt L-BFGS(5회 반복) 수렴 속도 측정
+3. alternating_rounds sweep: [1, 3, 5] 별 relative_error 및 실행 시간 비교
 
-- **벤치마크 2 — LongBench proxy**:
-  - 8개 독립 synthetic 시퀀스 (다른 seed/길이 조합) 각각에서 `cosine_similarity_output ≥ 0.99`
-  - 허용 기준: **8개 모두** cosine_sim ≥ 0.99 — MANDATORY
-
-- **KVSculpt 증류 정확도**:
-  - 균일 50% 압축 vs. 난이도 비례 예산 배분(γ=0.5) 비교
-  - 난이도 비례 배분이 균일 대비 KL 발산 감소 확인
-  - γ = [0.0, 0.25, 0.50, 1.0] 별 정확도-압축률 곡선 측정
-
-- **Cross-1 파이프라인 통합 정확도**:
-  - RuntimeCertifiedKVSculptDistillationPipeline.run_pipeline() 실행 후
-    `cosine_similarity_output(Q, K_orig, V_orig, K_final, V_final) ≥ 0.99` — MANDATORY
-
-### KV 메모리 감소율 검증
-
-- INT8K+INT4V vs FP16: `memory_reduction_ratio() ≥ 0.50` (50% 이상) [MANDATORY: −30% 기준 초과]
-- INT8K+FP16V (Level 1 폴백): `memory_reduction_ratio() ≥ 0.25`
-- KVSculpt budget_ratio=0.50: 50% KV 유지 → 50% 메모리 절감
-
-### Fail 기준
-
-- **Level 0 relative_error > 0.01** → 전체 FAIL (evaluation_criteria.md §4 필수)
-- **LongBench proxy cosine_sim < 0.99** (1개라도) → 전체 FAIL (MANDATORY)
-- **error_bound < actual_error** (1개라도, 100 시퀀스 중) → 전체 FAIL (수학적 보장 붕괴)
-- **Cross-1 파이프라인 cosine_sim < 0.99** → 전체 FAIL (§5 MANDATORY)
-
-### 검증 테스트 파일
-
-`tests/unit/test_compression_accuracy.py` (기존 파일 덮어쓰기 — RuntimeCertified 기반)
-`tests/unit/test_runtime_certified_quant_codec.py` (RuntimeCertifiedQuantizedAttentionCodec 전용)
+**검증 테스트 파일**: `tests/unit/test_compression_accuracy.py` (C-2 케이스 추가)
 
 ---
 
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-23.yaml
+# configs/experiments/2026-05-24.yaml
 experiment:
-  date: "2026-05-23"
-  activity: "C+A+B"
+  date: "2026-05-24"
+  activity: "A+C"
   description: >
-    C-1 RuntimeCertifiedQuantizedAttentionCodec (수학적 런타임 오류 경계 인증 양자화) +
-    C-2 KVSculptDistillationCodec (L-BFGS+최소제곱 교대 증류 레이어 예산 배분) +
-    Cross-1 RuntimeCertifiedKVSculptDistillationPipeline (C-1+C-2 폐루프 인증 증류) +
-    B-1 CLCPositionalBiasGatedSegmentCache (위치 편향 3단계 선택적 재인코딩 게이트) +
-    A-2 CPDWarmColdHitRateRouter (예측 히트율 기반 warm/cold 소프트 분기 스케줄러).
-    RuntimeCertified(arXiv 2605.20868) + KVSculpt(arXiv 2603.27819) 기반.
-  cache_type: runtime_certified_distillation_pipeline
-  compression_method: int8_key_int4_value_with_fp16_fallback
-  scheduler_type: cpd_warm_cold_hit_router
+    C-1 TriAttentionPreRoPEKVSelectorCodec (pre-RoPE Q/K 집중도 삼각함수 KV 선택, 10.7x 절감) +
+    C-2 AttentionMatchingClosedFormCodec (닫힌 형태 최소제곱 잠재 공간 KV 압착, 50x 압착) +
+    A-1 DualPathNICLoadBalancer (스토리지 NIC 이중 경로 로드 밸런서, P/D 분리 멀티 노드) +
+    Cross-1 DualPathTriAttentionCompressPipeline (A+C 통합 파이프라인).
+    TriAttention(arXiv 2604.04921) + AttentionMatching(arXiv 2602.16284) +
+    DualPath(arXiv 2602.21548) 기반.
+  cache_type: triattention_pre_rope_kv_selector_codec
+  compression_method: pre_rope_trigonometric_selection
+  scheduler_type: dualpath_nic_load_balancer
 
-runtime_certified_quant_codec:  # C-1
+triattention_selector:  # C-1
   d_head: 128
   n_kv_heads: 8
-  n_layers: 12
-  error_threshold: 0.005        # ±0.5% perplexity 수학적 상한 (목표 ±1%의 절반)
-  key_bits: 8                   # INT8 Key
-  value_bits: 4                 # INT4 Value
+  rope_base: 10000.0
+  kv_budget_ratio_reasoning: 0.093     # AIME25 10.7x 절감 기준
+  kv_budget_ratio_default: 0.20        # 비추론 태스크 보수적 설정
+  high_pressure_threshold: 0.80
+  high_pressure_extra_reduction: 0.10
   max_entries: 1000
   seed: 42
 
-kvsculpt_distillation_codec:  # C-2
-  n_layers: 12
+attention_matching:  # C-2
   d_head: 128
-  total_budget_ratio: 0.50      # 전체 KV 유지 비율
-  gamma: 0.5                    # 난이도 반응 강도
-  lbfgs_max_iter: 5             # L-BFGS 반복 (경량화)
-  alternating_rounds: 3         # 교대 반복 횟수
-  convergence_tol: 1.0e-4
-  pilot_n_sequences: 50         # 파일럿 보정 시퀀스 수
+  n_ref_queries: 32
+  compression_ratio: 50
+  alternating_rounds: 3
   max_entries: 1000
   seed: 42
 
-distillation_pipeline:  # Cross-1
-  adaptive_threshold_scale: 1.0
-  online_budget_realloc_window: 100
+dualpath_nic_load_balancer:  # A-1
+  nic_saturation_threshold: 0.80
+  idle_nic_threshold: 0.30
+  max_dual_path_per_node: 4
+  nic_monitor_interval_ms: 200.0
+  stale_threshold_ms: 1000.0
   seed: 42
 
-clc_bias_gate:  # B-1
-  max_context_length: 4096
-  bias_threshold: 0.15          # ΔPos ≤ 0.15: 직접 재사용
-  rope_distortion_threshold: 0.40  # ΔPos > 0.40: 전체 재인코딩
-  partial_reencoding_layer_ratio: 0.5
-  max_entries: 1000
-  seed: 42
-
-cpd_warm_cold_router:  # A-2
-  high_hit_threshold: 0.70
-  low_hit_threshold: 0.25
-  warm_slot_ratio: 0.60
-  cold_slot_ratio: 0.30
-  neutral_slot_ratio: 0.10
-  queue_pressure_threshold: 100
-  max_context_length_warm: 50000
+dualpath_triattention_pipeline:  # Cross-1
   seed: 42
 
 benchmark:
   accuracy:
     method: "attention_output_proxy"
     dataset_proxy: "wikitext2_synthetic"
-    task_accuracy_proxy: "niah_cosine_similarity"
-    relative_error_max: 0.01         # ±1% (evaluation_criteria.md §4 MANDATORY)
-    cosine_similarity_min: 0.99      # (evaluation_criteria.md §4 MANDATORY)
-    kl_divergence_max: 0.015
-    niah_context_lengths: [256, 512, 1024]   # proxy: 32K/64K/128K
+    task_accuracy_proxy: "cosine_similarity"
+    relative_error_max: 0.01            # ±1% MANDATORY
+    cosine_similarity_min: 0.99         # MANDATORY
+    c1_budget_ratio_sweep: [0.05, 0.093, 0.15, 0.20, 0.30]
+    c1_pre_rope_vs_post_rope_ablation: true
+    c1_concentration_sequences: 100
+    c2_compression_ratio_sweep: [5, 10, 20, 50]
+    c2_vs_kvsculpt_comparison: true
+    c2_alternating_rounds_sweep: [1, 3, 5]
+    niah_context_lengths: [256, 512, 1024]
     longbench_subtask_count: 8
-    math_guarantee_sequences: 100    # error_bound ≥ actual_error 검증 시퀀스 수
-    kvsculpt_gamma_sweep: [0.0, 0.25, 0.50, 1.0]
-  activity_b:
-    cache_hit_rate_improvement_min_pct: 5.0
-    noncontiguous_direct_hit_rate_min_pct: 30.0
-    memory_footprint_max_increase_pct: 20.0
   activity_a:
+    scheduling_overhead_max_ms: 0.1     # < 0.1ms/요청 MANDATORY
     scheduling_overhead_ttft_p50_max_pct: 5.0
-    scheduling_overhead_max_us: 100.0   # 0.1ms 이내
+    ttft_overhead_target_pct: 2.0
     cache_hit_rate_improvement_min_pct: 10.0
   activity_c:
-    memory_reduction_min_ratio: 0.50    # INT8K+INT4V: −50% 이상
-    int8k_int4v_relative_error_max: 0.01
+    c1_memory_reduction_min_ratio: 0.89  # -89% 이상 (추론, budget=0.093)
+    c1_memory_reduction_default_ratio: 0.50
+    c2_memory_reduction_min_ratio: 0.92  # -92% 이상 (50x 압착)
     effective_context_multiplier: 2.0
-    fallback_rate_level1_max: 0.20      # Level 1 폴백 비율 최대 20%
-    fallback_rate_level2_max: 0.05      # Level 2 폴백 비율 최대 5%
-  cross_c1_c2:
+    compression_overhead_ttft_max_pct: 10.0
+  cross_a1_c1:
     pipeline_cosine_min: 0.99           # MANDATORY
-    combined_memory_reduction_min: 0.55  # C-1+C-2 결합 −55% 이상
+    combined_kv_size_reduction_min: 0.80
 
 seed: 42
-results_dir: "results/2026-05-23"
+results_dir: "results/2026-05-24"
+```
+
+```yaml
+# configs/triattention_budget_policy.yaml
+reasoning_kv_budget_ratio: 0.093
+default_kv_budget_ratio: 0.20
+high_pressure_threshold: 0.80
+high_pressure_extra_reduction: 0.10
+reasoning_detection:
+  trigger_tags: ["<think>", "</think>"]
+```
+
+```yaml
+# configs/attention_matching_ref_query_config.yaml
+n_ref_queries: 32
+sampling_strategy: "mixed"
+uniform_fraction: 0.5
+importance_fraction: 0.5
+compression_ratios: [5, 10, 20, 50]
+alternating_rounds: 3
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_runtime_certified_quant_codec.py`
-- [ ] `tests/unit/test_compression_accuracy.py` (기존 파일 덮어쓰기)
-- [ ] `tests/unit/test_kvsculpt_distillation_codec.py`
-- [ ] `tests/unit/test_clc_positional_bias_gated_segment_cache.py`
-- [ ] `tests/unit/test_cpd_warm_cold_hit_router.py`
-- [ ] `tests/integration/test_runtime_certified_distillation_e2e.py`
-
-### 단위 테스트 명세 — test_runtime_certified_quant_codec.py
-
-```
-test_quantize_int8_round_trip_error_small:
-    quantize_int8 → dequantize_int8: relative_error < 0.01
-
-test_quantize_int4_round_trip_error_small:
-    quantize_int4 → dequantize_int4: relative_error < 0.05
-
-test_put_stores_int8_and_int4:
-    put(key, tensor) 후 _store[key].key_int8.dtype == torch.int8 확인
-
-test_put_cpu_backup_exists:
-    put 후 _store[key].key_fp16_backup.device == cpu 확인
-
-test_get_returns_restored_tensor_level0:
-    put → get: fallback_level=0, 반환값 shape 동일 확인
-
-test_compute_error_bound_conservative:
-    100 synthetic 시퀀스에서 error_bound ≥ actual_relative_error 항상 성립 (MANDATORY)
-
-test_decide_fallback_level0_below_threshold:
-    error_bound=0.003 ≤ error_threshold=0.005 → fallback_level=0
-
-test_decide_fallback_level1_above_threshold:
-    error_bound=0.008 > threshold=0.005, delta_attn=0.002 ≤ threshold/2=0.0025 → level=1
-
-test_decide_fallback_level2_high_attn_distortion:
-    delta_attn=0.004 > threshold/2=0.0025 → level=2
-
-test_certify_and_update_changes_fallback_level:
-    put 후 certify_and_update(Q) 호출 → fallback_level 적절히 설정
-
-test_memory_reduction_ratio_above_50pct:
-    INT8K+INT4V: memory_reduction_ratio() ≥ 0.50 (FP16 대비 −50% 이상) (MANDATORY)
-
-test_compression_hook_relative_error_below_1pct:
-    compression_hook(key, tensor) 후 attention_output_relative_error < 0.01 (MANDATORY)
-
-test_fallback_rate_level1_tracked:
-    Level 1 폴백 발생 시 fallback_count_level1 증가 확인
-
-test_certified_accuracy_report_keys:
-    certified_accuracy_report() 에 필수 키 포함:
-    [fallback_rate_level1, fallback_rate_level2, error_bound_mean, error_bound_p99,
-     memory_reduction_ratio, error_threshold]
-
-test_cachestore_interface_full:
-    put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
-
-test_evict_lru_first:
-    max_entries=2, 3번 put → 첫 번째 항목 퇴거
-
-test_hit_rate_tracking:
-    put 2개 후 get 1회 히트 + 1회 미스 → hit_rate() == 0.5
-
-test_seed_reproducibility:
-    동일 seed + 동일 입력 → 동일 양자화 결과
-```
-
-### 단위 테스트 명세 — test_compression_accuracy.py (기존 파일 덮어쓰기)
-
-```
-test_int8k_int4v_level0_relative_error_below_1pct:
-    RuntimeCertifiedQuantizedAttentionCodec Level 0 (INT8K+INT4V):
-    attention_output_relative_error < 0.01 (MANDATORY)
-
-test_int8k_fp16v_level1_relative_error_below_1pct:
-    Level 1 폴백 (INT8K+FP16V): relative_error < 0.01 (MANDATORY)
-
-test_fp16k_fp16v_level2_relative_error_near_zero:
-    Level 2 완전 복원 (FP16K+FP16V): relative_error ≈ 0.0 (기준 검증)
-
-test_niah_proxy_level0_cosine_above_099:
-    seq_len=[256, 512, 1024]: cosine_similarity_output ≥ 0.99 (MANDATORY)
-
-test_longbench_8subtask_proxy_all_above_099:
-    8개 독립 synthetic 시퀀스: cosine_sim ≥ 0.99 모두 (MANDATORY)
-
-test_error_bound_conservative_100_sequences:
-    100 synthetic 시퀀스: error_bound ≥ actual_error 모두 성립 (MANDATORY)
-
-test_memory_reduction_int8k_int4v_above_50pct:
-    memory_reduction_ratio() ≥ 0.50 (MANDATORY, −30% 기준 초과)
-
-test_kvsculpt_difficulty_profile_varies_by_layer:
-    pilot_profile_layer_difficulty 후 레이어별 난이도 값 다양성 확인
-    (max_difficulty / min_difficulty > 1.0)
-
-test_kvsculpt_budget_proportional_to_difficulty:
-    gamma=0.5: 고난이도 레이어 budget > 저난이도 레이어 budget
-
-test_kvsculpt_distill_compress_reduces_seq_len:
-    distill_compress(Q, K, V, layer_idx=0): 반환 K_selected.shape[0] < K.shape[0]
-
-test_kvsculpt_gamma0_uniform_budget:
-    gamma=0.0: 모든 레이어 budget ≈ total_budget_ratio (균일 배분)
-
-test_kvsculpt_accuracy_preserved_cosine_above_099:
-    distill_compress 후 cosine_similarity_output(Q, K_orig, V_orig, K_sel, V_sel) ≥ 0.99 (MANDATORY)
-
-test_cross1_pipeline_cosine_above_099:
-    RuntimeCertifiedKVSculptDistillationPipeline.run_pipeline() 후
-    cosine_similarity_output ≥ 0.99 (MANDATORY §5)
-
-test_cross1_pipeline_memory_reduction_above_55pct:
-    Cross-1 파이프라인: certified_codec.memory_reduction_ratio() ≥ 0.50
-
-test_cross1_fallback_count_tracked:
-    폴백 발생 시 layer_fallback_counts[layer_idx] 증가 확인
-
-test_kvsculpt_gamma_sweep_accuracy_curve:
-    gamma=[0.0, 0.25, 0.50, 1.0] 각각에서 cosine_sim 측정 및 기록
-    (모두 ≥ 0.99 MANDATORY)
-```
-
-### 단위 테스트 명세 — test_clc_positional_bias_gated_segment_cache.py
-
-```
-test_clc_delta_pos_zero_same_position:
-    pos_orig_start=100, pos_target_start=100 → ΔPos=0.0
-
-test_clc_delta_pos_normalized:
-    |pos_target - pos_orig| / max_context_length 정규화 확인
-
-test_clc_bias_gate_direct_reuse_small_delta:
-    ΔPos=0.10 ≤ 0.15 → ReencodingPolicy.DIRECT_REUSE
-
-test_clc_bias_gate_partial_reencoding_mid_delta:
-    ΔPos=0.25 (0.15 < 0.25 ≤ 0.40) → ReencodingPolicy.PARTIAL_REENCODING
-
-test_clc_bias_gate_full_reencoding_large_delta:
-    ΔPos=0.60 > 0.40 → ReencodingPolicy.FULL_REENCODING
-
-test_clc_put_segment_stores_meta:
-    put_segment(key, kv, pos_orig_start, pos_orig_end, hash) 후
-    _meta[key] 존재 확인
-
-test_clc_get_with_policy_returns_tuple:
-    put_segment → get_with_policy(key, pos_target) → (tensor, policy) 반환
-
-test_clc_get_with_policy_miss_returns_none:
-    미존재 key → (None, FULL_REENCODING)
-
-test_clc_direct_reuse_hit_count_increments:
-    direct_reuse 정책 히트 → _direct_reuse_hits 증가
-
-test_clc_noncontiguous_direct_hit_rate:
-    direct_reuse_hits=3, partial=1, full=1 → rate=3/5=0.60
-
-test_clc_cachestore_interface_full:
-    put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
-
-test_clc_evict_lru_oldest_first:
-    max_entries=2, 3번 put → 첫 번째 항목 퇴거
-
-test_clc_hit_rate_tracking:
-    put 2개 후 get 1회 히트 + 1회 미스 → hit_rate() == 0.5
-```
-
-### 단위 테스트 명세 — test_cpd_warm_cold_hit_router.py
-
-```
-test_cpd_predict_hit_rate_range_0_to_1:
-    predict_hit_rate(req) ∈ [0.0, 1.0]
-
-test_cpd_classify_warm_high_hit_rate:
-    prefix_hash 히트 히스토리 100% → path="warm", priority=0
-
-test_cpd_classify_cold_low_hit_rate:
-    히스토리 없는 첫 요청, 낮은 피처 → path="cold", priority=2
-
-test_cpd_classify_neutral_mid_hit_rate:
-    중간 피처 조합 → path="neutral", priority=1
-
-test_cpd_schedule_warm_first_in_output:
-    warm 요청이 출력 리스트 앞에 위치 (batch_priority=0 먼저)
-
-test_cpd_schedule_cold_last:
-    cold 요청이 출력 리스트 뒤에 위치
-
-test_cpd_update_predictor_changes_weights:
-    update_predictor(req, actual_hit=True) → 가중치 변화 확인
-
-test_cpd_hit_history_updated_after_update:
-    update_predictor 후 _hit_history[prefix_hash] 비어 있지 않음
-
-test_cpd_scheduling_overhead_below_1ms:
-    classify_request() 오버헤드 < 1000μs (TTFT +5% 이내 준수)
-
-test_cpd_schedule_empty_returns_empty:
-    schedule([]) == []
-
-test_cpd_sort_warm_batch_by_prefix:
-    동일 prefix_hash를 가진 요청들이 연속하여 정렬됨
-
-test_cpd_queue_pressure_cold_promoted:
-    len(requests) > queue_pressure_threshold: cold 요청 일부가 neutral로 승격
-
-test_cpd_routing_stats_keys:
-    routing_stats() 에 필수 키:
-    [warm_ratio, cold_ratio, neutral_ratio, scheduling_overhead_mean_us]
-
-test_cpd_basescheduler_interface:
-    schedule() 메서드가 List 반환 확인 (BaseScheduler 인터페이스)
-```
-
-### 통합 테스트 명세 — test_runtime_certified_distillation_e2e.py
-
-```
-test_e2e_pipeline_basic_run:
-    run_pipeline(Q, K, V, layer_idx=0, key) 정상 완료 확인
-
-test_e2e_pipeline_returns_kfinal_vfinal_report:
-    run_pipeline 반환값 (K_final, V_final, report) 타입 확인
-    report에 layer_idx, fallback_level, error_bound, selected_ratio 포함
-
-test_e2e_pipeline_accuracy_preserved_cosine_above_099:
-    run_pipeline 후 cosine_similarity_output(Q, K_orig, V_orig, K_final, V_final) ≥ 0.99
-    (MANDATORY §5)
-
-test_e2e_pipeline_memory_reduction_above_50pct:
-    certified_codec.memory_reduction_ratio() ≥ 0.50 after pipeline run
-
-test_e2e_pipeline_distillation_reduces_seq_len:
-    run_pipeline: K_final.shape[0] ≤ K.shape[0] (증류 압축으로 토큰 수 감소)
-
-test_e2e_pipeline_fallback_tracking:
-    Layer 0 다수 처리 후 layer_fallback_counts / layer_request_counts 딕셔너리 존재
-
-test_e2e_pipeline_cachestore_interface_full:
-    put/get/evict/hit_rate/memory_bytes/reset_stats 모두 동작
-
-test_e2e_pipeline_runner_integration:
-    InferenceRunner(cache=RuntimeCertifiedKVSculptDistillationPipeline)로
-    run_batch() 호출 성공 (src/engine/runner.py 사용)
-
-test_e2e_pipeline_cpd_router_integration:
-    CPDWarmColdHitRateRouter.schedule() → warm 요청에 대해 run_pipeline() 호출 후
-    routing_stats()["warm_ratio"] > 0
-
-test_e2e_clc_gate_integration:
-    CLCPositionalBiasGatedSegmentCache.get_with_policy() 반환 policy에 따라
-    DIRECT_REUSE 세그먼트는 재인코딩 없이 run_pipeline() 입력으로 사용
-
-test_e2e_solo_c1_vs_solo_c2_vs_cross1_memory_comparison:
-    C-1 단독 / C-2 단독 / Cross-1 통합 메모리 감소율 비교 기록
-    (Cross-1이 C-1 단독 대비 ≥ −10% 추가 감소 또는 동등)
-```
+- [ ] `tests/unit/test_triattention_pre_rope_kv_selector_codec.py`
+  - compute_concentration() 수치 검증 (동일 방향 vecs -> conc ~1.0; 균등 분산 -> conc ~0.0)
+  - compute_dist_pref_scores() 반환 shape [N] 검증
+  - select_kv() shape 검증, kept_indices 정렬 검증
+  - is_reasoning_task=True -> budget=0.093, False -> budget=0.20
+  - kv_pool_pressure=0.85 시 budget 10% 추가 감소
+  - detect_reasoning_task() 태그 감지 검증
+  - CacheStore 인터페이스 전체: put/get/evict/hit_rate/memory_bytes/reset_stats
+  - get_importance_mask() bool 마스크 shape [original_seq_len]
+  - concentration_stats() dict 반환
+  - memory_reduction_ratio() budget=0.093 시 >= 0.85
+
+- [ ] `tests/unit/test_attention_matching_closed_form_codec.py`
+  - build_ref_queries() shape [m, d_head], m=32 보장
+  - closed_form_k() shape [N, d_head]
+  - compact() K_c shape [m_c, d_head], m_c = max(1, N//compression_ratio)
+  - 어텐션 출력 보존: compression_ratio=5x, relative_error < 0.01
+  - compression_ratio=50x 시 m_c = max(1, N//50) 검증
+  - CacheStore 인터페이스 전체
+  - memory_reduction_ratio() compression_ratio=50x 시 >= 0.90
+  - alternating_rounds=1 vs 3 실행 시간 비교
+
+- [ ] `tests/unit/test_dualpath_nic_load_balancer.py`
+  - update_nic_status() 상태 갱신/조회
+  - prefill_nic_util < 0.80 -> path="single"
+  - prefill_nic_util >= 0.80 + idle decode 존재 -> path="dual"
+  - idle decode 없음 -> path="single"
+  - min_load_first 정렬 검증
+  - 라운드-로빈 균등 분산 검증
+  - max_dual_path_per_node=4 초과 decode 노드 제외 검증
+  - complete_dual_path() active_dual_path 감소
+  - 결정 지연 < 0.1ms (p99)
+  - schedule() routing_decision 첨부 검증
+  - scheduling_stats() dict 반환
+
+- [ ] `tests/unit/test_compression_accuracy.py` (기존 파일에 추가)
+  - C-1: kv_budget_ratio=0.20 -> relative_error < 0.01 (MANDATORY)
+  - C-1: kv_budget_ratio=0.093 -> relative_error < 0.01 (MANDATORY)
+  - C-1: pre-RoPE 집중도 선택 vs. norm_score만 사용 ablation 비교
+  - C-1: budget_ratio sweep [0.05, 0.093, 0.15, 0.20, 0.30] x relative_error 표
+  - C-1: concentration_stats() conc_Q_mean, conc_K_mean JSON 기록
+  - C-2: compression_ratio=5x -> relative_error < 0.01 (MANDATORY)
+  - C-2: compression_ratio=50x -> relative_error < 0.05
+  - C-2: KVSculptDistillationCodec 대비 동일 압축률에서 relative_error 비교
+  - C-2: compression_ratio sweep [5, 10, 20, 50] x relative_error 표
+
+- [ ] `tests/integration/test_dualpath_triattention_pipeline_e2e.py`
+  - 단일 경로 시나리오: prefill NIC 0.60 -> path="single", K_final=K_full
+  - 이중 경로 시나리오: prefill NIC 0.85 + idle decode -> path="dual"
+  - 이중 경로 + 추론 태스크: n_keep = N * 0.093
+  - accuracy: 이중 경로 후 relative_error < 0.01 (MANDATORY)
+  - 100회 실행: avg decision_latency_ms < 0.1
+  - pipeline_summary() dict 반환
+  - idle decode 없을 때 single path fallback
+  - kv_bytes_transferred / kv_bytes_original ~= budget_ratio
 
 ---
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] 단위 테스트 전부 통과 (신규 5개 파일 + 기존 회귀 없음)
-- [ ] `evaluation_criteria.md` §4 Activity C 필수 항목 충족:
-      - `test_int8k_int4v_level0_relative_error_below_1pct` 통과 (relative_error < 0.01, MANDATORY)
-      - `test_longbench_8subtask_proxy_all_above_099` 통과 (cosine_sim ≥ 0.99, MANDATORY)
-      - `test_error_bound_conservative_100_sequences` 통과 (수학적 보장 검증, MANDATORY)
-      - `test_memory_reduction_int8k_int4v_above_50pct` 통과 (reduction ≥ 0.50)
-- [ ] `evaluation_criteria.md` §5 크로스 조합 C 포함:
-      - `test_cross1_pipeline_cosine_above_099` 통과 (MANDATORY)
-      - `test_e2e_pipeline_accuracy_preserved_cosine_above_099` 통과 (MANDATORY)
-- [ ] `evaluation_criteria.md` §3 Activity B 항목 충족:
-      - `test_clc_bias_gate_direct_reuse_small_delta` 통과
-      - `test_clc_noncontiguous_direct_hit_rate` 통과
-- [ ] `evaluation_criteria.md` §2 Activity A 항목 충족:
-      - `test_cpd_scheduling_overhead_below_1ms` 통과 (TTFT overhead 검증)
-      - `test_cpd_classify_warm_high_hit_rate` 통과
-- [ ] `evaluation_criteria.md` §0 공통 필수:
-      - `RuntimeCertifiedQuantizedAttentionCodec`, `KVSculptDistillationCodec`,
-        `RuntimeCertifiedKVSculptDistillationPipeline`, `CLCPositionalBiasGatedSegmentCache`
-        모두 `CacheStore` 인터페이스 구현
-      - `CPDWarmColdHitRateRouter`가 `BaseScheduler` 인터페이스 구현
-      - 기존 테스트 회귀 없이 통과
-      - 시드 42 고정 재현성
-      - `configs/experiments/2026-05-23.yaml` 존재
-      - 모든 공개 함수·메서드 타입 힌트
-- [ ] 목표 지표 수치 `results/2026-05-23/metrics.json`에 JSON 기록:
-      ```json
-      {
-        "c1_int8k_int4v_relative_error": ...,
-        "c1_cosine_similarity_level0": ...,
-        "c1_memory_reduction_ratio": ...,
-        "c1_fallback_rate_level1": ...,
-        "c1_fallback_rate_level2": ...,
-        "c1_error_bound_mean": ...,
-        "c1_error_bound_p99": ...,
-        "c1_error_bound_conservative_violations": 0,
-        "c2_kl_reduction_vs_uniform": ...,
-        "c2_layer_difficulty_max_min_ratio": ...,
-        "c2_accuracy_cosine_budget_050": ...,
-        "c2_gamma_sweep": {"0.0": ..., "0.25": ..., "0.50": ..., "1.0": ...},
-        "cross1_pipeline_cosine": ...,
-        "cross1_memory_reduction_ratio": ...,
-        "cross1_fallback_budget_realloc_count": ...,
-        "b1_direct_reuse_hit_rate": ...,
-        "b1_noncontiguous_hit_rate_pct": ...,
-        "b1_cache_hit_rate_improvement_pct": ...,
-        "a2_scheduling_overhead_mean_us": ...,
-        "a2_warm_ratio": ...,
-        "a2_cold_ratio": ...,
-        "a2_cache_hit_rate_improvement_pct": ...,
-        "inference_throughput_improvement_pct": ...,
-        "effective_context_length_multiplier": ...
-      }
-      ```
-- [ ] 기존 모든 단위·통합 테스트 회귀 없이 통과
+- [ ] 단위 테스트 전부 통과 (신규 4종 + 기존 회귀 없음)
+- [ ] 통합 테스트 전부 통과
+- [ ] **evaluation_criteria.md §4 필수**: relative_error < 0.01 (MANDATORY)
+  - C-1: kv_budget_ratio=0.093/0.20 각각
+  - C-2: compression_ratio=5x
+- [ ] **evaluation_criteria.md §4 필수**: cosine_similarity >= 0.99 (MANDATORY)
+  - C-1: AIME25 proxy + LongBench proxy
+  - C-2: NIAH proxy + LongBench proxy
+- [ ] **evaluation_criteria.md §4 높음**: KV Memory Reduction >= -30%
+  - C-1: -89% (budget=0.093)
+  - C-2: -92% (50x 압착)
+- [ ] **evaluation_criteria.md §2 필수**: TTFT p50 +5% 이내
+  - A-1: p99 decision_latency_ms < 0.1
+- [ ] **evaluation_criteria.md §5 필수 (C 포함)**: Cross-1 cosine_similarity >= 0.99
+- [ ] **evaluation_criteria.md §1 높음**: 처리량 +20% 이상 (시뮬레이션)
+- [ ] `configs/experiments/2026-05-24.yaml` 생성됨
+- [ ] `configs/triattention_budget_policy.yaml` 생성됨
+- [ ] `configs/attention_matching_ref_query_config.yaml` 생성됨
+- [ ] `results/2026-05-24/metrics.json` 기록됨
+  - 필수 필드: `{conc_Q_mean, conc_K_mean, kv_budget_ratio, is_reasoning_task,
+    memory_reduction_ratio_c1, memory_reduction_ratio_c2,
+    relative_error_c1, relative_error_c2, compression_ratio_actual_c2,
+    dual_path_ratio, decision_latency_mean_ms}`
+- [ ] 이전 사이클 모든 단위·통합 테스트 회귀 없이 통과
