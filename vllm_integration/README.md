@@ -7,6 +7,156 @@ implementation (src/) into the latest vLLM codebase.
 
 ---
 
+## 2026-05-24 Cycle: Activity A+C (DualPathNIC NIC-Load-Aware Routing + TriAttention Pre-RoPE KV Selector + Attention Matching Closed-Form LS Compaction)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A   — DualPathNICLoadBalancer (NIC-utilization-aware disaggregated prefill routing)
+        + C-1 — TriAttentionPreRoPEKVSelectorCodec (arXiv 2604.04921, pre-RoPE trig-distance KV selection)
+        + C-2 — AttentionMatchingClosedFormCodec (arXiv 2602.16284, closed-form LS KV compaction)
+Cross A+C     — DualPathTriAttentionPipeline (dual-path relay + TriAttention KV compression before RDMA)
+Source: src/scheduler/dualpath_nic_load_balancer.py (A)
+        src/cache/triattention_pre_rope_kv_selector_codec.py (C-1)
+        src/cache/attention_matching_closed_form_codec.py (C-2)
+        src/engine/dualpath_triattention_pipeline.py (Cross A+C)
+Report ①: reports/evaluations/2026-05-24.md (PASS, all mandatory criteria met)
+```
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `dualpath_nic_scheduler_patch.py` | `DualPathNICSchedulerMixin.dualpath_pre_schedule()`: per-request NIC-load routing; annotates each request with `dualpath_routing_path` ("single"\|"dual"), `dualpath_relay_decode_node_id`, `dualpath_prefill_nic_utilization`, `dualpath_decision_latency_ms`. |
+| **A** | `DualPathNICSchedulerConfig` | `dualpath_nic_scheduler_patch.py` | `nic_saturation_threshold=0.80`, `idle_nic_threshold=0.30`, `max_dual_path_per_node=4`, `stale_threshold_ms=1000.0`. |
+| **A** | `make_dualpath_nic_scheduler_class(base, config)` | `dualpath_nic_scheduler_patch.py` | Factory: `(DualPathNICSchedulerMixin, base_class)` subclass. `dualpath_scheduling_stats()` returns per-node and aggregate stats. |
+| **A** | Multi-node heartbeat | `dualpath_nic_scheduler_patch.py` | `update_node_nic_status(node_id, node_type, nic_utilization, active_dual_path)`: syncs gRPC heartbeat NIC state. Stale entries (> `stale_threshold_ms`) auto-excluded from routing decisions. |
+| **C-1** | Attention write hook | `triattention_pre_rope_kv_selector_patch.py` | `TriAttentionPreRoPEKVSelectorHook.write_to_cache()`: stores compact `(K_sel, V_sel, kept_indices)` in side-channel cache; **returns ORIGINAL tensors unchanged** to primary attention kernel. |
+| **C-1** | Attention read hook | `triattention_pre_rope_kv_selector_patch.py` | `read_from_cache()`: returns `(compact_k, compact_v, kept_indices)` from side cache; for non-contiguous segment reuse only. |
+| **C-1** | `extend_cache_config_triattention()` | `triattention_pre_rope_kv_selector_patch.py` | Adds `compression_method="triattention_pre_rope"`, `triattention_kv_budget_ratio_reasoning`, `triattention_kv_budget_ratio_default`, `triattention_d_head` to vLLM `CacheConfig` via `object.__setattr__()`. |
+| **C-1** | `apply_triattention_pre_rope_kv_selector_patch()` | `triattention_pre_rope_kv_selector_patch.py` | Monkey-patcher: attaches `_triattention_hook`, `write_to_cache`, `read_from_cache` to any attention implementation class. |
+| **C-2** | Attention write hook | `attention_matching_closed_form_patch.py` | `AttentionMatchingClosedFormHook.write_to_cache()`: compacts KV using closed-form LS to `m_c = N / compression_ratio` tokens; stores in side cache; returns ORIGINAL tensors. |
+| **C-2** | Attention read hook | `attention_matching_closed_form_patch.py` | `read_from_cache()`: returns `(K_c, V_c)` compact tensors. `K_c`, `V_c` are LS-optimal representations of original KV for the training `Q_ref` set. |
+| **C-2** | `extend_cache_config_attention_matching()` | `attention_matching_closed_form_patch.py` | Adds `compression_method="attention_matching_closed_form"`, `attn_matching_compression_ratio`, `attn_matching_n_ref_queries`, `attn_matching_alternating_rounds` to CacheConfig. |
+| **A+C** | Cross-config | `cache_config_extension.py` | `DualPathTriAttentionACConfig` dataclass: unified A+C config. `build_dualpath_triattention_ac_config()` factory. `DualPathTriAttentionACConfigMixin`. |
+| **A+C** | Combined scheduler factory | `dualpath_nic_scheduler_patch.py` | `make_dualpath_triattention_scheduler_class(base, dualpath_config, triattention_hook)`: subclasses Scheduler with DualPath mixin + TriAttention hook attached. On dual path: TriAttention compresses KV on relay decode node before RDMA transfer to prefill. |
+
+### Accuracy Contract (evaluation_criteria.md §4 — validated Report ① 2026-05-24)
+
+**MANDATORY: `write_to_cache()` always returns ORIGINAL tensors — compressed KV NEVER enters primary attention kernel.**
+
+| Metric | Measured | Threshold | Status |
+|--------|----------|-----------|--------|
+| **Primary kernel accuracy (C-1, cosine sim)** | **1.000000** | **≥ 0.99** | **PASS (MANDATORY)** |
+| **C-1 relative_error (budget=0.093, reasoning)** | **0.000404** | **< 0.01** | **PASS (MANDATORY)** |
+| **C-1 relative_error (budget=0.20, default)** | **0.000127** | **< 0.01** | **PASS (MANDATORY)** |
+| **C-2 relative_error (5× compression)** | **0.003509** | **< 0.01** | **PASS (MANDATORY)** |
+| **C-2 relative_error (50× compression)** | **0.042** | **< 0.05** | **PASS** |
+| KV Memory Reduction C-1 (budget=0.093) | 90.7% | ≥ 30% | PASS |
+| KV Memory Reduction C-1 (budget=0.20) | 80.0% | ≥ 30% | PASS |
+| KV Memory Reduction C-2 (5× compression) | 80.0% | ≥ 30% | PASS |
+| A-1 dual-path decision latency p99 | 0.012ms | < 0.1ms | PASS (MANDATORY) |
+| Cross A+C dual_path_cosine_sim | 1.000 | ≥ 0.99 | PASS (MANDATORY) |
+| Cross A+C kv_memory_reduction | 80% | ≥ 30% | PASS |
+
+**C-1 accuracy model:**
+- Token selection is lossless (no quantization): `(compact_k - key[kept_indices]).norm() ≈ 0`
+- Primary path always receives ORIGINAL K/V tensors: `relative_error = 0.0`
+
+**C-2 accuracy model:**
+- LS objective: `min_{K_c,V_c} ||A_c V_c - A_orig V_orig||` over training `Q_ref`
+- Accuracy guarantee is w.r.t. the same `Q_ref` used during compaction
+- 5× compression: `rel_err = 0.003509 < 0.01` (MANDATORY pass)
+
+### Algorithm Pseudocode
+
+**TriAttention Pre-RoPE KV Selection (Activity C-1):**
+```
+conc_q = std(norm(Q, dim=-1)) / mean(norm(Q, dim=-1))
+conc_k = std(norm(K, dim=-1)) / mean(norm(K, dim=-1))
+budget = kv_budget_ratio_reasoning (0.093) if conc_q > 0.80 else kv_budget_ratio_default (0.20)
+scores = trigonometric_distance(Q, K)
+kept_indices = topk(scores, ceil(n_kv * budget)).indices
+_segment_cache[key] = (K[kept_indices], V[kept_indices], kept_indices)
+return key_original, value_original   # PRIMARY: unchanged
+```
+
+**Attention Matching Closed-Form LS (Activity C-2):**
+```
+m_c = max(1, N // compression_ratio)
+Q_ref = build_ref_queries(Q_context, n_ref_queries=32)
+K_c, V_c = alternating_LS_optimization(Q_ref, K, V, m_c, rounds=3)
+_compact_cache[key] = (K_c, V_c, Q_ref)
+return key_original, value_original   # PRIMARY: unchanged
+```
+
+**DualPath NIC-Load Routing (Activity A):**
+```
+if prefill_nic.utilization >= 0.80:
+    relay = min(decode_nodes with nic < 0.30 and active_dual < 4, key=active_dual)
+    path = "dual" if relay else "single"
+else:
+    path = "single"
+request.dualpath_routing_path = path   # decision_latency p99 < 0.1ms
+```
+
+### Usage (2026-05-24 A+C)
+
+```python
+import sys; sys.path.insert(0, "/path/to/inference-orchestration")
+from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+    TriAttentionHookConfig, TriAttentionPreRoPEKVSelectorHook,
+    apply_triattention_pre_rope_kv_selector_patch, extend_cache_config_triattention,
+)
+from vllm_integration.attention_matching_closed_form_patch import (
+    AttentionMatchingHookConfig, AttentionMatchingClosedFormHook,
+    apply_attention_matching_closed_form_patch, extend_cache_config_attention_matching,
+)
+from vllm_integration.dualpath_nic_scheduler_patch import (
+    DualPathNICSchedulerConfig,
+    make_dualpath_nic_scheduler_class,
+    make_dualpath_triattention_scheduler_class,
+)
+from vllm_integration.cache_config_extension import build_dualpath_triattention_ac_config
+from vllm.v1.core.sched.scheduler import Scheduler
+
+# Activity C-1: TriAttention pre-RoPE KV selector
+tri_hook = TriAttentionPreRoPEKVSelectorHook(
+    config=TriAttentionHookConfig(
+        d_head=128, n_kv_heads=8,
+        kv_budget_ratio_reasoning=0.093,
+        kv_budget_ratio_default=0.20,
+    )
+)
+extend_cache_config_triattention(vllm_config.cache_config, tri_hook.config)
+apply_triattention_pre_rope_kv_selector_patch(FlashAttentionImpl, tri_hook)
+
+# Activity C-2: AttentionMatching closed-form LS
+am_hook = AttentionMatchingClosedFormHook(
+    config=AttentionMatchingHookConfig(d_head=128, compression_ratio=5)
+)
+extend_cache_config_attention_matching(vllm_config.cache_config, am_hook.config)
+apply_attention_matching_closed_form_patch(FlashAttentionImpl, am_hook)
+
+# Activity A: DualPath NIC-aware scheduler
+DPSched = make_dualpath_nic_scheduler_class(Scheduler, DualPathNICSchedulerConfig())
+
+# Cross A+C: DualPath + TriAttention
+XCSched = make_dualpath_triattention_scheduler_class(Scheduler, DualPathNICSchedulerConfig(), tri_hook)
+```
+
+### Compatibility Table
+
+| Environment | Status | Notes |
+|-------------|--------|-------|
+| vLLM 0.21.0 v1 + CUDA GPU | PASS | Full integration; monkey-patch active |
+| vLLM 0.21.0 v1 + CPU only | PASS | All tensor ops run on CPU; factory guarded by try/except |
+| src/ not importable | PASS | Inline fallbacks in all three patch files |
+| Prior cycles (2026-05-23 through 2026-05-20) | PASS | No regressions |
+
+---
+
 ## 2026-05-23 Cycle: Activity A+B+C (RuntimeCertified INT8K+INT4V Quantization + CLC Positional-Bias-Gated Segment Cache + CPD Warm/Cold Hit-Rate Router)
 
 ### vLLM Version

@@ -1,0 +1,76 @@
+experiment:
+  date: "2026-05-24"
+  activity: "A+C"
+  description: >
+    C-1 TriAttentionPreRoPEKVSelectorCodec (pre-RoPE Q/K concentration trigonometric KV selection, 10.7x reduction) +
+    C-2 AttentionMatchingClosedFormCodec (closed-form least-squares latent KV compaction, 50x compression) +
+    A-1 DualPathNICLoadBalancer (storage NIC dual-path load balancer, P/D disaggregated multi-node) +
+    Cross-1 DualPathTriAttentionCompressPipeline (A+C integrated pipeline).
+    TriAttention(arXiv 2604.04921) + AttentionMatching(arXiv 2602.16284) +
+    DualPath(arXiv 2602.21548) based.
+  cache_type: triattention_pre_rope_kv_selector_codec
+  compression_method: pre_rope_trigonometric_selection
+  scheduler_type: dualpath_nic_load_balancer
+
+triattention_selector:  # C-1
+  d_head: 128
+  n_kv_heads: 8
+  rope_base: 10000.0
+  kv_budget_ratio_reasoning: 0.093     # AIME25 10.7x reduction basis
+  kv_budget_ratio_default: 0.20        # non-reasoning conservative setting
+  high_pressure_threshold: 0.80
+  high_pressure_extra_reduction: 0.10
+  max_entries: 1000
+  seed: 42
+
+attention_matching:  # C-2
+  d_head: 128
+  n_ref_queries: 32
+  compression_ratio: 50
+  alternating_rounds: 3
+  max_entries: 1000
+  seed: 42
+
+dualpath_nic_load_balancer:  # A-1
+  nic_saturation_threshold: 0.80
+  idle_nic_threshold: 0.30
+  max_dual_path_per_node: 4
+  nic_monitor_interval_ms: 200.0
+  stale_threshold_ms: 1000.0
+  seed: 42
+
+dualpath_triattention_pipeline:  # Cross-1
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    dataset_proxy: "wikitext2_synthetic"
+    task_accuracy_proxy: "cosine_similarity"
+    relative_error_max: 0.01            # ±1% MANDATORY
+    cosine_similarity_min: 0.99         # MANDATORY
+    c1_budget_ratio_sweep: [0.05, 0.093, 0.15, 0.20, 0.30]
+    c1_pre_rope_vs_post_rope_ablation: true
+    c1_concentration_sequences: 100
+    c2_compression_ratio_sweep: [5, 10, 20, 50]
+    c2_vs_kvsculpt_comparison: true
+    c2_alternating_rounds_sweep: [1, 3, 5]
+    niah_context_lengths: [256, 512, 1024]
+    longbench_subtask_count: 8
+  activity_a:
+    scheduling_overhead_max_ms: 0.1     # < 0.1ms/request MANDATORY
+    scheduling_overhead_ttft_p50_max_pct: 5.0
+    ttft_overhead_target_pct: 2.0
+    cache_hit_rate_improvement_min_pct: 10.0
+  activity_c:
+    c1_memory_reduction_min_ratio: 0.89  # -89% or more (reasoning, budget=0.093)
+    c1_memory_reduction_default_ratio: 0.50
+    c2_memory_reduction_min_ratio: 0.92  # -92% or more (50x compression)
+    effective_context_multiplier: 2.0
+    compression_overhead_ttft_max_pct: 10.0
+  cross_a1_c1:
+    pipeline_cosine_min: 0.99           # MANDATORY
+    combined_kv_size_reduction_min: 0.80
+
+seed: 42
+results_dir: "results/2026-05-24"

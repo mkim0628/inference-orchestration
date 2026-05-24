@@ -1,0 +1,6 @@
+reasoning_kv_budget_ratio: 0.093
+default_kv_budget_ratio: 0.20
+high_pressure_threshold: 0.80
+high_pressure_extra_reduction: 0.10
+reasoning_detection:
+  trigger_tags: ["<think>", "</think>"]
