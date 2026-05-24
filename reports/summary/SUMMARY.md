@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-23
-총 사이클 수: 24회 (SIGNIFICANT_CHANGE: true 24회 / false 0회)
+최종 업데이트: 2026-05-24
+총 사이클 수: 25회 (SIGNIFICANT_CHANGE: true 25회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-23) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-24) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-23 A+C+B 사이클 CPD 스케줄러 overhead p50=51.1μs 확인, GPU 실측 미포함 | 목표 2.5× 초과 달성 기록 유지 | ✓ |
-| KV Memory Reduction | −30% | **−62.5%** (2026-05-23 RuntimeCertifiedQuantizedAttentionCodec INT8K+INT4V: 9.0MB vs 24.0MB; 역대 최고 −96.88% DRAM 유지) | 목표 −30% 2.08× 초과 달성 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **60%** (2026-05-23 CLCPositionalBiasGatedSegmentCache noncontiguous_direct_hit_rate=60%(3/5); vLLM 33.3%(1/3, 실험 설정 차이); 목표 ≥30% 달성) | 목표 ≥30% 실측 2× 초과 달성 | ✓ |
-| Effective Context Length | 2× | **2.67×** (2026-05-23 RuntimeCertified 62.5% 메모리 감소 → 동일 메모리로 2.67× 컨텍스트; 역대 최고 VQCodec/DapQ 3.3× 유지) | 목표 2× 초과 달성 | ✓ |
-| Compression Accuracy Delta | ±1% | **±0.393%** (2026-05-23 RuntimeCertifiedQuantizedAttentionCodec per-channel INT8 수정 후 vLLM p99=0.393%; 독립 max=0.69%; 24사이클 연속 ±1% 이내 통과) | 24사이클 연속 ±1% 이내 통과; 수학적 런타임 보장 최초 달성 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **p50=51.1μs** (2026-05-23 CPDWarmColdHitRateRouter vLLM 실측; 역대 최저 vLLM 0.002ms(2026-05-19) 유지) | 역대 최저 수준 유지 | ✓ |
+| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-24 A+C 사이클 DualPathNICLoadBalancer p99=0.012ms 확인, GPU 실측 미포함 | 목표 2.5× 초과 달성 기록 유지 | ✓ |
+| KV Memory Reduction | −30% | **−90.7%** (2026-05-24 TriAttentionPreRoPEKVSelectorCodec budget=0.093 실측; C-2 AttentionMatching 50x: −93%; 역대 실측 최고치 갱신) | 목표 −30% 3.02× 초과 달성 — 역대 실측 최고치 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **60%** (2026-05-23 기록 유지; 2026-05-24 Activity B 미포함 사이클) | 목표 ≥30% 실측 2× 초과 달성 유지 | ✓ |
+| Effective Context Length | 2× | **5×** (2026-05-24 TriAttentionPreRoPEKVSelectorCodec 80~93% KV 절감 → 동일 메모리로 5× 이상 컨텍스트; 역대 최고치 갱신) | 목표 2× 2.5× 초과 달성 — 역대 최고치 | ✓ |
+| Compression Accuracy Delta | ±1% | **±0.000404** (2026-05-24 C-1 budget=0.093 relative_error=0.000404; C-2 5x: 0.003509; 25사이클 연속 ±1% 이내 통과) | 25사이클 연속 ±1% 이내 통과; C-1 역대 최저 accuracy delta 달성 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **p99=0.012ms** (2026-05-24 DualPathNICLoadBalancer 독립 실측; vLLM p99=0.005ms; 역대 최저 vLLM 0.002ms(2026-05-19) 유지) | 역대 최저 수준 유지 | ✓ |
 
-**2026-05-23 주요 이정표**: RuntimeCertifiedQuantizedAttentionCodec (C-1: INT8K+INT4V 수학적 오류 경계 인증 양자화 + 다단계 폴백 사다리) + KVSculptDistillationPipeline (Cross-1: 인증형 증류 압축) + CLCPositionalBiasGatedSegmentCache (B-1: 위치 편향 게이트 선택적 비연속 재사용) + CPDWarmColdHitRateRouter (A-2: Warm/Cold 히트율 예측 라우터) 사이클. 독립 평가 루프 1회차 Pass(62개 신규 단위+29 정확도+11 통합, 1381개 전체 통과). vLLM 이식 3회차 Pass(Loop 2 per-token→per-channel INT8 수정으로 p99 1.06%→0.393% 달성). Activity C RuntimeCertified 이중항 오류 분해: error_bound 100/100 보수성 검증 통과(위반 0건). 메모리 −62.5%(INT8K+INT4V 이론+실측 일치). CLC 비연속 직접 히트율 60%(독립). CPD 스케줄링 오버헤드 p50=51.1μs(<100μs 목표 절반). 런타임 오류 경계 수학적 보장 방식을 Activity C에 최초 적용. vLLM 0.21.0.
+**2026-05-24 주요 이정표**: TriAttentionPreRoPEKVSelectorCodec (C-1: pre-RoPE 삼각함수 중요도 KV 선택, 10.7× KV 절감, accuracy-preserving) + AttentionMatchingClosedFormCodec (C-2: 닫힌 형태 최소제곱 50× 압착) + DualPathNICLoadBalancer (A-1: 멀티노드 P/D 분리 스토리지 NIC 이중 경로) + DualPathTriAttentionCompressPipeline (Cross A+C: 이중 경로 + TriAttention 압축 통합 파이프라인) 사이클. 독립 평가 루프 1회차 Pass(신규 105개 단위+통합 + 기존 84개 회귀, 총 147+ tests). vLLM 이식 1회차 Pass(35/35 신규 smoke tests, 73/73 기존 사이클 Pass). KV Memory Reduction −90.7%(C-1 budget=0.093) + −93%(C-2 50x) 역대 실측 최고치 달성. Effective Context Length 5× 목표 2× 2.5배 초과. C-1 relative_error=0.000404(역대 최저 accuracy delta), C-2 5x: 0.003509(MANDATORY 통과). A-1 p99=0.012ms(독립), p99=0.005ms(vLLM). cosine_sim=1.000 (Cross-1). vLLM 0.21.0.
 
 ---
 
@@ -44,6 +44,7 @@
 | 2026-05-20 | **CONCURCongestionAdmissionSchedulerMixin** (혼잡 게이트 기반 요청 승인; _InlineCONCURGate FREE/BOUNDARY/CONGESTED 3-상태; 글로벌 KV Pool 점유율 추적; occupancy 임계값 0.40/0.75; 상위 절반 priority 허용; make_concur_admission_scheduler_class() 팩토리; vLLM Scheduler 서브클래싱; get_concur_stats() API; A+C Cross 사이클 메인 스케줄러) | **0.0004ms p50** (독립 실측; 목표 5ms 대비 12,500배 여유); vLLM 0.002ms/step (200 req; 목표 5ms 이내) | max_wait_time_multiplier=2.0 경계값 충족; CONGESTED 해소 후 모든 요청 즉시 허용; 글로벌 점유율 local=0.30+remote=0.70→global=0.50 멀티노드 추적; +10.0%p 히트율 향상 | 단일+멀티 (글로벌 점유율 집계 구조) | ✓ Pass |
 | 2026-05-22 | **PPDAppendFullPrefillClassifier** (PPD arXiv 2603.13358 기반 프리필 유형 분류 라우터; (content_hash, session_id, turn_id) 레지스트리; append_threshold=0.15; SLO 압박 시 full-prefill override; expire_sessions() TTL 만료; make_ppd_classifier_scheduler_class() 팩토리; DapQSessionSegmentDualReductionPipeline 통합; A+B+C 파이프라인 메인 스케줄러) | **<1000μs mean** (독립 실측; O(1) 해시 비교); **1.6μs/call** (vLLM 실측; 목표 5ms 대비 3,125배 여유) | Turn 1 full-prefill / Turn 2 append-prefill 분류 정확도 100%; SLO pressure override 정상; 세션 TTL 만료 검증; new_token_ratio=15/115≈0.130 < 0.15 → append 판정; threshold 경계값 (=) → append | 멀티 (P/D 분리 구조; append→D_node, full→P_node) | ✓ Pass |
 | 2026-05-23 | **CPDWarmColdHitRateRouter** (Together AI CPD 기반 경량 히트율 예측기; 선형 회귀 4피처 온라인 SGD 갱신; warm/cold/neutral 3경로 소프트 분기; warm_slot_ratio=0.60 / cold_slot_ratio=0.30 / neutral_slot_ratio=0.10; cold promotion으로 기아 방지; _cpd_predict_hit_rate() p50=51.1μs; high_hit_threshold=0.70 / low_hit_threshold=0.25; C+A+B 조합 메인 스케줄러) | **p50=51.1μs** (vLLM 실측; 목표 100μs 이내 충족); **p99=248.6μs** | warm/cold/neutral 3경로 smoke test Pass; warm 업데이트 후 hot prefix → warm 분류 확인; cold_promotion 로직: SGD 업데이트로 히스토리 반영 | 단일 (멀티-GPU N/A — GPU 없는 환경; 설계상 멀티노드 지원 구조 포함) | ✓ Pass |
+| 2026-05-24 | **DualPathNICLoadBalancer** (DualPath 2602.21548 기반 스토리지 NIC 부하 인식 이중 경로 라우터; nic_saturation_threshold=0.80; idle decode 노드 유휴 NIC(utilization<0.30) 중계 경로; min_load_first 정책; max_dual_path_per_node=4 상한; round-robin 균등 분산; make_dualpath_nic_scheduler_class() 팩토리; A+C Cross-1 메인 스케줄러) | **avg 0.003ms / p99 0.012ms** (독립 실측; 기준 0.1ms 크게 하회); **vLLM p99=0.005ms** (1000회 routing decision) | round-robin 균등 분산 smoke Pass; max_dual_path_per_node 제한 정상; 1P+3D 시뮬레이션 single/dual path 분기 정확 | 멀티 (P/D 분리 환경; decode 노드 유휴 NIC 중계 경로) | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: 멀티노드 P/D 분리 환경 구현 완료. compress_before_transfer 임계값(1MB) 기반 자동 압축 활성화.
 
