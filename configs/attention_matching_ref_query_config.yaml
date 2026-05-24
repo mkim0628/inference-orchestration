@@ -1,0 +1,6 @@
+n_ref_queries: 32
+sampling_strategy: "mixed"
+uniform_fraction: 0.5
+importance_fraction: 0.5
+compression_ratios: [5, 10, 20, 50]
+alternating_rounds: 3
