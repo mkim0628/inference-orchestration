@@ -314,3 +314,139 @@ def build_kvdrive_abc_config(
         thunder_pin_threshold=thunder_pin_threshold,
         seed=seed,
     )
+
+
+# ===========================================================================
+# 2026-05-24: DualPathTriAttentionACConfig (Activity A+C — config extension)
+# ===========================================================================
+# Extends CacheConfig with fields needed for the 2026-05-24 A+C cycle.
+#
+# Activity A (DualPathNICLoadBalancer):
+#   enable_dualpath_nic: bool — enable NIC-load-aware dual-path routing
+#   nic_saturation_threshold: float — NIC saturation threshold (default 0.80)
+#   idle_nic_threshold: float — decode node idle threshold (default 0.30)
+#   max_dual_path_per_node: int — max concurrent dual-path KV loads per relay node
+#   dualpath_stale_threshold_ms: float — NIC status staleness threshold
+#
+# Activity C-1 (TriAttentionPreRoPEKVSelectorCodec):
+#   compression_method: str — "triattention_pre_rope" | "attention_matching_ls"
+#   triattention_kv_budget_ratio_reasoning: float — budget for reasoning tasks
+#   triattention_kv_budget_ratio_default: float — budget for non-reasoning tasks
+#   triattention_d_head: int — attention head dimension
+#
+# Activity C-2 (AttentionMatchingClosedFormCodec):
+#   attn_matching_compression_ratio: int — m_c = N / ratio
+#   attn_matching_n_ref_queries: int — reference queries m
+#   attn_matching_alternating_rounds: int — LS alternating optimization rounds
+#
+# Does NOT modify vLLM CacheConfig; uses standalone dataclass + mixin pattern.
+# ===========================================================================
+
+from dataclasses import dataclass as _dc_24, field as _field_24
+from typing import Optional as _Opt_24
+
+
+@_dc_24
+class DualPathTriAttentionACConfig:
+    """Standalone config for the 2026-05-24 A+C integrated cycle.
+
+    Carries all new fields required by:
+      - Activity A (DualPathNICSchedulerMixin): NIC routing thresholds.
+      - Activity C-1 (TriAttentionPreRoPEKVSelectorHook): pre-RoPE KV budget.
+      - Activity C-2 (AttentionMatchingClosedFormHook): LS compaction settings.
+      - Cross-1 (DualPathTriAttentionPipeline): A+C combined parameters.
+
+    Usage:
+        from vllm_integration.cache_config_extension import DualPathTriAttentionACConfig
+        cfg = DualPathTriAttentionACConfig()
+        # Pass alongside vLLM's CacheConfig
+    """
+    # Activity A — DualPath NIC routing
+    enable_dualpath_nic: bool = True
+    nic_saturation_threshold: float = 0.80
+    idle_nic_threshold: float = 0.30
+    max_dual_path_per_node: int = 4
+    dualpath_nic_monitor_interval_ms: float = 200.0
+    dualpath_stale_threshold_ms: float = 1000.0
+    dualpath_enable_multinode: bool = True
+
+    # Activity C — compression method selector
+    # Valid values: "none" | "triattention_pre_rope" | "attention_matching_ls"
+    #               | "dualpath_triattention_cross"
+    compression_method: str = "triattention_pre_rope"
+
+    # Activity C-1 — TriAttentionPreRoPEKVSelectorCodec
+    triattention_enabled: bool = True
+    triattention_kv_budget_ratio_reasoning: float = 0.093  # 10.7x reduction
+    triattention_kv_budget_ratio_default: float = 0.20
+    triattention_d_head: int = 128
+    triattention_n_kv_heads: int = 8
+    triattention_rope_base: float = 10000.0
+    triattention_high_pressure_threshold: float = 0.80
+    triattention_high_pressure_extra_reduction: float = 0.10
+
+    # Activity C-2 — AttentionMatchingClosedFormCodec
+    attn_matching_enabled: bool = True
+    attn_matching_compression_ratio: int = 50
+    attn_matching_n_ref_queries: int = 32
+    attn_matching_alternating_rounds: int = 3
+
+    # Common
+    seed: int = 42
+
+
+class DualPathTriAttentionACConfigMixin:
+    """Mixin for engine-level configs needing 2026-05-24 A+C parameters.
+
+    Usage:
+        class MyEngineConfig(DualPathTriAttentionACConfigMixin, VllmConfig):
+            pass
+        cfg = MyEngineConfig()
+        cfg.dualpath_ac.compression_method  # => "triattention_pre_rope"
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        dualpath_ac: _Opt_24[DualPathTriAttentionACConfig] = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[call-arg]
+        self.dualpath_ac: DualPathTriAttentionACConfig = (
+            dualpath_ac or DualPathTriAttentionACConfig()
+        )
+
+
+def build_dualpath_triattention_ac_config(
+    compression_method: str = "triattention_pre_rope",
+    nic_saturation_threshold: float = 0.80,
+    kv_budget_ratio_reasoning: float = 0.093,
+    kv_budget_ratio_default: float = 0.20,
+    attn_matching_compression_ratio: int = 50,
+    enable_dualpath_nic: bool = True,
+    seed: int = 42,
+) -> DualPathTriAttentionACConfig:
+    """Convenience factory for DualPathTriAttentionACConfig.
+
+    Args:
+        compression_method: "triattention_pre_rope" | "attention_matching_ls"
+                            | "dualpath_triattention_cross" | "none".
+        nic_saturation_threshold: NIC saturation trigger for dual-path routing.
+        kv_budget_ratio_reasoning: TriAttention budget for reasoning tasks.
+        kv_budget_ratio_default: TriAttention budget for non-reasoning tasks.
+        attn_matching_compression_ratio: AttentionMatching m_c = N / ratio.
+        enable_dualpath_nic: Enable DualPath NIC routing (Activity A).
+        seed: RNG seed for reproducibility.
+
+    Returns:
+        Fully-initialised DualPathTriAttentionACConfig.
+    """
+    return DualPathTriAttentionACConfig(
+        compression_method=compression_method,
+        nic_saturation_threshold=nic_saturation_threshold,
+        triattention_kv_budget_ratio_reasoning=kv_budget_ratio_reasoning,
+        triattention_kv_budget_ratio_default=kv_budget_ratio_default,
+        attn_matching_compression_ratio=attn_matching_compression_ratio,
+        enable_dualpath_nic=enable_dualpath_nic,
+        seed=seed,
+    )

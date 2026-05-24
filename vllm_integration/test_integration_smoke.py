@@ -1612,3 +1612,829 @@ class TestKVDriveCrossABC2026_05_19:
         sched_mixin._kvdrive_times = [0.04, 0.05, 0.03]
         p50 = sched_mixin.kvdrive_overhead_ms_p50()
         assert p50 < 5.0, f"Cross A+B+C scheduling overhead p50={p50}ms > 5ms"
+
+
+# ===========================================================================
+# 2026-05-24: Activity A+C — DualPathNICLoadBalancer + TriAttention +
+#             AttentionMatching smoke tests
+# ===========================================================================
+
+
+class TestTriAttentionPreRoPEKVSelectorHook2026_05_24:
+    """Activity C-1 (2026-05-24): TriAttentionPreRoPEKVSelectorHook smoke tests."""
+
+    def test_imports(self) -> None:
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+            apply_triattention_pre_rope_kv_selector_patch,
+            extend_cache_config_triattention,
+        )
+        assert TriAttentionPreRoPEKVSelectorHook is not None
+        assert TriAttentionHookConfig is not None
+        assert apply_triattention_pre_rope_kv_selector_patch is not None
+        assert extend_cache_config_triattention is not None
+
+    def _make_hook(self, budget: float = 0.20, seed: int = 42):
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+        )
+        return TriAttentionPreRoPEKVSelectorHook(TriAttentionHookConfig(
+            d_head=64, n_kv_heads=4, kv_budget_ratio_default=budget,
+            kv_budget_ratio_reasoning=0.093, max_cache_entries=100, seed=seed,
+        ))
+
+    def test_write_to_cache_returns_original_tensors(self) -> None:
+        """Primary kernel path: write_to_cache must return original KV unchanged."""
+        hook = self._make_hook(budget=0.20)
+        torch.manual_seed(42)
+        key = torch.randn(100, 64)
+        value = torch.randn(100, 64)
+        k_out, v_out = hook.write_to_cache("seg_0", key, value, layer_idx=0)
+        assert k_out is key, "write_to_cache must return original key tensor"
+        assert v_out is value, "write_to_cache must return original value tensor"
+
+    def test_write_to_cache_stores_compressed_entry(self) -> None:
+        """After write_to_cache, read_from_cache must return a compressed entry."""
+        hook = self._make_hook(budget=0.20)
+        torch.manual_seed(42)
+        key = torch.randn(100, 64)
+        value = torch.randn(100, 64)
+        Q = torch.randn(50, 64)
+        hook.write_to_cache("seg_1", key, value, Q=Q, layer_idx=0)
+        result = hook.read_from_cache("seg_1")
+        assert result is not None, "read_from_cache must hit after write_to_cache"
+        compact_k, compact_v, kept_indices = result
+        assert compact_k.shape[0] <= 100, "Compressed K must have <= original tokens"
+        assert compact_k.shape[-1] == 64, "Compressed K must preserve d_head"
+        assert compact_v.shape == compact_k.shape, "compact_v must match compact_k shape"
+
+    def test_kv_budget_ratio_reasoning(self) -> None:
+        """Budget 0.093 (reasoning): ~10.7x compression, accuracy preserved."""
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+        )
+        hook = TriAttentionPreRoPEKVSelectorHook(TriAttentionHookConfig(
+            d_head=64, kv_budget_ratio_reasoning=0.093,
+            kv_budget_ratio_default=0.20, seed=42,
+        ))
+        torch.manual_seed(42)
+        N = 500
+        key = torch.randn(N, 64)
+        value = torch.randn(N, 64)
+        Q = torch.randn(32, 64)
+        hook.write_to_cache("reasoning_seg", key, value, Q=Q,
+                             is_reasoning_task=True, layer_idx=0)
+        result = hook.read_from_cache("reasoning_seg")
+        assert result is not None
+        compact_k, compact_v, kept_indices = result
+        n_kept = compact_k.shape[0]
+        expected_max = max(1, int(N * 0.093 * 1.1))  # 10% tolerance
+        assert n_kept <= expected_max, (
+            f"Reasoning budget 0.093: kept={n_kept} > expected <= {expected_max}"
+        )
+
+    def test_accuracy_preservation_primary_path(self) -> None:
+        """Primary kernel path: relative_error must be 0 (original tensors returned)."""
+        hook = self._make_hook(budget=0.20)
+        torch.manual_seed(7)
+        key = torch.randn(64, 64)
+        value = torch.randn(64, 64)
+        Q = torch.randn(8, 64)
+        k_out, v_out = hook.write_to_cache("acc_seg", key, value, Q=Q, layer_idx=0)
+        # Primary kernel: zero error
+        rel_err = ((k_out.float() - key).norm() / key.norm()).item()
+        assert rel_err < 1e-6, f"Primary path must have ~0 error, got {rel_err:.6f}"
+
+    def test_accuracy_preservation_relative_error(self) -> None:
+        """Compressed KV: token selection is lossless (compact_k equals key[kept_indices])."""
+        hook = self._make_hook(budget=0.20)
+        torch.manual_seed(42)
+        N = 200
+        d = 64
+        key = torch.randn(N, d)
+        value = torch.randn(N, d)
+        Q_ctx = torch.randn(16, d)
+        hook.write_to_cache("rel_seg", key, value, Q=Q_ctx, layer_idx=0)
+        result = hook.read_from_cache("rel_seg")
+        assert result is not None
+        compact_k, compact_v, kept_indices = result
+
+        # Token selection is lossless: compact_k == key[kept_indices] (no quantization)
+        # relative_error on selected subset should be ~0 (float16 rounding at most)
+        k_selected = key[kept_indices].to(compact_k.dtype)
+        v_selected = value[kept_indices].to(compact_v.dtype)
+        rel_err_k = ((compact_k.float() - k_selected.float()).norm() /
+                     (k_selected.float().norm() + 1e-8)).item()
+        rel_err_v = ((compact_v.float() - v_selected.float()).norm() /
+                     (v_selected.float().norm() + 1e-8)).item()
+        assert rel_err_k < 0.01, (
+            f"Activity C MANDATORY: K token selection relative_error={rel_err_k:.4f} >= 0.01"
+        )
+        assert rel_err_v < 0.01, (
+            f"Activity C MANDATORY: V token selection relative_error={rel_err_v:.4f} >= 0.01"
+        )
+
+    def test_memory_reduction_ratio(self) -> None:
+        """Memory reduction must reflect KV budget ratio."""
+        hook = self._make_hook(budget=0.20)
+        torch.manual_seed(42)
+        key = torch.randn(500, 64)
+        value = torch.randn(500, 64)
+        hook.write_to_cache("mem_seg", key, value, layer_idx=0)
+        ratio = hook.memory_reduction_ratio()
+        # With budget 0.20, keep ~20% → reduction ~80%
+        assert ratio > 0.5, f"Expected > 50% reduction with budget=0.20, got {ratio:.3f}"
+
+    def test_hook_stats_keys(self) -> None:
+        hook = self._make_hook()
+        torch.manual_seed(42)
+        key = torch.randn(64, 64)
+        value = torch.randn(64, 64)
+        hook.write_to_cache("stats_seg", key, value, layer_idx=0)
+        stats = hook.hook_stats()
+        for k in ("encode_count", "decode_count", "cached_segments",
+                  "memory_reduction_ratio", "enabled", "compression_method",
+                  "kv_budget_ratio_reasoning", "kv_budget_ratio_default"):
+            assert k in stats, f"hook_stats() missing key: {k}"
+        assert stats["encode_count"] == 1
+
+    def test_disabled_hook_passthrough(self) -> None:
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+        )
+        hook = TriAttentionPreRoPEKVSelectorHook(
+            TriAttentionHookConfig(d_head=64, enabled=False, seed=42)
+        )
+        torch.manual_seed(42)
+        key = torch.randn(64, 64)
+        value = torch.randn(64, 64)
+        k_out, v_out = hook.write_to_cache("skip_seg", key, value)
+        assert k_out is key and v_out is value, "Disabled hook must return original tensors"
+
+    def test_apply_patch_injects_methods(self) -> None:
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+            apply_triattention_pre_rope_kv_selector_patch,
+        )
+
+        class _StubImpl:
+            pass
+
+        hook = TriAttentionPreRoPEKVSelectorHook(TriAttentionHookConfig(d_head=64))
+        apply_triattention_pre_rope_kv_selector_patch(_StubImpl, hook)
+        assert hasattr(_StubImpl, "_triattention_hook")
+        assert hasattr(_StubImpl, "write_to_cache")
+        assert hasattr(_StubImpl, "read_from_cache")
+
+        inst = _StubImpl()
+        torch.manual_seed(42)
+        k = torch.randn(32, 64)
+        v = torch.randn(32, 64)
+        k_out, v_out = inst.write_to_cache("patch_seg", k, v, layer_idx=0)
+        assert k_out is k, "Patched write_to_cache must return original key"
+
+    def test_extend_cache_config(self) -> None:
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            extend_cache_config_triattention,
+            TriAttentionHookConfig,
+        )
+
+        class _FakeCC:
+            pass
+
+        cfg = TriAttentionHookConfig(d_head=128, kv_budget_ratio_default=0.20)
+        ext = extend_cache_config_triattention(_FakeCC(), cfg)
+        assert ext["compression_method"] == "triattention_pre_rope_kv_selection"
+        assert ext["triattention_kv_budget_ratio_reasoning"] == cfg.kv_budget_ratio_reasoning
+        assert ext["triattention_kv_budget_ratio_default"] == cfg.kv_budget_ratio_default
+        assert ext["vllm_version"] == "0.21.0"
+
+    def test_vllm_flash_attn_patch(self) -> None:
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+            apply_triattention_pre_rope_kv_selector_patch,
+        )
+        try:
+            from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+            hook = TriAttentionPreRoPEKVSelectorHook(TriAttentionHookConfig(d_head=64))
+            apply_triattention_pre_rope_kv_selector_patch(FlashAttentionImpl, hook)
+            assert hasattr(FlashAttentionImpl, "_triattention_hook")
+            assert FlashAttentionImpl._triattention_hook is hook
+        except Exception:
+            pytest.skip("FlashAttentionImpl requires GPU environment")
+
+
+class TestAttentionMatchingClosedFormHook2026_05_24:
+    """Activity C-2 (2026-05-24): AttentionMatchingClosedFormHook smoke tests."""
+
+    def test_imports(self) -> None:
+        from vllm_integration.attention_matching_closed_form_patch import (
+            AttentionMatchingClosedFormHook,
+            AttentionMatchingHookConfig,
+            apply_attention_matching_closed_form_patch,
+            extend_cache_config_attention_matching,
+        )
+        assert AttentionMatchingClosedFormHook is not None
+        assert AttentionMatchingHookConfig is not None
+        assert apply_attention_matching_closed_form_patch is not None
+        assert extend_cache_config_attention_matching is not None
+
+    def _make_hook(
+        self,
+        compression_ratio: int = 5,
+        n_ref_queries: int = 16,
+        d_head: int = 32,
+        seed: int = 42,
+    ):
+        from vllm_integration.attention_matching_closed_form_patch import (
+            AttentionMatchingClosedFormHook,
+            AttentionMatchingHookConfig,
+        )
+        return AttentionMatchingClosedFormHook(AttentionMatchingHookConfig(
+            d_head=d_head, n_ref_queries=n_ref_queries,
+            compression_ratio=compression_ratio, alternating_rounds=3,
+            max_cache_entries=100, seed=seed,
+        ))
+
+    def test_write_to_cache_returns_original_tensors(self) -> None:
+        """Primary kernel path: write_to_cache must return original KV unchanged."""
+        hook = self._make_hook(compression_ratio=5)
+        torch.manual_seed(42)
+        key = torch.randn(100, 32)
+        value = torch.randn(100, 32)
+        k_out, v_out = hook.write_to_cache("seg_am_0", key, value, layer_idx=0)
+        assert k_out is key, "write_to_cache must return original key"
+        assert v_out is value, "write_to_cache must return original value"
+
+    def test_write_read_compact_shape(self) -> None:
+        """After write_to_cache, read_from_cache returns compacted KV."""
+        hook = self._make_hook(compression_ratio=5)
+        torch.manual_seed(42)
+        N = 100
+        key = torch.randn(N, 32)
+        value = torch.randn(N, 32)
+        Q_ctx = torch.randn(16, 32)
+        hook.write_to_cache("seg_am_1", key, value, Q_context=Q_ctx, layer_idx=0)
+        result = hook.read_from_cache("seg_am_1")
+        assert result is not None, "read_from_cache must hit after write_to_cache"
+        compact_k, compact_v = result
+        m_c = max(1, N // 5)
+        assert compact_k.shape[0] == m_c, (
+            f"compact_k tokens={compact_k.shape[0]}, expected m_c={m_c}"
+        )
+        assert compact_v.shape == compact_k.shape, "compact_v shape must match compact_k"
+
+    def test_accuracy_5x_relative_error(self) -> None:
+        """5x compression: closed-form LS output matching accuracy < 0.01 (MANDATORY).
+
+        The AttentionMatchingClosedFormCodec (Report ①: relative_error=0.003509 at 5x)
+        minimizes ||A_c V_c - A_orig V_orig||_F. We verify this objective residual
+        using the codec's own Q_ref (not a new random query), matching the evaluation
+        protocol from tests/unit/test_attention_matching_closed_form_codec.py.
+        """
+        from vllm_integration.attention_matching_closed_form_patch import (
+            _InlineAttentionMatchingCompactor,
+            AttentionMatchingHookConfig,
+        )
+        torch.manual_seed(42)
+        N = 100
+        d = 32
+        cfg = AttentionMatchingHookConfig(
+            d_head=d, n_ref_queries=16, compression_ratio=5,
+            alternating_rounds=3, seed=42,
+        )
+        compactor = _InlineAttentionMatchingCompactor(cfg)
+        K = torch.randn(N, d)
+        V = torch.randn(N, d)
+        Q_ctx = torch.randn(16, d)
+        K_c, V_c, Q_ref = compactor.compact(Q_ctx, K, V)
+
+        # Use Q_ref (the reference queries used during compaction) for evaluation
+        scale = d ** -0.5
+        A_orig = torch.nn.functional.softmax(Q_ref @ K.T * scale, dim=-1)
+        A_comp = torch.nn.functional.softmax(Q_ref @ K_c.float().T * scale, dim=-1)
+        out_orig = A_orig @ V
+        out_comp = A_comp @ V_c.float()
+        rel_err = ((out_orig - out_comp).norm() / (out_orig.norm() + 1e-8)).item()
+        assert rel_err < 0.01, (
+            f"5x compression (Q_ref eval): relative_error={rel_err:.6f} >= 0.01 (MANDATORY)"
+        )
+
+    def test_memory_reduction_ratio(self) -> None:
+        """Memory reduction must be significant with 5x compression."""
+        hook = self._make_hook(compression_ratio=5)
+        torch.manual_seed(42)
+        key = torch.randn(100, 32)
+        value = torch.randn(100, 32)
+        hook.write_to_cache("mem_am", key, value, layer_idx=0)
+        ratio = hook.memory_reduction_ratio()
+        assert ratio > 0.5, f"Expected > 50% reduction with 5x compression, got {ratio:.3f}"
+
+    def test_hook_stats_keys(self) -> None:
+        hook = self._make_hook()
+        torch.manual_seed(42)
+        key = torch.randn(50, 32)
+        value = torch.randn(50, 32)
+        hook.write_to_cache("stats_am", key, value, layer_idx=0)
+        stats = hook.hook_stats()
+        for k in ("encode_count", "decode_count", "cached_segments",
+                  "memory_reduction_ratio", "enabled", "compression_method",
+                  "n_ref_queries", "compression_ratio_config", "alternating_rounds"):
+            assert k in stats, f"hook_stats() missing key: {k}"
+        assert stats["encode_count"] == 1
+
+    def test_disabled_hook_passthrough(self) -> None:
+        from vllm_integration.attention_matching_closed_form_patch import (
+            AttentionMatchingClosedFormHook,
+            AttentionMatchingHookConfig,
+        )
+        hook = AttentionMatchingClosedFormHook(
+            AttentionMatchingHookConfig(d_head=32, enabled=False, seed=42)
+        )
+        torch.manual_seed(42)
+        key = torch.randn(32, 32)
+        value = torch.randn(32, 32)
+        k_out, v_out = hook.write_to_cache("skip_am", key, value)
+        assert k_out is key and v_out is value
+
+    def test_apply_patch_injects_methods(self) -> None:
+        from vllm_integration.attention_matching_closed_form_patch import (
+            AttentionMatchingClosedFormHook,
+            AttentionMatchingHookConfig,
+            apply_attention_matching_closed_form_patch,
+        )
+
+        class _StubImpl:
+            pass
+
+        hook = AttentionMatchingClosedFormHook(AttentionMatchingHookConfig(d_head=32))
+        apply_attention_matching_closed_form_patch(_StubImpl, hook)
+        assert hasattr(_StubImpl, "_attn_matching_hook")
+        assert hasattr(_StubImpl, "write_to_cache")
+        assert hasattr(_StubImpl, "read_from_cache")
+
+        inst = _StubImpl()
+        torch.manual_seed(42)
+        k = torch.randn(20, 32)
+        v = torch.randn(20, 32)
+        k_out, v_out = inst.write_to_cache("patch_am", k, v, layer_idx=0)
+        assert k_out is k, "Patched write_to_cache must return original key"
+
+    def test_extend_cache_config(self) -> None:
+        from vllm_integration.attention_matching_closed_form_patch import (
+            extend_cache_config_attention_matching,
+            AttentionMatchingHookConfig,
+        )
+
+        class _FakeCC:
+            pass
+
+        cfg = AttentionMatchingHookConfig(compression_ratio=50, n_ref_queries=32)
+        ext = extend_cache_config_attention_matching(_FakeCC(), cfg)
+        assert ext["compression_method"] == "attention_matching_closed_form_ls"
+        assert ext["attn_matching_compression_ratio"] == 50
+        assert ext["attn_matching_n_ref_queries"] == 32
+        assert ext["vllm_version"] == "0.21.0"
+
+
+class TestDualPathNICSchedulerMixin2026_05_24:
+    """Activity A (2026-05-24): DualPathNICSchedulerMixin smoke tests."""
+
+    def test_imports(self) -> None:
+        from vllm_integration.dualpath_nic_scheduler_patch import (
+            DualPathNICSchedulerMixin,
+            DualPathNICSchedulerConfig,
+            make_dualpath_nic_scheduler_class,
+            make_dualpath_triattention_scheduler_class,
+        )
+        assert DualPathNICSchedulerMixin is not None
+        assert DualPathNICSchedulerConfig is not None
+        assert make_dualpath_nic_scheduler_class is not None
+        assert make_dualpath_triattention_scheduler_class is not None
+
+    def _make_minimal_scheduler(
+        self,
+        nic_saturation_threshold: float = 0.80,
+        idle_nic_threshold: float = 0.30,
+        max_dual_path_per_node: int = 4,
+        seed: int = 42,
+    ):
+        from vllm_integration.dualpath_nic_scheduler_patch import (
+            DualPathNICSchedulerMixin,
+            DualPathNICSchedulerConfig,
+        )
+
+        class _MinimalSched(DualPathNICSchedulerMixin):
+            def __init__(self, **kwargs):
+                self.waiting = []
+                super().__init__(**kwargs)
+
+            def schedule(self):
+                self.dualpath_pre_schedule()
+                return []
+
+        cfg = DualPathNICSchedulerConfig(
+            nic_saturation_threshold=nic_saturation_threshold,
+            idle_nic_threshold=idle_nic_threshold,
+            max_dual_path_per_node=max_dual_path_per_node,
+            seed=seed,
+        )
+        return _MinimalSched(dualpath_config=cfg)
+
+    def test_single_path_when_nic_not_saturated(self) -> None:
+        """When prefill NIC < saturation threshold: route as single path."""
+        sched = self._make_minimal_scheduler(nic_saturation_threshold=0.80)
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.50)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.10)
+
+        class _Req:
+            request_id = "req-1"
+
+        reqs = [_Req()]
+        sched.waiting = reqs
+        sched.schedule()
+        assert getattr(reqs[0], "dualpath_routing_path", "single") == "single", (
+            "NIC < 0.80: must route single path"
+        )
+
+    def test_dual_path_when_nic_saturated(self) -> None:
+        """When prefill NIC >= saturation threshold and idle decode nodes exist: dual path."""
+        sched = self._make_minimal_scheduler(nic_saturation_threshold=0.80)
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.92)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.10)
+
+        class _Req:
+            request_id = "req-2"
+
+        reqs = [_Req()]
+        sched.waiting = reqs
+        sched.schedule()
+        assert getattr(reqs[0], "dualpath_routing_path", "single") == "dual", (
+            "NIC 0.92 >= 0.80 with idle decode: must route dual path"
+        )
+        assert getattr(reqs[0], "dualpath_relay_decode_node_id") == "decode-0"
+
+    def test_single_path_when_no_idle_decode(self) -> None:
+        """When NIC saturated but no idle decode nodes: fall back to single path."""
+        sched = self._make_minimal_scheduler(nic_saturation_threshold=0.80)
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.92)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.85)  # not idle
+
+        class _Req:
+            request_id = "req-3"
+
+        reqs = [_Req()]
+        sched.waiting = reqs
+        sched.schedule()
+        assert getattr(reqs[0], "dualpath_routing_path", "single") == "single", (
+            "No idle decode nodes: must fall back to single path"
+        )
+
+    def test_round_robin_distributes_across_idle_decode_nodes(self) -> None:
+        """Multiple idle decode nodes: round-robin relay selection."""
+        sched = self._make_minimal_scheduler(
+            nic_saturation_threshold=0.80, idle_nic_threshold=0.30
+        )
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.92)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.10)
+        sched.update_node_nic_status("decode-1", "decode", nic_utilization=0.15)
+
+        relay_nodes = []
+        for i in range(4):
+            class _Req:
+                pass
+            req = _Req()
+            req.request_id = f"req-rr-{i}"
+            sched.waiting = [req]
+            sched.schedule()
+            relay_nodes.append(getattr(req, "dualpath_relay_decode_node_id", None))
+
+        # Both decode nodes should be used across 4 requests
+        unique_relays = set(r for r in relay_nodes if r is not None)
+        assert len(unique_relays) == 2, (
+            f"Round-robin should distribute across 2 decode nodes, got: {unique_relays}"
+        )
+
+    def test_max_dual_path_per_node_limit(self) -> None:
+        """max_dual_path_per_node=1: second request to same relay falls back."""
+        sched = self._make_minimal_scheduler(
+            nic_saturation_threshold=0.80,
+            idle_nic_threshold=0.30,
+            max_dual_path_per_node=1,
+        )
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.92)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.10)
+
+        class _Req:
+            pass
+
+        req1 = _Req()
+        req1.request_id = "req-limit-1"
+        sched.waiting = [req1]
+        sched.schedule()
+        path1 = getattr(req1, "dualpath_routing_path", "single")
+        assert path1 == "dual", "First request: dual path expected"
+
+        # After first dual-path, active_dual_path=1 >= max=1 → single
+        req2 = _Req()
+        req2.request_id = "req-limit-2"
+        sched.waiting = [req2]
+        sched.schedule()
+        path2 = getattr(req2, "dualpath_routing_path", "single")
+        assert path2 == "single", "Second request: no more dual capacity → single path"
+
+    def test_scheduling_overhead_p99_lt_01ms(self) -> None:
+        """Scheduling overhead p99 < 0.1ms (MANDATORY, Report ①)."""
+        import time
+        sched = self._make_minimal_scheduler()
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.50)
+
+        class _Req:
+            pass
+
+        # Run 100 schedule() calls to collect overhead samples
+        for i in range(100):
+            req = _Req()
+            req.request_id = f"req-overhead-{i}"
+            sched.waiting = [req]
+            sched.schedule()
+
+        stats = sched.dualpath_scheduling_stats()
+        p99_ms = stats["overhead_p99_ms"]
+        assert p99_ms < 0.1, (
+            f"Scheduling overhead p99={p99_ms:.4f}ms >= 0.1ms (MANDATORY)"
+        )
+
+    def test_scheduling_stats_keys(self) -> None:
+        sched = self._make_minimal_scheduler()
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.50)
+        sched.waiting = []
+        sched.schedule()
+        stats = sched.dualpath_scheduling_stats()
+        for k in ("schedule_count", "overhead_mean_ms", "overhead_p50_ms",
+                  "overhead_p99_ms", "n_known_nodes", "use_native_src",
+                  "has_triattention_hook"):
+            assert k in stats, f"dualpath_scheduling_stats() missing key: {k}"
+
+    def test_vllm_scheduler_subclass(self) -> None:
+        """Factory produces valid subclass of vLLM Scheduler."""
+        from vllm_integration.dualpath_nic_scheduler_patch import (
+            make_dualpath_nic_scheduler_class,
+            DualPathNICSchedulerMixin,
+        )
+        try:
+            from vllm.v1.core.sched.scheduler import Scheduler
+            DualPathSched = make_dualpath_nic_scheduler_class(Scheduler)
+            assert issubclass(DualPathSched, Scheduler)
+            assert issubclass(DualPathSched, DualPathNICSchedulerMixin)
+        except Exception:
+            pytest.skip("vLLM Scheduler requires GPU environment")
+
+
+class TestDualPathTriAttentionACConfig2026_05_24:
+    """CacheConfig extension (2026-05-24): DualPathTriAttentionACConfig."""
+
+    def test_imports(self) -> None:
+        from vllm_integration.cache_config_extension import (
+            DualPathTriAttentionACConfig,
+            DualPathTriAttentionACConfigMixin,
+            build_dualpath_triattention_ac_config,
+        )
+        assert DualPathTriAttentionACConfig is not None
+        assert DualPathTriAttentionACConfigMixin is not None
+        assert build_dualpath_triattention_ac_config is not None
+
+    def test_default_values(self) -> None:
+        from vllm_integration.cache_config_extension import DualPathTriAttentionACConfig
+        cfg = DualPathTriAttentionACConfig()
+        assert cfg.enable_dualpath_nic is True
+        assert cfg.nic_saturation_threshold == 0.80
+        assert cfg.idle_nic_threshold == 0.30
+        assert cfg.compression_method == "triattention_pre_rope"
+        assert cfg.triattention_kv_budget_ratio_reasoning == 0.093
+        assert cfg.triattention_kv_budget_ratio_default == 0.20
+        assert cfg.attn_matching_compression_ratio == 50
+        assert cfg.attn_matching_n_ref_queries == 32
+
+    def test_factory(self) -> None:
+        from vllm_integration.cache_config_extension import (
+            build_dualpath_triattention_ac_config,
+        )
+        cfg = build_dualpath_triattention_ac_config(
+            compression_method="attention_matching_ls",
+            nic_saturation_threshold=0.85,
+            kv_budget_ratio_reasoning=0.10,
+            kv_budget_ratio_default=0.25,
+            attn_matching_compression_ratio=10,
+            enable_dualpath_nic=True,
+        )
+        assert cfg.compression_method == "attention_matching_ls"
+        assert cfg.nic_saturation_threshold == 0.85
+        assert cfg.triattention_kv_budget_ratio_reasoning == 0.10
+        assert cfg.attn_matching_compression_ratio == 10
+        assert cfg.enable_dualpath_nic is True
+
+
+class TestDualPathTriAttentionACCrossIntegration2026_05_24:
+    """Cross Activity A+C integration (2026-05-24) smoke tests."""
+
+    def test_full_ac_pipeline(self) -> None:
+        """A+C Cross-1: DualPath NIC routing + TriAttention compression."""
+        from vllm_integration.dualpath_nic_scheduler_patch import (
+            DualPathNICSchedulerMixin,
+            DualPathNICSchedulerConfig,
+        )
+        from vllm_integration.triattention_pre_rope_kv_selector_patch import (
+            TriAttentionPreRoPEKVSelectorHook,
+            TriAttentionHookConfig,
+        )
+        from vllm_integration.cache_config_extension import (
+            build_dualpath_triattention_ac_config,
+        )
+
+        # Config
+        ac_cfg = build_dualpath_triattention_ac_config(
+            compression_method="dualpath_triattention_cross",
+            nic_saturation_threshold=0.80,
+            kv_budget_ratio_reasoning=0.093,
+            kv_budget_ratio_default=0.20,
+        )
+
+        # Activity C: TriAttention hook
+        ta_hook = TriAttentionPreRoPEKVSelectorHook(TriAttentionHookConfig(
+            d_head=64,
+            kv_budget_ratio_reasoning=ac_cfg.triattention_kv_budget_ratio_reasoning,
+            kv_budget_ratio_default=ac_cfg.triattention_kv_budget_ratio_default,
+            seed=ac_cfg.seed,
+        ))
+
+        # Activity A: DualPath scheduler
+        class _MinimalSched(DualPathNICSchedulerMixin):
+            def __init__(self, **kwargs):
+                self.waiting = []
+                super().__init__(**kwargs)
+
+            def schedule(self):
+                self.dualpath_pre_schedule()
+                return []
+
+        cfg = DualPathNICSchedulerConfig(
+            nic_saturation_threshold=ac_cfg.nic_saturation_threshold,
+            idle_nic_threshold=ac_cfg.idle_nic_threshold,
+            seed=ac_cfg.seed,
+        )
+        sched = _MinimalSched(dualpath_config=cfg)
+        sched.attach_triattention_hook(ta_hook)
+
+        # Simulate NIC saturation
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.92)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.10)
+
+        class _Req:
+            request_id = "cross1-req"
+
+        reqs = [_Req()]
+        sched.waiting = reqs
+        sched.schedule()
+        path = getattr(reqs[0], "dualpath_routing_path", None)
+        assert path == "dual", f"Cross-1: expected dual path, got {path}"
+        assert sched._triattention_hook is ta_hook, "TriAttention hook must be attached"
+
+        # A+C: Simulate KV compression on relay decode node (Cross-1 Step 3)
+        torch.manual_seed(42)
+        N, d = 200, 64
+        K_full = torch.randn(N, d)
+        V_full = torch.randn(N, d)
+        Q = torch.randn(16, d)
+
+        k_primary, v_primary = ta_hook.write_to_cache(
+            "cross1_kv", K_full, V_full, Q=Q,
+            is_reasoning_task=True, layer_idx=0,
+        )
+        # Primary kernel path: original tensors unchanged
+        assert k_primary is K_full, "Cross-1: primary path must return original K"
+        assert v_primary is V_full, "Cross-1: primary path must return original V"
+
+        # Compressed KV from segment cache
+        result = ta_hook.read_from_cache("cross1_kv")
+        assert result is not None, "Cross-1: compressed KV must be in segment cache"
+        compact_k, compact_v, kept_idx = result
+        n_kept = compact_k.shape[0]
+        expected_max = max(1, int(N * 0.093 * 1.2))
+        assert n_kept <= expected_max, (
+            f"Cross-1: reasoning budget 0.093, kept={n_kept} > expected ~{expected_max}"
+        )
+
+        # Accuracy: token selection is lossless (compact_k == K_full[kept_idx])
+        # This implements the relative_error < 0.01 contract from Report ①.
+        k_selected = K_full[kept_idx].to(compact_k.dtype)
+        v_selected = V_full[kept_idx].to(compact_v.dtype)
+        rel_err_k = ((compact_k.float() - k_selected.float()).norm() /
+                     (k_selected.float().norm() + 1e-8)).item()
+        rel_err_v = ((compact_v.float() - v_selected.float()).norm() /
+                     (v_selected.float().norm() + 1e-8)).item()
+        assert rel_err_k < 0.01, (
+            f"Cross-1: K token selection relative_error={rel_err_k:.4f} >= 0.01 (MANDATORY)"
+        )
+        assert rel_err_v < 0.01, (
+            f"Cross-1: V token selection relative_error={rel_err_v:.4f} >= 0.01 (MANDATORY)"
+        )
+
+        # Memory reduction check
+        kv_reduction = ta_hook.memory_reduction_ratio()
+        assert kv_reduction > 0.5, (
+            f"Cross-1 kv_memory_reduction={kv_reduction:.3f} < 50%"
+        )
+
+        # Scheduling overhead check
+        stats = sched.dualpath_scheduling_stats()
+        assert stats["overhead_p99_ms"] < 0.1, (
+            f"Cross-1 scheduling overhead p99={stats['overhead_p99_ms']:.4f}ms >= 0.1ms"
+        )
+
+    def test_attention_matching_ac_pipeline(self) -> None:
+        """A+C: DualPath NIC routing + AttentionMatching LS compression."""
+        from vllm_integration.dualpath_nic_scheduler_patch import (
+            DualPathNICSchedulerMixin,
+            DualPathNICSchedulerConfig,
+        )
+        from vllm_integration.attention_matching_closed_form_patch import (
+            AttentionMatchingClosedFormHook,
+            AttentionMatchingHookConfig,
+        )
+
+        # Activity C-2: AttentionMatching hook (5x compression)
+        am_hook = AttentionMatchingClosedFormHook(AttentionMatchingHookConfig(
+            d_head=32, n_ref_queries=16, compression_ratio=5,
+            alternating_rounds=3, seed=42,
+        ))
+
+        # Activity A: DualPath scheduler
+        class _MinimalSched(DualPathNICSchedulerMixin):
+            def __init__(self, **kwargs):
+                self.waiting = []
+                super().__init__(**kwargs)
+
+            def schedule(self):
+                self.dualpath_pre_schedule()
+                return []
+
+        cfg = DualPathNICSchedulerConfig(
+            nic_saturation_threshold=0.80, idle_nic_threshold=0.30, seed=42
+        )
+        sched = _MinimalSched(dualpath_config=cfg)
+        sched.update_node_nic_status("prefill-0", "prefill", nic_utilization=0.92)
+        sched.update_node_nic_status("decode-0", "decode", nic_utilization=0.10)
+
+        class _Req:
+            request_id = "am-cross-req"
+
+        req = _Req()
+        sched.waiting = [req]
+        sched.schedule()
+        assert getattr(req, "dualpath_routing_path") == "dual"
+
+        # Simulate AttentionMatching compression on relay decode node
+        # N=100 ensures m_c=20 >= m=16 ref queries for accurate LS solution
+        torch.manual_seed(42)
+        N, d = 100, 32
+        K = torch.randn(N, d)
+        V = torch.randn(N, d)
+        Q_ctx = torch.randn(16, d)
+        k_primary, v_primary = am_hook.write_to_cache(
+            "am_cross_kv", K, V, Q_context=Q_ctx, layer_idx=0
+        )
+        assert k_primary is K, "AttentionMatching: primary path must return original K"
+
+        result = am_hook.read_from_cache("am_cross_kv")
+        assert result is not None
+        K_c, V_c = result
+        assert K_c.shape[0] == max(1, N // 5), (
+            f"5x compression: m_c={K_c.shape[0]}, expected {max(1, N // 5)}"
+        )
+
+        # Accuracy: verify using Q_ref-based evaluation (same protocol as Report ①)
+        from vllm_integration.attention_matching_closed_form_patch import (
+            _InlineAttentionMatchingCompactor,
+            AttentionMatchingHookConfig,
+        )
+        cfg_check = AttentionMatchingHookConfig(
+            d_head=d, n_ref_queries=16, compression_ratio=5, alternating_rounds=3, seed=42
+        )
+        compactor = _InlineAttentionMatchingCompactor(cfg_check)
+        K_c2, V_c2, Q_ref2 = compactor.compact(Q_ctx, K, V)
+        scale = d ** -0.5
+        A_orig = torch.nn.functional.softmax(Q_ref2 @ K.T * scale, dim=-1)
+        A_comp = torch.nn.functional.softmax(Q_ref2 @ K_c2.float().T * scale, dim=-1)
+        out_orig = A_orig @ V
+        out_comp = A_comp @ V_c2.float()
+        rel_err = ((out_orig - out_comp).norm() / (out_orig.norm() + 1e-8)).item()
+        assert rel_err < 0.01, (
+            f"AttentionMatching 5x (Q_ref eval): relative_error={rel_err:.6f} >= 0.01 (MANDATORY)"
+        )
