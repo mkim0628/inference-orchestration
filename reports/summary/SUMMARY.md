@@ -1,22 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-24
-총 사이클 수: 25회 (SIGNIFICANT_CHANGE: true 25회 / false 0회)
+최종 업데이트: 2026-05-25
+총 사이클 수: 26회 (SIGNIFICANT_CHANGE: true 26회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-24) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-25) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-24 A+C 사이클 DualPathNICLoadBalancer p99=0.012ms 확인, GPU 실측 미포함 | 목표 2.5× 초과 달성 기록 유지 | ✓ |
-| KV Memory Reduction | −30% | **−90.7%** (2026-05-24 TriAttentionPreRoPEKVSelectorCodec budget=0.093 실측; C-2 AttentionMatching 50x: −93%; 역대 실측 최고치 갱신) | 목표 −30% 3.02× 초과 달성 — 역대 실측 최고치 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **60%** (2026-05-23 기록 유지; 2026-05-24 Activity B 미포함 사이클) | 목표 ≥30% 실측 2× 초과 달성 유지 | ✓ |
-| Effective Context Length | 2× | **5×** (2026-05-24 TriAttentionPreRoPEKVSelectorCodec 80~93% KV 절감 → 동일 메모리로 5× 이상 컨텍스트; 역대 최고치 갱신) | 목표 2× 2.5× 초과 달성 — 역대 최고치 | ✓ |
-| Compression Accuracy Delta | ±1% | **±0.000404** (2026-05-24 C-1 budget=0.093 relative_error=0.000404; C-2 5x: 0.003509; 25사이클 연속 ±1% 이내 통과) | 25사이클 연속 ±1% 이내 통과; C-1 역대 최저 accuracy delta 달성 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **p99=0.012ms** (2026-05-24 DualPathNICLoadBalancer 독립 실측; vLLM p99=0.005ms; 역대 최저 vLLM 0.002ms(2026-05-19) 유지) | 역대 최저 수준 유지 | ✓ |
+| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-25 B+C 사이클 GPU 실측 미포함 (시뮬레이션 환경) | 목표 2.5× 초과 달성 기록 유지 | ✓ |
+| KV Memory Reduction | −30% | **−49.96%** (2026-05-25 VeriCacheSpeculativeCodec INT8 2× 압축 실측; 역대 역할별 최고치: −90.7%(2026-05-24 C-1) 유지) | 목표 −30% 1.67× 초과 달성 (본 사이클 실측); 역대 최고치 −90.7% 유지 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **99%** (2026-05-25 KVPacketNonContiguousCache 실측 — 역대 최고치 갱신; 목표 ≥30% 3.3× 초과) | 역대 최고치 갱신 — 목표 3.3× 초과 | ✓ |
+| Effective Context Length | 2× | **5×** (2026-05-24 기록 유지; 2026-05-25 INT8 2× 압축 → 동일 메모리로 ~2× 컨텍스트 추가) | 목표 2× 2.5× 초과 달성 — 역대 최고치 유지 | ✓ |
+| Compression Accuracy Delta | ±1% | **±0.00988** (2026-05-25 final_relative_error_max=0.00988; cosine_sim=0.9999995; 26사이클 연속 ±1% 이내 통과) | 26사이클 연속 ±1% 이내 통과; 결정론적 fallback 보장 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **p99=0.012ms** (2026-05-24 DualPathNICLoadBalancer 기록 유지; 2026-05-25 직접 lookup 구조로 추가 오버헤드 없음; 역대 최저 vLLM 0.002ms(2026-05-19) 유지) | 역대 최저 수준 유지 | ✓ |
 
-**2026-05-24 주요 이정표**: TriAttentionPreRoPEKVSelectorCodec (C-1: pre-RoPE 삼각함수 중요도 KV 선택, 10.7× KV 절감, accuracy-preserving) + AttentionMatchingClosedFormCodec (C-2: 닫힌 형태 최소제곱 50× 압착) + DualPathNICLoadBalancer (A-1: 멀티노드 P/D 분리 스토리지 NIC 이중 경로) + DualPathTriAttentionCompressPipeline (Cross A+C: 이중 경로 + TriAttention 압축 통합 파이프라인) 사이클. 독립 평가 루프 1회차 Pass(신규 105개 단위+통합 + 기존 84개 회귀, 총 147+ tests). vLLM 이식 1회차 Pass(35/35 신규 smoke tests, 73/73 기존 사이클 Pass). KV Memory Reduction −90.7%(C-1 budget=0.093) + −93%(C-2 50x) 역대 실측 최고치 달성. Effective Context Length 5× 목표 2× 2.5배 초과. C-1 relative_error=0.000404(역대 최저 accuracy delta), C-2 5x: 0.003509(MANDATORY 통과). A-1 p99=0.012ms(독립), p99=0.005ms(vLLM). cosine_sim=1.000 (Cross-1). vLLM 0.21.0.
+**2026-05-25 주요 이정표**: VeriCacheSpeculativeCodec (C: speculative draft-verify fallback, INT8 draft, 결정론적 정확도 보장) + KVPacketNonContiguousCache (B: SHA-256 위치-독립 세그먼트 해시, non-contiguous 히트율 99%) + SpeculativePacketPipeline (Cross B+C: put_kv_pair → draft_and_verify → get_final_output 파이프라인) 사이클. 독립 평가 루프 2회차 Pass(1572 단위 + 268 통합, 총 1840 tests). vLLM 이식 루프 1회차 Pass(40/40 smoke tests). Non-contiguous Hit Rate 99%(역대 최고치 갱신; 목표 ≥30% 3.3× 초과). KV Memory Reduction −49.96%(INT8 2× 압축). final_relative_error_max=0.00988 < 0.01(MANDATORY Pass). pipeline_cosine_similarity=0.9999995. draft acceptance rate 1%(INT8 threshold mismatch — FP8 codec 개선 대상). vLLM 0.21.0.
 
 ---
 
@@ -90,6 +90,7 @@
 | 2026-05-21 | **BlockUnionNonContiguousReuseIndex** (CompactAttention 2605.16839 기반; GQA-aware per-group 블록 테이블; KVSelectionBlockTable 자료구조; build_block_union_table() O(포인터 연산); BlockUnionFlashAttentionForwardPatcher block_tables 주입; CacheStore 인터페이스 완전 준수) | **33.3%** (독립 평가; [hit,miss,hit,miss,hit] 패턴; 목표 ≥30% 달성) | **60.0%p** 전체 히트율 향상 (prefix-only 0% → BlockUnion 60%) | 블록 테이블 포인터만 추가(nbytes 미증가); O(n_segments × n_blocks) 정수 — 무시 가능 | ✓ Pass |
 | 2026-05-22 | **SessionAwareTurnLevelSegmentCache** (PPD 멀티-턴 재사용 아이디어 기반; (content_hash, session_id, turn_id) 3-tuple 키; TurnSegmentIndex 자료구조; session_priority_lru: cross-session 먼저 퇴거; DapQ position_reuse_score 통합; get_session_segments(turn_range) 필터링; CacheStore 완전 준수) | **로직 구현 및 추적 정확성 검증 완료** (turn_id > 0 get() 시 _noncontiguous_hits 증가; noncontiguous_hit_rate() = _hits/_hits 정확; 실제 워크로드 수치 미측정) | score_near > score_far 위치-인식 재사용 점수 검증; 4개 중 50% 상위 → 2개 반환; cross-session 키 우선 퇴거 확인 | memory_bytes=bounded by LRU; +20% 이내 통과 | ✓ Pass |
 | 2026-05-23 | **CLCPositionalBiasGatedSegmentCache** (2603.20218 CLC 위치 편향 규명 기반; ΔPos = \|pos_target_start - pos_orig_start\| / max_context_length 정규화; 3단계 게이트: ΔPos ≤ 0.15 → 직접 재사용, 0.15 < ΔPos ≤ 0.40 → 부분 재인코딩, ΔPos > 0.40 → 전체 재인코딩; rope_distortion 추정; LRU OrderedDict 백엔드; CacheStore 완전 준수; C+A+B 조합 통합) | **60%** (독립: 3/5=60% noncontiguous_direct_hit_rate; vLLM: 33.3%=1/3, 실험 설정 차이 — 구조적 일치) | 전체 히트율 구조적 향상 확인 (ΔPos ≤ 0.15 직접 재사용 Pass) | 추가 메모리 없음 (기존 KV 재사용); LRU 퇴거; +20% 이내 통과 | ✓ Pass |
+| 2026-05-25 | **KVPacketNonContiguousCache** (SHA-256 위치-독립 세그먼트 해시 키; _insertion_order 리스트 기반 비연속 추적(move_to_end() 버그 수정); LRU + distillation_loss 우선 퇴거; n_adapter_tokens=4 경량 어댑터; KVPacketConfig/파이프라인 설정 통합; CacheStore 완전 준수; B+C Cross-1 SpeculativePacketPipeline 메인 B 컴포넌트) | **99%** (독립: noncontiguous_hit_rate=0.99; vLLM: 0.99 동일 — 역대 최고치 갱신) | kv_packet_hit_rate=1.00; b_hit_rate=1.00 (전체 100% 히트) | n_adapter_tokens=4로 어댑터 오버헤드 최소화; LRU bounded; +20% 이내 통과 | ✓ Pass |
 
 **신규 달성 (2026-04-30)**: KV Packet 스타일 경량 MLP 어댑터 통합. loss 81.7% 감소(500 steps).
 
@@ -196,6 +197,8 @@
 **신규 달성 (2026-05-23)**: RuntimeCertifiedQuantizedAttentionCodec + KVSculptDistillationPipeline(Cross-1) + CLCPositionalBiasGatedSegmentCache + CPDWarmColdHitRateRouter C+A+B 조합. 수학적 런타임 오류 경계 인증 방식 Activity C 최초 적용. KV Memory −62.5%(이론-실측 일치). vLLM 3회차 per-channel INT8 수정으로 p99=0.393%(±1% MANDATORY Pass). error_bound ≥ actual_error 100/100 위반 0건(수학적 보수성 검증). CLC 위치 편향 게이트 3단계 선택적 재사용 최초 구현. CPD 히트율 예측 온라인 SGD warm/cold/neutral 소프트 분기 p50=51.1μs.
 
 **신규 달성 (2026-05-24)**: DualPathNICLoadBalancer(A) + TriAttentionPreRoPEKVSelectorCodec(C-1) + AttentionMatchingClosedFormCodec(C-2) + DualPathTriAttentionCompressPipeline(Cross A+C) 4-컴포넌트 통합 사이클. KV Memory −90.7%(C-1, 역대 실측 최고치) + −93%(C-2 50×). Effective Context 5×(역대 최고치; 목표 2× 2.5× 초과). C-1 relative_error=0.000404(역대 최저 accuracy delta). A-1 p99=0.012ms(독립)/0.005ms(vLLM). Cross-1 dual_path_cosine_sim=1.000 + relative_error=0.000127. vLLM 0.21.0 이식 1회차 Pass(35/35 신규 smoke + 73/73 기존 사이클 Pass). 신규 105개 + 기존 84개 회귀, 총 147+ 테스트 통과. 독립 평가 루프 1회차 단 1회차 Pass.
+
+**신규 달성 (2026-05-25)**: KVPacketNonContiguousCache(B)가 _insertion_order 리스트로 move_to_end() 순서 오염 버그를 수정하고, SHA-256 위치-독립 세그먼트 해시 기반 비연속 히트율 99%(역대 최고치 갱신; 목표 ≥30% 3.3× 초과) 실측 달성. n_adapter_tokens=4 경량 어댑터로 메모리 오버헤드 최소화. 독립 평가 루프 2회차(1572 단위+268 통합) 전량 통과. vLLM 이식 루프 1회차 Pass(40/40 smoke).
 
 **신규 달성 (2026-05-03)**: A+B+C 전체 조합 45/45 테스트 1회차 통과.
 
