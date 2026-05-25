@@ -1,0 +1,15 @@
+acceptance_threshold: 0.01
+draft_length: 4
+draft_codecs:
+  - type: "int8"
+    compression_ratio: 2.0
+  - type: "token_eviction"
+    keep_ratio: 0.5
+    compression_ratio: 2.0
+  - type: "token_eviction"
+    keep_ratio: 0.3
+    compression_ratio: 3.33
+enable_async_verify: true
+auto_codec_selection:
+  enabled: false
+  acceptance_rate_threshold: 0.70       # Switch to more accurate codec if acceptance < 0.70

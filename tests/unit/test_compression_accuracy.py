@@ -1166,3 +1166,223 @@ def test_c2_vs_kvsculpt_comparison() -> None:
 
     assert err_am < 0.01, f"AttentionMatching err={err_am:.6f} >= 0.01"
     assert err_kv < 0.01, f"KVSculpt err={err_kv:.6f} >= 0.01"
+
+
+# =========================================================================== #
+# C-1: VeriCacheSpeculativeCodec accuracy (2026-05-25 cycle)                  #
+# =========================================================================== #
+
+from src.cache.vericache_speculative_codec import (  # noqa: E402
+    Int8DraftCodec as VeriCacheInt8DraftCodec,
+    TokenEvictionDraftCodec as VeriCacheTokenEvictionDraftCodec,
+    VeriCacheConfig,
+    VeriCacheSpeculativeCodec,
+)
+
+
+def _make_vc_codec(
+    d_head: int = 64,
+    acceptance_threshold: float = 0.01,
+    seed: int = 42,
+) -> VeriCacheSpeculativeCodec:
+    cfg = VeriCacheConfig(
+        d_head=d_head,
+        acceptance_threshold=acceptance_threshold,
+        max_entries=512,
+        seed=seed,
+    )
+    return VeriCacheSpeculativeCodec(cfg)
+
+
+def _vc_final_error_and_cosine(
+    codec: VeriCacheSpeculativeCodec,
+    n_tokens: int = 128,
+    d_head: int = 64,
+    n_q: int = 8,
+    seed: int = 42,
+) -> tuple:
+    """Compute final_error and cosine_similarity for VeriCache codec.
+
+    Returns (final_relative_error, cosine_sim_final_vs_full).
+    """
+    torch.manual_seed(seed)
+    K = torch.randn(n_tokens, d_head)
+    V = torch.randn(n_tokens, d_head)
+    Q = torch.randn(n_q, d_head)
+
+    codec.put_kv_pair("test", K, V)
+    result = codec.draft_and_verify("test_K", "test_V", Q)
+    assert result is not None
+
+    final = codec.get_final_output(result)
+    full_out = VeriCacheSpeculativeCodec._compute_attention(Q, K, V)
+
+    final_error = float(
+        (final.float() - full_out.float()).norm() / (full_out.float().norm() + 1e-8)
+    )
+    full_flat = full_out.float().flatten().unsqueeze(0)
+    final_flat = final.float().flatten().unsqueeze(0)
+    import torch.nn.functional as F_local
+    cosine_sim = float(F_local.cosine_similarity(full_flat, final_flat).item())
+    return final_error, cosine_sim
+
+
+def test_vericache_final_error_below_threshold() -> None:
+    """C-1 VeriCache: final_error < acceptance_threshold=0.01 (MANDATORY).
+
+    Mathematical guarantee:
+    - Accepted draft: relative_error < threshold (by definition of acceptance)
+    - Rejected draft: final_output = verified_output = full KV attention -> error = 0
+    In both cases, final_error <= threshold.
+    """
+    codec = _make_vc_codec(d_head=64, acceptance_threshold=0.01)
+    final_error, _ = _vc_final_error_and_cosine(codec, n_tokens=128, d_head=64, seed=42)
+    assert final_error < 0.01, \
+        f"VeriCache final_error={final_error:.6f} >= 0.01 (MANDATORY)"
+
+
+def test_vericache_cosine_similarity() -> None:
+    """C-1 VeriCache: cosine_similarity(final_output, full_kv_output) >= 0.99 (MANDATORY)."""
+    codec = _make_vc_codec(d_head=64, acceptance_threshold=0.01)
+    _, cosine_sim = _vc_final_error_and_cosine(codec, n_tokens=128, d_head=64, seed=42)
+    assert cosine_sim >= 0.99, \
+        f"VeriCache cosine_similarity={cosine_sim:.6f} < 0.99 (MANDATORY)"
+
+
+def test_vericache_deterministic_guarantee_rejected_equals_full_kv() -> None:
+    """C-1 VeriCache: rejected draft final_output = verified_output (deterministic guarantee)."""
+    d_head = 64
+    torch.manual_seed(42)
+    K = torch.randn(128, d_head)
+    V = torch.randn(128, d_head)
+    Q = torch.randn(8, d_head)
+
+    # Force all drafts to be rejected (threshold=0.0)
+    cfg = VeriCacheConfig(d_head=d_head, acceptance_threshold=0.0, seed=42)
+    codec = VeriCacheSpeculativeCodec(cfg)
+    codec.put_kv_pair("seg", K, V)
+    result = codec.draft_and_verify("seg_K", "seg_V", Q)
+
+    assert result is not None
+    assert result.accepted is False  # threshold=0.0 -> rejected
+
+    final = codec.get_final_output(result)
+    max_diff = (final - result.verified_output).abs().max().item()
+    assert max_diff < 1e-5, \
+        f"Rejected draft: max_diff(final, verified) = {max_diff:.2e} >= 1e-5"
+
+
+def test_vericache_int8_memory_reduction_above_40pct() -> None:
+    """C-1 VeriCache Int8DraftCodec: memory_reduction_ratio >= 0.40 (FP32 stored, INT8 compressed)."""
+    codec = _make_vc_codec(d_head=64)
+    # Store 10 FP32 entries; Int8 compressed = ~25% of FP32 (1byte vs 4bytes) or ~50% of FP16
+    for i in range(10):
+        torch.manual_seed(i)
+        K = torch.randn(64, 64)  # FP32
+        V = torch.randn(64, 64)
+        codec.put_kv_pair(f"seg{i}", K, V)
+
+    ratio = codec.memory_reduction_ratio()
+    assert ratio >= 0.40, f"Int8DraftCodec memory_reduction_ratio={ratio:.4f} < 0.40"
+
+
+def test_vericache_token_eviction_memory_reduction_above_40pct() -> None:
+    """C-1 VeriCache TokenEviction(0.5): memory_reduction_ratio >= 0.40."""
+    codec = _make_vc_codec(d_head=64)
+    codec.set_draft_codec(VeriCacheTokenEvictionDraftCodec(keep_ratio=0.5))
+
+    for i in range(10):
+        torch.manual_seed(i)
+        K = torch.randn(64, 64)
+        V = torch.randn(64, 64)
+        codec.put_kv_pair(f"seg{i}", K, V)
+
+    ratio = codec.memory_reduction_ratio()
+    assert ratio >= 0.40, f"TokenEviction(0.5) memory_reduction_ratio={ratio:.4f} < 0.40"
+
+
+def test_vericache_int8_longbench_8subtask_all_above_099() -> None:
+    """C-1 VeriCache LongBench 8 subtask proxy: cosine_sim >= 0.99 for all (MANDATORY)."""
+    for subtask_seed in range(8):
+        codec = _make_vc_codec(d_head=64, acceptance_threshold=0.01, seed=subtask_seed)
+        _, cosine_sim = _vc_final_error_and_cosine(
+            codec, n_tokens=128, d_head=64, n_q=8, seed=subtask_seed
+        )
+        assert cosine_sim >= 0.99, (
+            f"VeriCache LongBench subtask {subtask_seed}: cosine_sim={cosine_sim:.6f} < 0.99"
+        )
+
+
+def test_vericache_codec_sweep_acceptance_rates() -> None:
+    """C-1 VeriCache: acceptance_threshold sweep measures acceptance rates for all codec types."""
+    d_head, n_tokens, n_q = 64, 64, 8
+    thresholds = [0.001, 0.005, 0.01, 0.02, 0.05]
+    results = {}
+
+    for threshold in thresholds:
+        torch.manual_seed(42)
+        codec = _make_vc_codec(d_head=d_head, acceptance_threshold=threshold)
+        K = torch.randn(n_tokens, d_head)
+        V = torch.randn(n_tokens, d_head)
+        codec.put_kv_pair("seg", K, V)
+
+        Q = torch.randn(n_q, d_head)
+        result = codec.draft_and_verify("seg_K", "seg_V", Q)
+        assert result is not None
+        results[threshold] = result.accepted
+
+    # Higher threshold should be at least as accepting as lower threshold
+    # (monotonic: if accepted at threshold t, must accept at any t' > t)
+    thresholds_sorted = sorted(thresholds)
+    for i in range(len(thresholds_sorted) - 1):
+        t_lo, t_hi = thresholds_sorted[i], thresholds_sorted[i + 1]
+        if results[t_lo] is True:
+            assert results[t_hi] is True, \
+                f"Monotonicity violated: accepted at {t_lo} but rejected at {t_hi}"
+
+
+def test_vericache_cross_bc_pipeline_final_error_below_threshold() -> None:
+    """Cross-1 B+C: VeriCache final_error < 0.01 via SpeculativePacketPipeline (MANDATORY §5)."""
+    from src.engine.speculative_packet_pipeline import (
+        SpeculativePacketPipeline,
+        SpeculativePacketPipelineConfig,
+    )
+    from src.cache.kv_packet import KVPacketConfig
+    torch.manual_seed(42)
+
+    n_tokens, n_heads, d_head = 16, 4, 8
+    d_flat = n_heads * d_head  # VeriCache input dimension after K/V reshape
+
+    cfg = SpeculativePacketPipelineConfig(
+        kv_packet_config=KVPacketConfig(
+            n_heads=n_heads, d_head=d_head, adapter_steps=5, seed=42
+        ),
+        vericache_config=VeriCacheConfig(
+            d_head=d_flat,  # flattened after reshape
+            acceptance_threshold=0.01,
+            seed=42,
+        ),
+        seed=42,
+    )
+    pipeline = SpeculativePacketPipeline(cfg)
+
+    kv_block = torch.randn(n_tokens, 2, n_heads, d_head)
+    pipeline.store_segment("seg1", kv_block)
+
+    # Q must match the flattened d_head dimension used by VeriCache
+    Q = torch.randn(4, d_flat)  # [n_q, n_heads*d_head]
+    pipeline_result = pipeline.run("seg1", Q)
+
+    final_out = pipeline_result.final_output
+    assert final_out is not None
+    assert not torch.isnan(final_out).any(), "Pipeline output contains NaN"
+
+    # Verify pipeline ran (b_hit or b_miss)
+    assert pipeline_result.path in ("b_hit_c_draft", "c_reject_verified", "b_miss_fallback")
+
+    # If pipeline used VeriCache (b_hit), relative_error must be <= threshold
+    if pipeline_result.relative_error is not None:
+        assert pipeline_result.relative_error <= 0.01 + 1e-6, (
+            f"Cross-1 B+C relative_error={pipeline_result.relative_error:.6f} > 0.01"
+        )
+
