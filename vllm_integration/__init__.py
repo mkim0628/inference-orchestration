@@ -655,3 +655,35 @@ except (ImportError, AttributeError):
     DapQDualReductionAttentionHook = None                    # type: ignore
     extend_cache_config_dapq = None                         # type: ignore
     apply_dapq_patch = None                                  # type: ignore
+
+# ===========================================================================
+# 2026-05-25 imports (Activity B+C — KVPacket + VeriCache speculative codec)
+# ===========================================================================
+
+# Activity C: VeriCache speculative draft-verify codec hook
+try:
+    from vllm_integration.vericache_codec_patch import (
+        VeriCacheCodecHookConfig,
+        VeriCacheCodecAttentionHook,
+        VeriCacheVerificationResult,
+        apply_vericache_codec_patch,
+        extend_cache_config_vericache,
+    )
+except (ImportError, AttributeError):
+    VeriCacheCodecHookConfig = None         # type: ignore
+    VeriCacheCodecAttentionHook = None      # type: ignore
+    VeriCacheVerificationResult = None      # type: ignore
+    apply_vericache_codec_patch = None      # type: ignore
+    extend_cache_config_vericache = None    # type: ignore
+
+# Activity B: KVPacket non-contiguous segment KV cache manager
+try:
+    from vllm_integration.kv_packet_block_manager_patch import (
+        KVPacketSegmentConfig,
+        KVPacketSegmentMixin,
+        make_kv_packet_kv_cache_manager_class,
+    )
+except (ImportError, AttributeError):
+    KVPacketSegmentConfig = None               # type: ignore
+    KVPacketSegmentMixin = None                # type: ignore
+    make_kv_packet_kv_cache_manager_class = None  # type: ignore

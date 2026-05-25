@@ -1,0 +1,66 @@
+experiment:
+  date: "2026-05-25"
+  activity: "B+C"
+  description: >
+    C-1 VeriCacheSpeculativeKVDraftVerifyLosslessCodec (speculative draft-verify deterministic
+    lossless codec, deterministic ±0.0% accuracy guarantee) + B-1
+    KVPacketSoftTokenAdapterZeroFLOPsNonContiguousCache (soft-token adapter self-supervised
+    distillation zero-FLOPs non-contiguous reuse) + Cross-1 SpeculativePacketPipeline
+    (B+C integrated pipeline). VeriCache (arXiv 2605.17613) + KV Packet (arXiv 2604.13226) based.
+  cache_type: vericache_speculative_codec
+  compression_method: speculative_draft_verify
+  scheduler_type: default
+
+vericache_speculative:  # C-1
+  d_head: 128
+  draft_length: 4
+  acceptance_threshold: 0.01         # ±1% deterministic guarantee
+  max_entries: 512
+  enable_async_verify: true
+  seed: 42
+
+kv_packet:  # B-1
+  n_heads: 8
+  d_head: 128
+  n_adapter_tokens: 4
+  adapter_lr: 0.0001
+  adapter_steps: 100
+  distillation_loss_threshold: 0.1
+  max_packets: 512
+  seed: 42
+
+speculative_packet_pipeline:  # Cross-1
+  use_token_eviction_codec: false   # INT8 default
+  token_eviction_keep_ratio: 0.5
+  seed: 42
+
+benchmark:
+  accuracy:
+    method: "attention_output_proxy"
+    dataset_proxy: "wikitext2_synthetic"
+    task_accuracy_proxy: "cosine_similarity"
+    acceptance_threshold: 0.01             # ±1% MANDATORY
+    relative_error_max: 0.01               # MANDATORY
+    cosine_similarity_min: 0.99            # MANDATORY
+    draft_length_sweep: [1, 2, 4, 8]
+    codec_sweep:
+      - type: "int8"
+      - type: "token_eviction"
+        keep_ratio: 0.5
+      - type: "token_eviction"
+        keep_ratio: 0.3
+    acceptance_threshold_sweep: [0.001, 0.005, 0.01, 0.02, 0.05]
+    longbench_subtask_count: 8
+  activity_b:
+    noncontiguous_hit_rate_min: 0.30       # 30%+ of hits must be non-contiguous
+    cache_hit_rate_improvement_min_pct: 5.0
+  activity_c:
+    memory_reduction_min_ratio: 0.30       # -30% or more (MANDATORY)
+    effective_context_multiplier: 2.0      # 2x or more in same memory budget
+    compression_overhead_ttft_max_pct: 10.0
+  cross_bc:
+    pipeline_cosine_min: 0.99             # MANDATORY
+    combined_noncontiguous_hit_rate_min: 0.30
+
+seed: 42
+results_dir: "results/2026-05-25"

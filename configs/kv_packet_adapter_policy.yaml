@@ -1,0 +1,6 @@
+n_adapter_tokens: 4
+adapter_lr: 0.0001
+adapter_steps: 100
+distillation_loss_threshold: 0.1
+eviction_policy: "lru_plus_low_quality"   # LRU + distillation_loss priority eviction
+zero_flops_verify: true                   # Enable zero-FLOPs reuse verification
