@@ -281,8 +281,8 @@ def test_noncontiguous_hit_rate_after_random_access():
         pipeline.run(f"seg{idx}", Q)
 
     nc_rate = pipeline.kv_packet_cache.noncontiguous_hit_rate()
-    # Value must be a valid fraction
-    assert 0.0 <= nc_rate <= 1.0
+    # Non-contiguous accesses must constitute >= 30% of all hits
+    assert nc_rate >= 0.30, f"noncontiguous_hit_rate()={nc_rate:.4f} < 0.30"
 
 
 # --------------------------------------------------------------------------- #

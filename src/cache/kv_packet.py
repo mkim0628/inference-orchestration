@@ -74,6 +74,10 @@ class KVPacketCache(CacheStore):
         self._misses: int = 0
         self._noncontiguous_hits: int = 0
         self._access_order: List[str] = []
+        # Stable insertion-order index for non-contiguous detection.
+        # list(self._store.keys()) is corrupted by move_to_end() on get(), so we
+        # maintain a separate list that only grows on put() and shrinks on evict().
+        self._insertion_order: List[str] = []
 
     # ---- CacheStore interface ----
 
@@ -100,6 +104,7 @@ class KVPacketCache(CacheStore):
             adapter_V=adapter_V,
         )
         self._store[key] = packet
+        self._insertion_order.append(key)
 
     def get(self, key: str) -> Optional[torch.Tensor]:
         """Return adapter-applied KV [n_adapter_tokens+n_tokens, 2, n_heads, d_head].
@@ -149,6 +154,8 @@ class KVPacketCache(CacheStore):
         ]
         evict_key = low_quality[0] if low_quality else next(iter(self._store))
         packet = self._store.pop(evict_key)
+        if evict_key in self._insertion_order:
+            self._insertion_order.remove(evict_key)
         return packet.kv_data.nbytes + packet.adapter_K.nbytes + packet.adapter_V.nbytes
 
     def hit_rate(self) -> float:
@@ -166,6 +173,7 @@ class KVPacketCache(CacheStore):
         self._misses = 0
         self._noncontiguous_hits = 0
         self._access_order.clear()
+        self._insertion_order.clear()
 
     # ---- KV Packet-specific API ----
 
@@ -289,12 +297,15 @@ class KVPacketCache(CacheStore):
         return torch.cat([adapter_kv.to(packet.kv_data.dtype), packet.kv_data], dim=0)
 
     def _track_noncontiguous(self, key: str) -> None:
-        """Track non-contiguous hits based on store insertion order."""
+        """Track non-contiguous hits using stable insertion-order index.
+
+        Uses _insertion_order instead of list(self._store.keys()) because
+        get() calls move_to_end() which corrupts the OrderedDict key order.
+        """
         if self._access_order:
             prev = self._access_order[-1]
-            keys_list = list(self._store.keys())
-            if key in keys_list and prev in keys_list:
-                if abs(keys_list.index(key) - keys_list.index(prev)) > 1:
+            if key in self._insertion_order and prev in self._insertion_order:
+                if abs(self._insertion_order.index(key) - self._insertion_order.index(prev)) > 1:
                     self._noncontiguous_hits += 1
             else:
                 self._noncontiguous_hits += 1
