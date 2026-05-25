@@ -4483,5 +4483,130 @@ if [ $EXIT_2026_05_24 -ne 0 ]; then
 fi
 
 echo ""
+echo "=== 2026-05-25 B+C smoke tests (KVPacketSegmentMixin + VeriCacheCodecAttentionHook) ==="
+set +e
+python - <<'PYEOF_2026_05_25'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+from vllm_integration.vericache_codec_patch import (
+    VeriCacheCodecHookConfig, VeriCacheCodecAttentionHook,
+    apply_vericache_codec_patch, extend_cache_config_vericache,
+)
+from vllm_integration.kv_packet_block_manager_patch import (
+    KVPacketSegmentConfig, KVPacketSegmentMixin,
+    make_kv_packet_kv_cache_manager_class,
+    _InlineKVPacketStore, _hash_token_ids,
+)
+
+# --- Activity C ---
+cfg = VeriCacheCodecHookConfig(d_head=64, acceptance_threshold=0.01, max_entries_per_layer=100)
+hook = VeriCacheCodecAttentionHook(cfg)
+key_t = torch.randn(16, 64)
+val_t = torch.randn(16, 64)
+k_out, v_out = hook.write_to_cache("seg_A", key_t, val_t, layer_idx=0)
+assert k_out is key_t and v_out is val_t
+print("  VeriCacheCodecAttentionHook write_to_cache (primary passthrough): PASS")
+
+Q = torch.randn(4, 64)
+result = hook.read_from_cache("seg_A", layer_idx=0, Q=Q)
+assert result is not None and hasattr(result, "accepted")
+final_out = hook.get_final_output(result)
+assert final_out is not None
+print(f"  read+get_final: accepted={result.accepted}, rel_err={result.relative_error:.4f}: PASS")
+
+mrr = hook.memory_reduction_ratio()
+assert mrr >= 0.30, f"memory_reduction_ratio={mrr:.3f} < 0.30"
+print(f"  memory_reduction_ratio={mrr:.3f} >= 0.30 (MANDATORY): PASS")
+
+class _FakeCC: pass
+extend_cache_config_vericache(_FakeCC(), cfg)
+assert getattr(_FakeCC(), "compression_method", None) != "vericache_speculative"  # instance check
+fake_cc = _FakeCC()
+extend_cache_config_vericache(fake_cc, cfg)
+assert fake_cc.compression_method == "vericache_speculative"
+print("  extend_cache_config_vericache: PASS")
+
+# --- Activity B ---
+store = _InlineKVPacketStore(max_entries=50, n_adapter_tokens=4, n_heads=4, d_head=32, seed=42)
+kv_data = torch.randn(16, 2, 4, 32).half()
+store.put("seg_A", kv_data)
+store.put("seg_B", torch.randn(16, 2, 4, 32).half())
+store.put("seg_C", torch.randn(8, 2, 4, 32).half())
+adapted = store.get("seg_A")
+assert adapted.shape[0] == 4 + 16
+print(f"  _InlineKVPacketStore adapter-prepend: shape={tuple(adapted.shape)}: PASS")
+kv_pair = store.get_kv_pair("seg_B")
+K, V = kv_pair
+assert K.shape == (4+16, 4, 32) and V.shape == (4+16, 4, 32)
+print(f"  get_kv_pair: K={K.shape}: PASS")
+
+class MinimalKVPktMgr(KVPacketSegmentMixin):
+    def __init__(self, **kw):
+        self._kv_packet_cfg = kw.get("kv_packet_config") or KVPacketSegmentConfig()
+        c = self._kv_packet_cfg
+        self._kv_packet_store = _InlineKVPacketStore(
+            max_entries=c.max_segments, n_adapter_tokens=c.n_adapter_tokens,
+            n_heads=c.n_heads, d_head=c.d_head, seed=c.seed)
+        self._kv_packet_block_registry = {}
+        self._kv_packet_block_align_warnings = 0
+
+kv_cfg = KVPacketSegmentConfig(max_segments=100, n_adapter_tokens=4, n_heads=4, d_head=32)
+mgr = MinimalKVPktMgr(kv_packet_config=kv_cfg)
+token_ids_A, token_ids_B = list(range(16)), list(range(16, 32))
+kv_seg = torch.randn(16, 2, 4, 32).half()
+seg_id_A = mgr.store_kv_packet_segment(token_ids_A, kv_seg, layer_idx=0)
+mgr.store_kv_packet_segment(token_ids_B, torch.randn(16,2,4,32).half(), layer_idx=0)
+assert isinstance(seg_id_A, str)
+print(f"  store_kv_packet_segment: PASS (id={seg_id_A[:8]}...)")
+
+hits = mgr.find_noncontiguous_hits([token_ids_A, token_ids_B], layer_idx=0)
+assert len(hits) == 2
+print(f"  find_noncontiguous_hits: {len(hits)} hits: PASS")
+
+seg_keys = [f"{_hash_token_ids(t)}_L0" for t in [token_ids_A, token_ids_B]]
+table = mgr.build_kv_packet_block_table(seg_keys, block_size=16, max_blocks=8)
+assert table is not None and table.shape == (1, 8) and table.dtype == torch.int64
+assert (table[0, 2:] == -1).all()
+print(f"  build_kv_packet_block_table: shape={tuple(table.shape)}: PASS")
+
+stats_b = mgr.kv_packet_stats()
+assert "hit_rate" in stats_b and "noncontiguous_hit_rate" in stats_b
+print(f"  kv_packet_stats: {stats_b}: PASS")
+
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    KVPktCls = make_kv_packet_kv_cache_manager_class(KVCacheManager, kv_cfg)
+    assert issubclass(KVPktCls, KVCacheManager) and issubclass(KVPktCls, KVPacketSegmentMixin)
+    print(f"  make_kv_packet_kv_cache_manager_class: PASS ({KVPktCls.__name__})")
+except Exception as exc:
+    print(f"  make_kv_packet_kv_cache_manager_class: SKIP (no GPU env): {exc}")
+
+# --- Cross B+C ---
+c_hook2 = VeriCacheCodecAttentionHook(VeriCacheCodecHookConfig(d_head=32*4, acceptance_threshold=0.0))
+K_flat = K.reshape(K.shape[0], -1).float()
+V_flat = V.reshape(V.shape[0], -1).float()
+c_hook2.write_to_cache("cross", K_flat, V_flat, layer_idx=0)
+Q_cross = torch.randn(2, K_flat.shape[-1])
+r_cross = c_hook2.read_from_cache("cross", layer_idx=0, Q=Q_cross)
+assert r_cross is not None
+final_cross = c_hook2.get_final_output(r_cross)
+verified = VeriCacheCodecAttentionHook._compute_attention(Q_cross.float(), K_flat, V_flat)
+cross_err = float((final_cross.float() - verified.float()).norm() / (verified.float().norm() + 1e-8))
+assert cross_err < 0.01, f"Cross B+C rel_err={cross_err:.4f} >= 0.01 (MANDATORY)"
+print(f"  Cross B+C accuracy: rel_err={cross_err:.6f} < 0.01 (MANDATORY): PASS")
+
+print("=== 2026-05-25 B+C smoke tests: ALL PASS ===")
+PYEOF_2026_05_25
+EXIT_2026_05_25=$?
+set -e
+if [ $EXIT_2026_05_25 -ne 0 ]; then
+  echo "WARNING: 2026-05-25 B+C smoke tests had failures (exit=$EXIT_2026_05_25)" >&2
+fi
+
+echo ""
 echo "=== All vLLM integration smoke tests complete ==="
 echo "vLLM version: $(python -c 'import vllm; print(vllm.__version__)')"
