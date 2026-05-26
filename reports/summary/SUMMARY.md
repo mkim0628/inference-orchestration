@@ -1,20 +1,20 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-25
-총 사이클 수: 26회 (SIGNIFICANT_CHANGE: true 26회 / false 0회)
+최종 업데이트: 2026-05-26
+총 사이클 수: 27회 (SIGNIFICANT_CHANGE: true 27회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-25) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-26) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-25 B+C 사이클 GPU 실측 미포함 (시뮬레이션 환경) | 목표 2.5× 초과 달성 기록 유지 | ✓ |
-| KV Memory Reduction | −30% | **−49.96%** (2026-05-25 VeriCacheSpeculativeCodec INT8 2× 압축 실측; 역대 역할별 최고치: −90.7%(2026-05-24 C-1) 유지) | 목표 −30% 1.67× 초과 달성 (본 사이클 실측); 역대 최고치 −90.7% 유지 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **99%** (2026-05-25 KVPacketNonContiguousCache 실측 — 역대 최고치 갱신; 목표 ≥30% 3.3× 초과) | 역대 최고치 갱신 — 목표 3.3× 초과 | ✓ |
-| Effective Context Length | 2× | **5×** (2026-05-24 기록 유지; 2026-05-25 INT8 2× 압축 → 동일 메모리로 ~2× 컨텍스트 추가) | 목표 2× 2.5× 초과 달성 — 역대 최고치 유지 | ✓ |
-| Compression Accuracy Delta | ±1% | **±0.00988** (2026-05-25 final_relative_error_max=0.00988; cosine_sim=0.9999995; 26사이클 연속 ±1% 이내 통과) | 26사이클 연속 ±1% 이내 통과; 결정론적 fallback 보장 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **p99=0.012ms** (2026-05-24 DualPathNICLoadBalancer 기록 유지; 2026-05-25 직접 lookup 구조로 추가 오버헤드 없음; 역대 최저 vLLM 0.002ms(2026-05-19) 유지) | 역대 최저 수준 유지 | ✓ |
+| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-26 A+B 사이클 GPU 실측 미포함 (CPU-only 환경) | 목표 2.5× 초과 달성 기록 유지 | ✓ |
+| KV Memory Reduction | −30% | **depth-axis 최대 −96.88%** (2026-05-26 MLATwoAxisCompressionCodec 32 유사 레이어 실측); position-axis −50% (MLA c_KV dedup); 역대 최고치 −90.7%(2026-05-24 C-1) 유지 | 2축 압축 결합 시 목표 −30% 대폭 초과; 역대 최고치 −90.7% 유지 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **87.5%** (2026-05-26 IrminsulMLASegmentCache 독립 실측); **80.0%** (vLLM 실측); 역대 최고치 99%(2026-05-25) 유지 | 목표 ≥30% 2.9× 초과 (vLLM 기준) | ✓ |
+| Effective Context Length | 2× | **5×** (2026-05-24 기록 유지; 2026-05-26 position dedup 50% 절감으로 추가 컨텍스트 확보) | 목표 2× 2.5× 초과 달성 — 역대 최고치 유지 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.00%** (2026-05-26 MLATwoAxisCompressionCodec; position-axis 수학적 보장 + depth-axis residual exact 재구성; 27사이클 연속 ±1% 이내 통과) | 27사이클 연속 ±1% 이내 통과; 역대 공동 최저(0.00%) 달성 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **0.11 µs/req** (2026-05-26 ObjectCacheS3TierRouter annotation-only; critical path I/O 없음); 역대 최저 vLLM 0.002ms(2026-05-19) 유지 | 역대 최저 수준 유지 | ✓ |
 
 **2026-05-25 주요 이정표**: VeriCacheSpeculativeCodec (C: speculative draft-verify fallback, INT8 draft, 결정론적 정확도 보장) + KVPacketNonContiguousCache (B: SHA-256 위치-독립 세그먼트 해시, non-contiguous 히트율 99%) + SpeculativePacketPipeline (Cross B+C: put_kv_pair → draft_and_verify → get_final_output 파이프라인) 사이클. 독립 평가 루프 2회차 Pass(1572 단위 + 268 통합, 총 1840 tests). vLLM 이식 루프 1회차 Pass(40/40 smoke tests). Non-contiguous Hit Rate 99%(역대 최고치 갱신; 목표 ≥30% 3.3× 초과). KV Memory Reduction −49.96%(INT8 2× 압축). final_relative_error_max=0.00988 < 0.01(MANDATORY Pass). pipeline_cosine_similarity=0.9999995. draft acceptance rate 1%(INT8 threshold mismatch — FP8 codec 개선 대상). vLLM 0.21.0.
 
