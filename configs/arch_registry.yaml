@@ -1,0 +1,31 @@
+architectures:
+  - model_pattern: "deepseek-v2*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "deepseek-v3*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "kimi*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "moonlight*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "deepseek-r1*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "llama*"
+    arch: "GQA"
+  - model_pattern: "mistral*"
+    arch: "GQA"
+  - model_pattern: "qwen*"
+    arch: "GQA"
+  - model_pattern: "gpt*"
+    arch: "MHA"
+  - model_pattern: "default"
+    arch: "MHA"

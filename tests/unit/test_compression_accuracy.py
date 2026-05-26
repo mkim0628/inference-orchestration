@@ -1386,3 +1386,181 @@ def test_vericache_cross_bc_pipeline_final_error_below_threshold() -> None:
             f"Cross-1 B+C relative_error={pipeline_result.relative_error:.6f} > 0.01"
         )
 
+
+# =========================================================================== #
+# C-1: MLATwoAxisCompressionCodec accuracy (2026-05-26 cycle)                 #
+# =========================================================================== #
+
+from src.cache.mla_two_axis_compression_codec import (  # noqa: E402
+    MLATwoAxisCompressionCodec,
+    MLATwoAxisConfig,
+)
+from src.cache.irminsul_mla_segment_cache import IrminsulMLAConfig, IrminsulMLASegmentCache  # noqa: E402
+
+
+def _make_two_axis_codec(
+    depth_threshold: float = 0.90,
+    position_dedup: bool = True,
+    seed: int = 42,
+) -> MLATwoAxisCompressionCodec:
+    base = IrminsulMLASegmentCache(IrminsulMLAConfig(max_entries=200, seed=seed))
+    cfg = MLATwoAxisConfig(
+        depth_sharing_threshold=depth_threshold,
+        position_dedup_enabled=position_dedup,
+        fallback_threshold=0.95,
+    )
+    return MLATwoAxisCompressionCodec(base, cfg)
+
+
+def test_mla_two_axis_position_axis_lossless() -> None:
+    """Position-axis dedup: same segment_id stored twice → pointer reuse, tensor unchanged.
+
+    c_KV position-free property guarantees zero accuracy loss (mathematical).
+    """
+    codec = _make_two_axis_codec(position_dedup=True)
+
+    torch.manual_seed(42)
+    kv = torch.randn(16, 64)
+    key = "segment_abc123"
+
+    codec.put(key, kv)
+    val1 = codec.get(key)
+    assert val1 is not None
+    assert torch.allclose(val1, kv, atol=1e-5), "First get must return exact tensor"
+
+    # Second put (same key) should be deduplicated
+    codec.put(key, kv)
+    val2 = codec.get(key)
+    assert val2 is not None
+    assert torch.allclose(val2, kv, atol=1e-5), "Second get must return same tensor"
+
+    # Position dedup counter should have incremented
+    assert codec._position_deduplicated >= 1, (
+        "Position dedup counter should increment on second put"
+    )
+
+
+def test_mla_two_axis_depth_axis_cosine_threshold() -> None:
+    """Depth axis: cos_sim >= 0.90 → share layer, cos_sim < threshold → independent."""
+    codec = _make_two_axis_codec(depth_threshold=0.90, position_dedup=False)
+
+    torch.manual_seed(42)
+    d = 64
+    n_tokens = 32
+
+    # Create two nearly-identical tensors (high cos_sim)
+    base_tensor = torch.randn(n_tokens, d)
+    similar_tensor = base_tensor + torch.randn(n_tokens, d) * 0.001  # cos_sim ≈ 1.0
+
+    # Create a very different tensor (low cos_sim)
+    different_tensor = torch.randn(n_tokens, d)
+
+    c_kv_by_layer = {
+        0: base_tensor,
+        1: similar_tensor,    # should be shared with 0 (high cos_sim)
+        2: different_tensor,  # should be independent (low cos_sim)
+    }
+
+    compressed, depth_reduction = codec.compress_layer_kv(c_kv_by_layer)
+
+    # Layer 1 should share layer 0 (they are nearly identical)
+    assert compressed[1] is compressed[0], (
+        "Layer 1 (similar) should share layer 0 (high cos_sim)"
+    )
+
+    # Layer 2 should be independent (different tensor)
+    assert compressed[2] is not compressed[0], (
+        "Layer 2 (different) should be independent (low cos_sim)"
+    )
+
+    # Depth reduction should be > 0 (at least one layer shared)
+    assert depth_reduction > 0.0, f"Expected depth_reduction > 0, got {depth_reduction}"
+
+
+def test_mla_two_axis_combined_reduction() -> None:
+    """Combined reduction = 1 - (1-pos_reduction) * (1-depth_reduction)."""
+    codec = _make_two_axis_codec(depth_threshold=0.90, position_dedup=True)
+
+    torch.manual_seed(42)
+    d, n = 32, 10
+
+    # Store multiple entries with the same key (position dedup)
+    key = "test_segment"
+    kv = torch.randn(n, d)
+    codec.put(key, kv)
+    codec.put(key, kv)  # duplicate → deduped
+    codec.put(key, kv)  # duplicate → deduped
+
+    # Create layer KV set with high similarity for depth compression
+    base = torch.randn(n, d)
+    similar = base + torch.randn(n, d) * 0.001
+
+    c_kv_by_layer = {0: base, 1: similar}
+    _, depth_reduction = codec.compress_layer_kv(c_kv_by_layer)
+
+    pos_reduction = codec.position_dedup_reduction_rate()
+    combined = codec.combined_reduction_rate(c_kv_by_layer, pos_reduction=pos_reduction)
+
+    expected = 1.0 - (1.0 - pos_reduction) * (1.0 - depth_reduction)
+    assert abs(combined - expected) < 1e-6, (
+        f"Combined reduction formula mismatch: expected={expected:.4f}, got={combined:.4f}"
+    )
+
+
+def test_mla_two_axis_fallback_threshold() -> None:
+    """accuracy_delta > 1% triggers auto threshold adjustment to fallback_threshold."""
+    base = IrminsulMLASegmentCache(IrminsulMLAConfig(max_entries=100, seed=42))
+    cfg = MLATwoAxisConfig(
+        depth_sharing_threshold=0.90,
+        fallback_threshold=0.95,
+    )
+    codec = MLATwoAxisCompressionCodec(base, cfg)
+
+    # accuracy_delta > 1% → threshold should be raised
+    adjusted = codec.auto_adjust_threshold(accuracy_delta=0.02, max_allowed_delta=0.01)
+    assert adjusted is True, "Should return True when threshold is adjusted"
+    assert codec.config.depth_sharing_threshold == 0.95, (
+        f"Threshold should be raised to fallback=0.95, got {codec.config.depth_sharing_threshold}"
+    )
+
+
+def test_mla_two_axis_fallback_threshold_not_triggered() -> None:
+    """accuracy_delta <= 1% should NOT trigger threshold adjustment."""
+    base = IrminsulMLASegmentCache(IrminsulMLAConfig(max_entries=100, seed=42))
+    cfg = MLATwoAxisConfig(depth_sharing_threshold=0.90, fallback_threshold=0.95)
+    codec = MLATwoAxisCompressionCodec(base, cfg)
+
+    adjusted = codec.auto_adjust_threshold(accuracy_delta=0.005, max_allowed_delta=0.01)
+    assert adjusted is False, "Should return False when delta is within limit"
+    assert codec.config.depth_sharing_threshold == 0.90, (
+        "Threshold should remain at 0.90"
+    )
+
+
+def test_mla_two_axis_cache_store_interface() -> None:
+    """All CacheStore abstract methods work for MLATwoAxisCompressionCodec."""
+    codec = _make_two_axis_codec()
+
+    torch.manual_seed(42)
+    kv = torch.randn(8, 32)
+
+    codec.put("key_a", kv)
+    val = codec.get("key_a")
+    assert val is not None
+
+    miss = codec.get("nonexistent")
+    assert miss is None
+
+    rate = codec.hit_rate()
+    assert 0.0 <= rate <= 1.0
+
+    mem = codec.memory_bytes()
+    assert mem >= 0
+
+    freed = codec.evict()
+    assert freed >= 0
+
+    codec.reset_stats()
+    assert codec._hits == 0
+    assert codec._misses == 0
+

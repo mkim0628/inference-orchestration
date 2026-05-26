@@ -7,9 +7,10 @@ GQA/MHA → fallback CacheStore (RoPEReencodingNonContiguousCache or SegmentedHa
 
 import fnmatch
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import torch
 import yaml
 
 from src.cache.base import CacheStore
@@ -121,10 +122,10 @@ class ArchitectureAwareNonContiguousRouter(CacheStore):
     # CacheStore abstract methods                                       #
     # ---------------------------------------------------------------- #
 
-    def put(self, key: str, value: import torch if False else ...) -> None:  # type: ignore[misc]
+    def put(self, key: str, value: torch.Tensor) -> None:
         self._active_cache.put(key, value)
 
-    def get(self, key: str):
+    def get(self, key: str) -> Optional[torch.Tensor]:
         return self._active_cache.get(key)
 
     def evict(self) -> int:
@@ -151,6 +152,7 @@ class ArchitectureAwareNonContiguousRouter(CacheStore):
 
     @property
     def arch(self) -> str:
+        """Currently detected architecture type."""
         return self._arch
 
     def get_segments_routed(
@@ -158,7 +160,7 @@ class ArchitectureAwareNonContiguousRouter(CacheStore):
         token_ids: List[int],
         target_offset: int,
         layer_idx: int = 0,
-    ) -> Tuple[List[Tuple[int, "torch.Tensor"]], List[int]]:  # type: ignore[name-defined]
+    ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
         """Route segment lookup to architecture-appropriate cache backend.
 
         MLA: IrminsulMLASegmentCache.get_segments_mla() — returns (chunk_idx, c_kv, k_r)
@@ -184,34 +186,19 @@ class ArchitectureAwareNonContiguousRouter(CacheStore):
         self,
         token_ids: List[int],
         layer_idx: int = 0,
-    ) -> Tuple[List[Tuple[int, "torch.Tensor"]], List[int]]:  # type: ignore[name-defined]
+    ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
+        """InferenceRunner-compatible get_segments API."""
         return self.get_segments_routed(token_ids, 0, layer_idx)
 
     def put_segment(
         self,
         token_ids: List[int],
         chunk_idx: int,
-        kv: "torch.Tensor",  # type: ignore[name-defined]
+        kv: torch.Tensor,
         layer_idx: int = 0,
     ) -> None:
+        """InferenceRunner-compatible put_segment API."""
         if self._arch == "MLA":
             self.mla_cache.put_segment(token_ids, chunk_idx, kv, layer_idx)
         elif hasattr(self.gqa_mha_cache, "put_segment"):
             self.gqa_mha_cache.put_segment(token_ids, chunk_idx, kv, layer_idx)
-
-
-# Fix the put/get type annotations — redefine properly
-import torch  # noqa: E402 (needed for proper annotations after class)
-
-
-def _router_put(self: "ArchitectureAwareNonContiguousRouter", key: str, value: torch.Tensor) -> None:
-    self._active_cache.put(key, value)
-
-
-def _router_get(self: "ArchitectureAwareNonContiguousRouter", key: str) -> Optional[torch.Tensor]:
-    return self._active_cache.get(key)
-
-
-# Patch the methods to have correct signatures
-ArchitectureAwareNonContiguousRouter.put = _router_put  # type: ignore[method-assign]
-ArchitectureAwareNonContiguousRouter.get = _router_get  # type: ignore[method-assign]

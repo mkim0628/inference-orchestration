@@ -1,0 +1,33 @@
+experiment:
+  date: "2026-05-26"
+  activity: "A+B+C_synergy"
+  cache_type: "irminsul_mla_arch_aware"
+  compression_method: "mla_two_axis"
+  scheduler_type: "objectcache_s3_tier"
+
+# Activity B-1 Irminsul MLA settings
+irminsul_mla:
+  avg_chunk_size: 256
+  min_chunk_size: 64
+  max_chunk_size: 1024
+  rope_base: 10000.0
+  k_r_dim: 64
+  max_entries: 2000
+  seed: 42
+
+# Activity A-1 ObjectCache S3 break-even settings
+objectcache_s3_tier:
+  context_lengths: [4096, 8192, 16384, 32768, 65536]
+  hysteresis_band: 0.05
+  ema_gamma: 0.9
+  max_s3_requests_per_batch: 4
+  s3_enabled_by_default: false
+  rdma_bandwidth_gbps: 100.0
+
+# Activity C-1 MLA two-axis compression settings (optional)
+mla_two_axis:
+  depth_sharing_threshold: 0.90
+  depth_sharing_k: 2
+  position_dedup_enabled: true
+  fallback_threshold: 0.95
+  max_allowed_accuracy_delta: 0.01
