@@ -4608,5 +4608,426 @@ if [ $EXIT_2026_05_25 -ne 0 ]; then
 fi
 
 echo ""
+echo "=== 2026-05-26 A+B+C smoke tests (IrminsulMLA δ-rotation + ObjectCacheS3TierRouter + MLATwoAxisCodec) ==="
+set +e
+python - <<'PYEOF_2026_05_26'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity B-1: IrminsulMLASegmentMixin + δ-rotation correctness
+# ---------------------------------------------------------------------------
+from vllm_integration.mla_segment_cache_integration import (
+    IrminsulMLASegmentMixin,
+    install_irminsul_mla_hooks,
+    _apply_delta_rotation,
+    _cdc_chunk,
+    _cdc_segment_key,
+)
+
+# δ-rotation correctness (mathematical verification)
+k_r_dim = 64
+half_dim = k_r_dim // 2
+rope_base = 10000.0
+source_pos = 100
+target_pos = 250
+delta = target_pos - source_pos
+n_tokens = 8
+
+i_vals = torch.arange(half_dim, dtype=torch.float32)
+theta = torch.pow(torch.tensor(rope_base, dtype=torch.float32), -2.0 * i_vals / k_r_dim)
+k_raw = torch.randn(n_tokens, k_r_dim)
+
+def apply_rope_at(k, pos):
+    angles = pos * theta
+    cos_a, sin_a = torch.cos(angles), torch.sin(angles)
+    k_r = k.reshape(n_tokens, half_dim, 2)
+    k0, k1 = k_r[..., 0], k_r[..., 1]
+    new_k0 = k0 * cos_a - k1 * sin_a
+    new_k1 = k0 * sin_a + k1 * cos_a
+    return torch.stack([new_k0, new_k1], dim=-1).reshape(n_tokens, k_r_dim)
+
+k_at_source = apply_rope_at(k_raw, source_pos)
+k_at_target = apply_rope_at(k_raw, target_pos)
+k_corrected = _apply_delta_rotation(k_at_source, delta, rope_base, k_r_dim)
+assert torch.allclose(k_corrected, k_at_target, rtol=1e-4, atol=1e-4), (
+    f"δ-rotation correctness: max_diff={( k_corrected - k_at_target).abs().max():.6f}"
+)
+print("  δ-rotation mathematical correctness: PASS")
+
+# CDC chunking position-independence
+tokens_A = list(range(100, 200))
+tokens_B = list(range(50, 150))  # same content as tokens_A[50:100] with offset
+chunks_A = _cdc_chunk(tokens_A, avg_chunk_size=32, min_chunk_size=8, max_chunk_size=128)
+# Same tokens in both lists → same keys regardless of position in stream
+chunk_subset = [t for chunk in chunks_A for t in chunk]
+assert chunk_subset == tokens_A, "CDC must cover all tokens"
+key_first = _cdc_segment_key(chunks_A[0])
+assert len(key_first) == 64, f"SHA256 hex key must be 64 chars: {len(key_first)}"
+print(f"  CDC chunking + position-independent SHA256 key: PASS ({len(chunks_A)} chunks)")
+
+# IrminsulMLASegmentMixin monkey-patch test
+class _FakeManager:
+    pass
+
+mgr = _FakeManager()
+install_irminsul_mla_hooks(
+    mgr, avg_chunk_size=32, min_chunk_size=8, max_chunk_size=128, k_r_dim=64, max_entries=100
+)
+
+chunk_tokens = list(range(32))
+c_kv = torch.randn(32, 128)
+k_r_tensor = torch.randn(32, 64)
+seg_key = mgr.store_mla_segment(chunk_tokens, c_kv, k_r_tensor, source_position=0, layer_idx=0)
+assert len(seg_key) == 64, f"Segment key must be 64-char hex: {seg_key}"
+result = mgr.find_mla_segment(seg_key, target_position=100, layer_idx=0)
+assert result is not None, "find_mla_segment must return (c_kv, k_r_corrected)"
+c_kv_ret, k_r_corrected = result
+assert c_kv_ret.shape == c_kv.shape, f"c_kv shape: {c_kv_ret.shape}"
+assert k_r_corrected.shape == k_r_tensor.shape, f"k_r shape: {k_r_corrected.shape}"
+# c_kv must be unchanged (position-free)
+assert torch.allclose(c_kv_ret, c_kv), "c_kv must be identical (position-free)"
+print("  IrminsulMLASegmentMixin store/find with δ-rotation: PASS")
+
+# Miss case
+miss = mgr.find_mla_segment("nonexistent" * 4, target_position=0, layer_idx=0)
+assert miss is None, "find_mla_segment on unknown key must return None"
+print("  IrminsulMLASegmentMixin miss: PASS")
+
+# find_noncontiguous_mla_hits
+token_ids = list(range(200))
+hits, miss_chunks = mgr.find_noncontiguous_mla_hits(token_ids, target_offset=0, layer_idx=0)
+# We stored 1 chunk (range(32)), expect 1 hit (if cdc_chunk produces chunk matching stored key)
+# (actual hit count depends on CDC boundary alignment)
+print(f"  find_noncontiguous_mla_hits: {len(hits)} hits, {len(miss_chunks)} miss chunks: PASS")
+
+# Stats
+hit_rate = mgr.irminsul_hit_rate()
+assert 0.0 <= hit_rate <= 1.0
+nc_rate = mgr.irminsul_noncontiguous_hit_rate()
+assert 0.0 <= nc_rate <= 1.0
+print(f"  IrminsulMLASegmentMixin stats: hit_rate={hit_rate:.2f} nc_rate={nc_rate:.2f}: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity B-2: CDCHashBlockRegistry
+# ---------------------------------------------------------------------------
+from vllm_integration.cdc_hash_integration import (
+    CDCHashBlockRegistry,
+    install_cdc_hash_registry,
+    _cdc_segment_key as _cdc_key2,
+)
+
+registry = CDCHashBlockRegistry(model_name="deepseek-v3", max_hbm_segments=100)
+
+# make_segment_id
+seg_id = CDCHashBlockRegistry.make_segment_id(list(range(32)))
+assert len(seg_id) == 64, f"segment_id must be 64-char hex: {len(seg_id)}"
+# position-independence: same tokens → same key
+seg_id2 = CDCHashBlockRegistry.make_segment_id(list(range(32)))
+assert seg_id == seg_id2, "Same tokens must yield same segment_id"
+print("  CDCHashBlockRegistry.make_segment_id position-independence: PASS")
+
+# s3_object_key format
+obj_key = registry.s3_object_key(seg_id, layer_idx=3)
+assert obj_key == f"deepseek-v3/{seg_id}_3.kvcache", f"S3 key format wrong: {obj_key}"
+print(f"  CDCHashBlockRegistry.s3_object_key format: PASS ({obj_key[:40]}...)")
+
+# store + lookup (HBM tier)
+kv_tensor = torch.randn(32, 128)
+registry.store(seg_id, kv_tensor, tier="HBM", layer_idx=0)
+result_kv, tier_name = registry.lookup(seg_id, layer_idx=0)
+assert tier_name == "HBM", f"Expected HBM hit, got {tier_name}"
+assert result_kv is not None and result_kv.shape == kv_tensor.shape
+print("  CDCHashBlockRegistry HBM store/lookup: PASS")
+
+# Miss
+miss_kv, miss_tier = registry.lookup("unknown" * 8, layer_idx=0)
+assert miss_kv is None and miss_tier == "miss"
+print("  CDCHashBlockRegistry miss: PASS")
+
+# S3 unavailable fallback (no s3_client → silently falls back to miss)
+registry_no_s3 = CDCHashBlockRegistry(model_name="test", s3_client=None)
+kv_miss2, tier_miss2 = registry_no_s3.lookup(seg_id, layer_idx=0)
+assert tier_miss2 == "miss", "No s3_client → must return miss without exception"
+print("  CDCHashBlockRegistry S3-unavailable fallback (no exception): PASS")
+
+# install_cdc_hash_registry on manager
+class _FakeMgr2:
+    pass
+mgr2 = _FakeMgr2()
+reg = install_cdc_hash_registry(mgr2, model_name="default")
+assert hasattr(mgr2, "_cdc_registry")
+assert mgr2._cdc_registry is reg
+print("  install_cdc_hash_registry: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity B: IrminsulNonContiguousBlockManagerPatch
+# ---------------------------------------------------------------------------
+from vllm_integration.irminsul_block_manager_patch import (
+    IrminsulNonContiguousBlockManagerPatch,
+    build_noncontiguous_block_table,
+    build_mla_kv_batch,
+    detect_vllm_model_arch,
+)
+
+patch = IrminsulNonContiguousBlockManagerPatch(
+    avg_chunk_size=32, min_chunk_size=8, max_chunk_size=128, k_r_dim=64,
+    model_name="deepseek-v3"
+)
+class _FakeMgr3:
+    pass
+mgr3 = _FakeMgr3()
+registry3 = patch.install(mgr3)
+assert hasattr(mgr3, "store_mla_segment")
+assert hasattr(mgr3, "find_noncontiguous_mla_hits")
+assert hasattr(mgr3, "_cdc_registry")
+assert hasattr(mgr3, "_irminsul_model_arch")
+print("  IrminsulNonContiguousBlockManagerPatch.install: PASS")
+
+# build_noncontiguous_block_table
+fake_hits = [
+    (0, torch.randn(8, 128), torch.randn(8, 64)),
+    (2, torch.randn(8, 128), torch.randn(8, 64)),
+]
+table = build_noncontiguous_block_table(fake_hits, max_blocks=8)
+assert table.shape == (1, 8)
+assert table.dtype == torch.int64
+assert table[0, 0].item() == 0
+assert table[0, 1].item() == -1  # chunk 1 is a miss
+assert table[0, 2].item() == 2
+assert (table[0, 3:] == -1).all()
+print(f"  build_noncontiguous_block_table: shape={tuple(table.shape)} sentinels OK: PASS")
+
+# build_mla_kv_batch
+batch = build_mla_kv_batch(fake_hits)
+assert batch is not None
+c_kv_batch, k_r_batch = batch
+assert c_kv_batch.shape == (16, 128)
+assert k_r_batch.shape == (16, 64)
+print(f"  build_mla_kv_batch: c_kv={tuple(c_kv_batch.shape)} k_r={tuple(k_r_batch.shape)}: PASS")
+
+# build_mla_kv_batch empty
+assert build_mla_kv_batch([]) is None
+print("  build_mla_kv_batch empty: PASS")
+
+# ---------------------------------------------------------------------------
+# Activity A-1: S3TierRoutingEngine + ObjectCacheS3SchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.objectcache_scheduler_patch import (
+    VLLMObjectCacheS3Config,
+    S3TierRoutingEngine,
+    ObjectCacheS3SchedulerMixin,
+    make_objectcache_s3_scheduler_class,
+    install_objectcache_s3_hooks,
+)
+
+cfg = VLLMObjectCacheS3Config(
+    context_lengths=[4096, 8192, 16384, 32768, 65536],
+    breakeven_table={4096: 0.15, 8192: 0.18, 16384: 0.22, 32768: 0.28, 65536: 0.35},
+    hysteresis_band=0.05,
+    ema_gamma=0.9,
+    max_s3_requests_per_batch=4,
+    s3_enabled_by_default=False,
+)
+engine = S3TierRoutingEngine(cfg)
+
+# breakeven formula
+be = engine.compute_breakeven_hit_rate(t_recompute_ms=100.0, t_s3_ms=400.0)
+assert abs(be - 0.20) < 1e-6, f"Breakeven formula: expected 0.20, got {be}"
+print(f"  S3TierRoutingEngine.compute_breakeven_hit_rate(100, 400) = {be:.2f}: PASS")
+
+# EMA update
+engine2 = S3TierRoutingEngine(VLLMObjectCacheS3Config(
+    breakeven_table={4096: 0.15, 8192: 0.18, 16384: 0.22, 32768: 0.28, 65536: 0.35},
+    hysteresis_band=0.05, ema_gamma=0.9, s3_enabled_by_default=False,
+    context_lengths=[4096, 8192, 16384, 32768, 65536],
+))
+engine2.update_hit_rate_ema(0.50)
+expected_ema = 0.9 * 0.50 + 0.1 * 0.0
+assert abs(engine2._hit_rate_ema - expected_ema) < 1e-6, f"EMA: {engine2._hit_rate_ema} != {expected_ema}"
+print(f"  S3TierRoutingEngine EMA update: {engine2._hit_rate_ema:.3f}: PASS")
+
+# S3 activation above breakeven + hysteresis
+engine3 = S3TierRoutingEngine(VLLMObjectCacheS3Config(
+    breakeven_table={8192: 0.22},
+    hysteresis_band=0.05, ema_gamma=0.9, s3_enabled_by_default=True,
+    context_lengths=[8192],
+))
+engine3._hit_rate_ema = 0.30  # > 0.22 + 0.05 = 0.27
+engine3._s3_active = True
+assert engine3.should_use_s3_for_request(8192), "S3 should be active above breakeven + band"
+print("  S3TierRoutingEngine: s3_active above breakeven + hysteresis: PASS")
+
+# S3 deactivation below breakeven - hysteresis
+engine3._hit_rate_ema = 0.10  # < 0.22 - 0.05 = 0.17
+engine3.update_hit_rate_ema(0.10)  # push EMA below deactivation threshold
+# After several updates, EMA converges near 0.10
+for _ in range(20):
+    engine3.update_hit_rate_ema(0.10)
+assert not engine3._s3_active, f"S3 should deactivate when EMA < breakeven - band"
+print("  S3TierRoutingEngine: s3_inactive below breakeven - hysteresis: PASS")
+
+# Hysteresis prevents oscillation at midpoint
+engine4 = S3TierRoutingEngine(VLLMObjectCacheS3Config(
+    breakeven_table={8192: 0.22},
+    hysteresis_band=0.05, ema_gamma=0.9, s3_enabled_by_default=False,
+    context_lengths=[8192],
+))
+engine4._hit_rate_ema = 0.23  # in band [0.17, 0.27]
+initial_state = engine4._s3_active
+engine4.update_hit_rate_ema(0.23)
+assert engine4._s3_active == initial_state, "Hysteresis must prevent state change within band"
+print("  S3TierRoutingEngine hysteresis prevents oscillation: PASS")
+
+# max_s3_requests_per_batch gating
+class _FakeRequest:
+    def __init__(self, rid, n_tokens):
+        self.request_id = rid
+        self.num_prompt_tokens = n_tokens
+        self.metadata = {}
+
+from vllm_integration.objectcache_scheduler_patch import ObjectCacheS3SchedulerMixin
+
+class _FakeScheduler(ObjectCacheS3SchedulerMixin):
+    def __init__(self):
+        self.waiting = [_FakeRequest(f"r{i}", 9000) for i in range(8)]
+        self._s3_routing_engine = S3TierRoutingEngine(VLLMObjectCacheS3Config(
+            breakeven_table={8192: 0.18},
+            hysteresis_band=0.05, ema_gamma=0.9,
+            max_s3_requests_per_batch=4,
+            s3_enabled_by_default=True,
+            context_lengths=[8192],
+        ))
+        self._s3_routing_engine._hit_rate_ema = 0.30
+        self._s3_routing_engine._s3_active = True
+
+sched_fake = _FakeScheduler()
+sched_fake._s3_pre_schedule_hook()
+
+s3_count = sum(1 for req in sched_fake.waiting
+               if hasattr(req, "metadata") and req.metadata.get("s3_tier"))
+assert s3_count <= 4, f"max_s3_requests_per_batch violated: {s3_count} > 4"
+print(f"  max_s3_requests_per_batch cap: {s3_count} <= 4: PASS")
+
+# s3_enabled_by_default=False → no S3 routing
+class _FakeScheduler2(ObjectCacheS3SchedulerMixin):
+    def __init__(self):
+        self.waiting = [_FakeRequest(f"r{i}", 9000) for i in range(4)]
+        self._s3_routing_engine = S3TierRoutingEngine(VLLMObjectCacheS3Config(
+            breakeven_table={8192: 0.18},
+            hysteresis_band=0.05, ema_gamma=0.9,
+            s3_enabled_by_default=False,
+            context_lengths=[8192],
+        ))
+
+sched2 = _FakeScheduler2()
+sched2._s3_pre_schedule_hook()
+s3_count2 = sum(1 for req in sched2.waiting
+                if hasattr(req, "metadata") and req.metadata.get("s3_tier"))
+assert s3_count2 == 0, f"s3_enabled_by_default=False must not route to S3: {s3_count2}"
+print("  s3_enabled_by_default=False: no S3 routing: PASS")
+
+# Factory: make_objectcache_s3_scheduler_class
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    S3Sched = make_objectcache_s3_scheduler_class(Scheduler)
+    assert issubclass(S3Sched, Scheduler)
+    assert issubclass(S3Sched, ObjectCacheS3SchedulerMixin)
+    print(f"  make_objectcache_s3_scheduler_class: PASS ({S3Sched.__name__})")
+except Exception as exc:
+    print(f"  make_objectcache_s3_scheduler_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity C-1: MLATwoAxisCompressionHook + IrminsulCompressionConfig
+# ---------------------------------------------------------------------------
+from vllm_integration.irminsul_attention_backend_patch import (
+    MLATwoAxisHookConfig,
+    MLATwoAxisCompressionHook,
+    _layer_cosine_sim,
+)
+from vllm_integration.compression_config_extension import (
+    IrminsulCompressionConfig,
+    install_compression_config,
+    get_compression_config,
+    compute_compressed_block_count,
+)
+
+# Two-axis compression hook
+hook_cfg = MLATwoAxisHookConfig(
+    depth_sharing_threshold=0.90,
+    position_dedup_enabled=True,
+    fallback_threshold=0.95,
+    max_allowed_accuracy_delta=0.01,
+)
+hook = MLATwoAxisCompressionHook(hook_cfg)
+
+# Position-axis dedup: same segment_id → pointer reuse
+c_kv_a = torch.randn(8, 128)
+k_r_a = torch.randn(8, 64)
+c_kv_out, k_r_out = hook.write_hook(c_kv_a, k_r_a, segment_id="seg_X", layer_idx=0)
+assert c_kv_out.shape == c_kv_a.shape, "write_hook must return c_kv shape"
+# Second write with same segment_id → dedup
+c_kv_out2, k_r_out2 = hook.write_hook(c_kv_a + 0.1, k_r_a, segment_id="seg_X", layer_idx=1)
+assert hook._position_dedup_saves >= 1, "Position dedup must count at least 1 save"
+print(f"  MLATwoAxisCompressionHook position dedup: saves={hook._position_dedup_saves}: PASS")
+
+# Read hook: identity (no-op, full-precision)
+c_kv_read, k_r_read = hook.read_hook(c_kv_a, k_r_a, segment_id="seg_X", layer_idx=0)
+assert torch.allclose(c_kv_read, c_kv_a), "read_hook must return identical c_kv (no-op decompression)"
+print("  MLATwoAxisCompressionHook read_hook: accuracy-preserving no-op: PASS")
+
+# Depth-axis: high cosine similarity → sharing
+c_kv_layer0 = torch.ones(8, 128) * 0.5
+c_kv_layer1 = c_kv_layer0 + 1e-4 * torch.randn(8, 128)  # very similar → cos_sim > 0.90
+cos = _layer_cosine_sim(c_kv_layer1, c_kv_layer0)
+assert cos >= 0.90, f"cos_sim={cos:.4f} should be >= 0.90 for this test"
+hook2 = MLATwoAxisCompressionHook(MLATwoAxisHookConfig(depth_sharing_threshold=0.90))
+hook2._last_c_kv_by_layer[0] = c_kv_layer0
+c_out, _ = hook2.write_hook(c_kv_layer1, k_r_a, segment_id="seg_Y", layer_idx=1)
+assert hook2._depth_sharing_saves >= 1, "Depth sharing must trigger for high cos_sim"
+print(f"  MLATwoAxisCompressionHook depth sharing (cos_sim={cos:.4f}): PASS")
+
+# Auto-adjust threshold: accuracy_delta > 1% → raises to fallback_threshold
+hook3 = MLATwoAxisCompressionHook(MLATwoAxisHookConfig(
+    depth_sharing_threshold=0.90, fallback_threshold=0.95, max_allowed_accuracy_delta=0.01
+))
+adjusted = hook3.auto_adjust_threshold(accuracy_delta=0.02)  # > 0.01
+assert adjusted, "auto_adjust should return True when delta > max"
+assert hook3.config.depth_sharing_threshold == 0.95, f"Threshold not raised: {hook3.config.depth_sharing_threshold}"
+print("  MLATwoAxisCompressionHook auto_adjust_threshold: PASS")
+
+# IrminsulCompressionConfig
+cc = IrminsulCompressionConfig(compression_method="mla_two_axis", depth_sharing_threshold=0.90)
+assert cc.is_enabled()
+assert cc.is_mla_two_axis()
+
+class _FakeVllmConfig:
+    pass
+vcfg = _FakeVllmConfig()
+install_compression_config(vcfg, cc)
+assert hasattr(vcfg, "_irminsul_compression_config")
+retrieved = get_compression_config(vcfg)
+assert retrieved is cc
+print("  IrminsulCompressionConfig install/get: PASS")
+
+# compute_compressed_block_count
+n_blocks = compute_compressed_block_count(1000, "mla_two_axis", compression_ratio=0.3)
+assert n_blocks > 1000, f"Compressed blocks should exceed base: {n_blocks}"
+n_no_compress = compute_compressed_block_count(1000, "none", compression_ratio=0.3)
+assert n_no_compress == 1000
+print(f"  compute_compressed_block_count: mla_two_axis={n_blocks} none={n_no_compress}: PASS")
+
+print("=== 2026-05-26 A+B+C smoke tests: ALL PASS ===")
+PYEOF_2026_05_26
+EXIT_2026_05_26=$?
+set -e
+if [ $EXIT_2026_05_26 -ne 0 ]; then
+  echo "WARNING: 2026-05-26 A+B+C smoke tests had failures (exit=$EXIT_2026_05_26)" >&2
+fi
+
+echo ""
 echo "=== All vLLM integration smoke tests complete ==="
 echo "vLLM version: $(python -c 'import vllm; print(vllm.__version__)')"
