@@ -1,106 +1,96 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-24 대비):
-이전 사이클(2026-05-24)은 A+C 조합이었다:
-  - C-1 TriAttentionPreRoPEKVSelectorCodec (pre-RoPE Q/K 집중도 삼각함수 KV 선택, 10.7x 절감)
-  - C-2 AttentionMatchingClosedFormCodec (닫힌 형태 최소제곱 잠재 공간 KV 압착, 50x 압착)
-  - A-1 DualPathNICLoadBalancer (스토리지 NIC 이중 경로 로드 밸런서)
-  - Cross-1 DualPathTriAttentionCompressPipeline (A+C 통합 파이프라인)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-25 대비):
+이전 사이클(2026-05-25)은 B+C 조합이었다:
+  - C-1 VeriCacheSpeculativeKVDraftVerifyLosslessCodec (투기적 드래프트-검증 무손실 코덱)
+  - B-1 KVPacketSoftTokenAdapterZeroFLOPsNonContiguousCache (소프트-토큰 어댑터 비연속 재사용)
+  - Cross-1 VeriCacheKVPacketZeroFLOPsLosslessNonContiguousPipeline (B+C 통합)
 
-이번 사이클(2026-05-25)은 B+C 조합으로 전환된다.
+이번 사이클(2026-05-26)은 A+B 조합(C 시너지 포함)으로 전환된다.
 핵심 전환:
-  - Activity C 최우선: TriAttention/AttentionMatching "사후 선택/압착" 방식에서
-    VeriCache의 "투기적 실행(speculative draft-verify)" 패러다임으로 전환.
-    압축 KV로 드래프트 토큰을 생성하고 전체 KV로 검증함으로써,
-    accuracy-preserving 제약을 ±1% 이내에서 결정론적 ±0.0%로 강화한다.
-  - Activity B 2순위: 기존 KVPacketSoftAdapterCache가 이미 구현되어 있으나,
-    VeriCache의 투기적 파이프라인과 B+C 크로스 통합에 최적화된
-    KVPacketCache 클래스를 신규 파일로 추가한다.
-    소프트-토큰 어댑터 자기지도 증류를 통해 재계산 FLOPs를 0으로 낮춘다.
-  - Cross-1 B+C: VeriCache 투기적 코덱 + KV Packet 비연속 재사용 통합 파이프라인.
-    비연속 패킷 세그먼트가 VeriCache 드래프팅의 압축 KV 소스로 직접 공급된다.
+  - Activity B 최우선: KV Packet/어댑터 기반 "소프트-토큰 근사" 방식에서
+    Irminsul의 "MLA 아키텍처 구조적 c_KV/k_r 분리 + 수학적 δ-회전 위치 수정"으로 전환.
+    훈련 없이 수학적으로 위치-독립 비연속 재사용을 보장하며,
+    GQA/MHA 모델은 기존 AdapShot RoPE 재인코딩 경로로 자동 fallback한다.
+  - Activity A 2순위: S3 오브젝트 스토리지를 4번째 KV 계층으로 추가하는
+    ObjectCacheS3TierRouter를 구현한다. 브레이크이븐 히트율 기반 동적 티어 전환으로
+    TTFT +5% 이내 제약을 S3 계층까지 유지한다.
+  - Activity B 3순위: CDC 콘텐츠 해시 통합 세그먼트 ID 인터페이스(B-2)로
+    Irminsul과 ObjectCache를 동일 주소 체계로 연결한다.
+  - Cross-1 A+B: IrminsulObjectCachePipeline으로 엔드-투-엔드 통합 파이프라인 완성.
+  - Activity C 시너지: MLATwoAxisCompressionCodec (위치 축 × 깊이 축) — C는
+    accuracy-preserving 검증 계획 포함으로 이번 사이클에서 선택적으로 구현한다.
 
 주요 변경:
-1. [신규] src/cache/vericache_speculative_codec.py (C-1, 최우선)
-2. [신규] src/cache/kv_packet.py (B-1)
-3. [신규] src/engine/speculative_packet_pipeline.py (Cross-1, B+C)
-4. [신규] configs/experiments/2026-05-25.yaml
-5. [신규] configs/vericache_speculative_policy.yaml
-6. [신규] configs/kv_packet_adapter_policy.yaml
-7. [신규] tests/unit/test_vericache_speculative_codec.py (C-1)
-8. [신규] tests/unit/test_kv_packet.py (B-1)
-9. [신규] tests/unit/test_compression_accuracy.py 에 C-1 VeriCache 케이스 추가
-10. [신규] tests/integration/test_speculative_packet_pipeline_e2e.py (Cross-1)
-11. [보존] 이전 사이클 구현 파일 전부 수정 금지.
-    특히 kv_packet_adapter.py, triattention_pre_rope_kv_selector_codec.py,
-    attention_matching_closed_form_codec.py, dualpath_nic_load_balancer.py,
-    runtime_certified_quant_codec.py, kvsculpt_distillation_codec.py 등
-    기존 단위·통합 테스트 회귀 없이 통과해야 한다.
+1. [신규] src/cache/irminsul_mla_segment_cache.py (B-1, 최우선)
+2. [신규] src/cache/arch_aware_noncontiguous_router.py (B-1 라우터)
+3. [신규] src/cache/cdc_content_hash_interface.py (B-2)
+4. [신규] src/scheduler/objectcache_s3_tier_router.py (A-1)
+5. [신규] src/engine/irminsul_objectcache_pipeline.py (Cross-1)
+6. [신규] src/cache/mla_two_axis_compression_codec.py (C-1 시너지, 선택적)
+7. [신규] configs/experiments/2026-05-26.yaml
+8. [신규] configs/arch_registry.yaml
+9. [신규] configs/objectcache_breakeven_table.yaml
+10. [신규] configs/objectcache_breakeven_calibration.py
+11. [신규] tests/unit/test_irminsul_mla_segment_cache.py (B-1)
+12. [신규] tests/unit/test_arch_aware_noncontiguous_router.py (B-1 라우터)
+13. [신규] tests/unit/test_cdc_content_hash_interface.py (B-2)
+14. [신규] tests/unit/test_objectcache_s3_tier_router.py (A-1)
+15. [신규] tests/unit/test_compression_accuracy.py에 C-1 MLATwoAxis 케이스 추가
+16. [신규] tests/integration/test_irminsul_objectcache_pipeline_e2e.py (Cross-1)
+17. [보존] 이전 사이클 구현 파일 전부 수정 금지.
+    특히 vericache_speculative_codec.py, kv_packet.py, kv_packet_adapter.py,
+    speculative_packet_pipeline.py 등 기존 단위·통합 테스트 회귀 없이 통과해야 한다.
 -->
 
-# Spec — 2026-05-25: VeriCache Speculative KV Codec + KV Packet Zero-FLOPs Non-Contiguous Reuse
+# Spec — 2026-05-26: Irminsul MLA δ-Rotation Non-Contiguous Reuse + ObjectCache S3 4-Tier Routing
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-25.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-26.md`
 
-**최우선 구현 타겟**: C-1 `VeriCacheSpeculativeKVDraftVerifyLosslessCodec`
-**2순위 구현 타겟**: B-1 `KVPacketSoftTokenAdapterZeroFLOPsNonContiguousCache`
-**통합 타겟**: Cross-1 `VeriCacheKVPacketZeroFLOPsLosslessNonContiguousPipeline` (B+C)
+**최우선 구현 타겟**: B-1 `IrminsulMLANativeDeltaRotationArchAwareNonContiguousRouter`
+**2순위 구현 타겟**: A-1 `ObjectCacheS3TierBreakEvenRoutingPolicy`
+**3순위 구현 타겟**: B-2 `CDCContentHashUnifiedSegmentIDInterface`
+**통합 타겟**: Cross-1 `IrminsulObjectCacheCDCLayerwiseRDMAMLAPipeline` (A+B)
+**선택적 C 시너지**: C-1 `MLATwoAxisCompressionCodec` (위치 축 × 깊이 축)
 
 **해결하려는 문제**:
 
-- **Activity C (VeriCache 투기적 드래프트-검증 무손실 코덱)**: 기존 KV 압축 기법들은
-  확률적 정확도 보존을 주장하지만 ±1% 이내를 결정론적으로 보장하지 못한다.
-  VeriCache(arXiv 2605.17613)는 투기적 실행 패러다임을 KV 압축에 최초 적용해
-  압축 KV로 드래프트 토큰을 생성하고 전체 KV로 검증함으로써 결정론적 ±0.0% 정확도를
-  수학적으로 보장한다. 드래프팅은 HBM-대역폭 바운드, 전체 KV 로드는 PCIe-바운드이므로
-  두 연산이 서로 다른 하드웨어 자원을 사용해 완전한 병렬화가 가능하다.
-  이전 사이클 RuntimeCertifiedQuantizedAttentionCodec(05-23)이 확률적 경계를 제공했다면,
-  VeriCache는 투기적 실행으로 전체 KV와의 결정론적 동일성을 보장하는 더 강한 메커니즘이다.
+- **Activity B (Irminsul MLA-네이티브 δ-회전 아키텍처-인식 비연속 재사용)**:
+  기존 비연속 재사용 기법(AdapShot RoPE 재인코딩, KV Packet 어댑터 등)은 GQA/MHA
+  아키텍처를 전제하거나 훈련이 필요하다. MLA 아키텍처(DeepSeek-V2/V3/R1,
+  Kimi-K2/Moonlight)는 c_KV(위치-자유 압축 표현)와 k_r(64-dim, δ-회전으로 수정
+  가능) 분리 구조를 가지므로, c_KV를 위치와 무관하게 재사용하고 k_r에만 δ-회전을
+  적용해 훈련 없이 수학적으로 보장되는 위치-독립 비연속 재사용이 가능하다.
+  CDC 청킹 + 콘텐츠-해시 키잉으로 절대 위치에 무관한 세그먼트 인덱싱을 구현한다.
 
-- **Activity B (KV Packet 소프트-토큰 어댑터 제로-FLOPs 비연속 재사용)**: 기존 비연속
-  KV 재사용 기법(segmented.py, kv_packet_adapter.py 등)은 컨텍스트 불연속성을 처리할 때
-  재계산 FLOPs가 발생하거나 RoPE 재인코딩이 필요하다. KV Packet(arXiv 2604.13226)은
-  훈련 가능한 소프트-토큰 어댑터와 자기지도 증류로 컨텍스트 불연속성을 사전에 흡수해
-  재사용 시 추가 FLOPs를 0으로 낮춘다. 이미 구현된 `kv_packet_adapter.py`
-  (KVPacketSoftAdapterCache)는 VeriCache 통합에 최적화되지 않았으므로,
-  VeriCache의 드래프트-검증 파이프라인과 직접 연동하는 `KVPacketCache` 클래스를 신규 파일로
-  추가한다. 기존 `kv_packet_adapter.py`는 보존한다.
+- **Activity A (ObjectCache S3 티어 브레이크이븐 기반 동적 KV 라우팅)**:
+  기존 3-티어(HBM/DRAM/SSD) 구성은 물리적 용량 한계로 긴 컨텍스트와 에이전틱
+  세션을 지원하기 어렵다. S3 호환 오브젝트 스토리지를 4번째 계층으로 추가하되,
+  브레이크이븐 히트율 계산으로 S3 전달 비용이 재계산 비용보다 낮을 때만 활성화해
+  TTFT +5% 이내 제약을 유지하면서 유효 컨텍스트 길이를 2× 이상 확장한다.
 
-- **Cross-1 B+C 통합 (SpeculativePacketPipeline)**: KV Packet 비연속 세그먼트 재사용이
-  제로-FLOPs로 더 많은 세그먼트를 캐싱 가능하게 하면, VeriCache가 더 많은 세그먼트에
-  압축-검증을 적용할 수 있어 메모리와 처리량이 복합 개선된다.
+- **Activity B-2 (CDC 통합 주소 인터페이스)**:
+  Irminsul(B-1)의 CDC 콘텐츠 해시와 ObjectCache(A-1)의 S3 오브젝트 키가 동일한
+  SHA256 기반 주소 체계를 공유하도록 통합 인터페이스를 구현해, 계층 간 투명한
+  세그먼트 접근을 가능하게 한다.
 
 ---
 
 ## 이번 사이클 Activity
 
-- [ ] Activity A: KV Cache-aware Scheduling (이번 사이클 최우선 아님)
-- [x] Activity B: Non-Contiguous KV Cache Reuse (KVPacketCache, 2순위)
-- [x] Activity C: KV Cache Compression (VeriCacheSpeculativeCodec, 최우선)
+- [x] Activity A: KV Cache-aware Scheduling / S3 4-Tier Routing (A-1)
+- [x] Activity B: Non-Contiguous KV Cache Reuse — MLA δ-Rotation (B-1, B-2)
+- [x] Activity C: KV Cache Compression — MLA 2-Axis Codec (C-1, 선택적, accuracy 검증 포함)
 
 ---
 
 ## 목표
 
-- [ ] 목표 1 (evaluation_criteria.md §4 필수): perplexity 변화 ±1% 이내
-      — C-1: 결정론적 ±0.0% (전체 KV 검증 수학적 보장)
-      — 검증: `attention_output_relative_error` 비교 (압축 KV 드래프트 vs. 전체 KV)
-      — 허용 오차: relative_error < 0.01 (MANDATORY)
-- [ ] 목표 2 (evaluation_criteria.md §4 필수): downstream 태스크 정확도 ±1% 이내
-      — C-1: 드래프트 수락 토큰 = 전체 KV 추론 토큰 (결정론적 동일)
-      — cosine_similarity_output >= 0.99 (MANDATORY)
-- [ ] 목표 3 (evaluation_criteria.md §4 높음): KV Memory Reduction >= -30%
-      — C-1: INT8 양자화 코덱 사용 시 -50% 이상, 토큰 퇴거 코덱 사용 시 -70% 이상 목표
-- [ ] 목표 4 (evaluation_criteria.md §4 높음): Effective Context Length 동일 메모리 2x 이상
-      — 압축 KV를 HBM에 유지하고 전체 KV를 DRAM 오프로딩 → 동일 HBM 예산에서 2x 이상
-- [ ] 목표 5 (evaluation_criteria.md §3 높음): 비연속 세그먼트 히트율 전체 히트의 30% 이상
-      — B-1: 제로-FLOPs 재사용으로 비연속 히트 실용성 증가
-- [ ] 목표 6 (evaluation_criteria.md §1 높음): 처리량 베이스라인 +20% 이상
-      — C-1: 드래프트 수락률 0.7 기준 처리량 +50~70% 추정
-- [ ] 목표 7 (evaluation_criteria.md §5 필수, C 포함): Cross-1 복합 accuracy ±1% 이내
-      — cosine_similarity >= 0.99 (MANDATORY)
-- [ ] 목표 8 (evaluation_criteria.md §4 높음): 압축 오버헤드 TTFT +10% 이내
-      — C-1: 드래프팅 오버헤드 < 5ms/드래프트 배치, 검증 오버헤드 병렬화로 최소화
+- [ ] 목표 1: 비연속 캐시 히트율 전체 히트의 30% 이상 달성 (evaluation_criteria.md §3)
+- [ ] 목표 2: 추가 토큰 회수율 MLA 모델에서 +77% 이상 (에이전틱 세션 반복 청크 기준)
+- [ ] 목표 3: TTFT p50 증가 +5% 이내 (A-1 ObjectCacheS3TierRouter, §2)
+- [ ] 목표 4: 유효 컨텍스트 길이 베이스라인 대비 2× 이상 (S3 4번째 계층, §4)
+- [ ] 목표 5 (C-1 포함 시): KV 캐시 메모리 감소 −30% 이상, accuracy delta ±1% 이내 (§4)
 
 ---
 
@@ -110,1308 +100,836 @@
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/cache/vericache_speculative_codec.py` | C (최우선) | VeriCacheSpeculativeCodec — 투기적 드래프트-검증 KV 압축 코덱. CacheStore 인터페이스 구현. 플러그인 압축 코덱(INT8/FP8/토큰퇴거) + 전체 KV 비동기 검증으로 결정론적 ±0.0% 정확도 보장. |
-| `src/cache/kv_packet.py` | B | KVPacketCache — VeriCache 통합 최적화 KV Packet 비연속 재사용 캐시. CacheStore 인터페이스 구현. 소프트-토큰 어댑터 자기지도 증류로 재계산 FLOPs = 0. SpeculativePacketPipeline 연동 인터페이스 제공. |
-| `src/engine/speculative_packet_pipeline.py` | B+C (Cross-1) | SpeculativePacketPipeline — KVPacketCache(B) + VeriCacheSpeculativeCodec(C) 통합 파이프라인. 비연속 패킷이 VeriCache 드래프트 소스로 공급됨. |
-| `configs/vericache_speculative_policy.yaml` | C | VeriCache 정책 설정 |
-| `configs/kv_packet_adapter_policy.yaml` | B | KV Packet 어댑터 정책 설정 |
-| `configs/experiments/2026-05-25.yaml` | 공통 | 이번 사이클 실험 설정 |
-| `tests/unit/test_vericache_speculative_codec.py` | C | C-1 단위 테스트 |
-| `tests/unit/test_kv_packet.py` | B | B-1 단위 테스트 |
-| `tests/integration/test_speculative_packet_pipeline_e2e.py` | B+C Cross-1 | E2E 통합 테스트 |
+| `src/cache/irminsul_mla_segment_cache.py` | B-1 | MLA c_KV/k_r 분리 저장 + δ-회전 위치 수정, CDC 청킹, CacheStore 구현 |
+| `src/cache/arch_aware_noncontiguous_router.py` | B-1 | MLA vs GQA/MHA 아키텍처 감지 분기 라우터 |
+| `src/cache/cdc_content_hash_interface.py` | B-2 | CDC 콘텐츠 해시 통합 세그먼트 ID 인터페이스, 계층 투명 조회 |
+| `src/scheduler/objectcache_s3_tier_router.py` | A-1 | S3 4번째 계층 브레이크이븐 기반 동적 티어 라우터, BaseScheduler 상속 |
+| `src/engine/irminsul_objectcache_pipeline.py` | Cross-1 | A+B 통합 파이프라인 (CDC→계층 조회→S3 RDMA→δ-회전→어텐션) |
+| `src/cache/mla_two_axis_compression_codec.py` | C-1 | MLA c_KV 위치 축 × 깊이 축 2축 압축 코덱 (선택적) |
+| `configs/arch_registry.yaml` | B-1 | 지원 모델 아키텍처 레지스트리 |
+| `configs/objectcache_breakeven_table.yaml` | A-1 | 컨텍스트 길이별 브레이크이븐 히트율 룩업 테이블 |
+| `configs/objectcache_breakeven_calibration.py` | A-1 | T_s3, T_recompute 측정 및 브레이크이븐 테이블 생성 스크립트 |
+| `configs/experiments/2026-05-26.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `tests/unit/test_irminsul_mla_segment_cache.py` | B-1 | δ-회전 정확성 + CDC 청킹 + CacheStore 인터페이스 단위 테스트 |
+| `tests/unit/test_arch_aware_noncontiguous_router.py` | B-1 | 아키텍처 감지 분기 단위 테스트 |
+| `tests/unit/test_cdc_content_hash_interface.py` | B-2 | 통합 주소 조회 단위 테스트 |
+| `tests/unit/test_objectcache_s3_tier_router.py` | A-1 | 브레이크이븐 계산 + EMA 티어 전환 단위 테스트 |
+| `tests/unit/test_compression_accuracy.py` | C-1 | MLATwoAxisCompressionCodec accuracy 검증 (기존 파일에 케이스 추가) |
+| `tests/integration/test_irminsul_objectcache_pipeline_e2e.py` | Cross-1 | A+B 통합 엔드-투-엔드 테스트 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `tests/unit/test_compression_accuracy.py` | C-1 VeriCache accuracy 검증 케이스 추가 (기존 케이스 유지) |
-
-**보존 불변 파일**: `src/cache/base.py` 및 이전 사이클 구현 파일 전부.
-특히 `kv_packet_adapter.py`, `triattention_pre_rope_kv_selector_codec.py`,
-`attention_matching_closed_form_codec.py`, `dualpath_nic_load_balancer.py`,
-`runtime_certified_quant_codec.py`, `kvsculpt_distillation_codec.py` 등
-기존 단위·통합 테스트 회귀 없이 통과해야 한다.
+| `src/cache/segmented.py` | 변경 없음 — 기존 SegmentedHashCache 보존. IrminsulMLASegmentCache가 독립 클래스로 CacheStore 직접 구현 |
+| `tests/unit/test_compression_accuracy.py` | C-1 MLATwoAxisCompressionCodec 테스트 케이스 추가 (기존 케이스 보존) |
 
 ---
 
 ## 알고리즘 상세
 
-### VeriCacheSpeculativeCodec (Activity C — 최우선)
+### 1. CDC 청킹 (Content-Defined Chunking) — B-1, B-2 공통
 
 ```python
-# src/cache/vericache_speculative_codec.py
+def cdc_chunk(
+    token_ids: List[int],
+    avg_chunk_size: int = 256,
+    min_chunk_size: int = 64,
+    max_chunk_size: int = 1024,
+    window_size: int = 32,
+    modulus: int = 0,  # 0 → 자동 계산: avg_chunk_size - 1
+) -> List[List[int]]:
+    """Rabin 핑거프린트 기반 CDC 청킹.
 
-from __future__ import annotations
+    알고리즘:
+      1. modulus = avg_chunk_size - 1 (기본값)
+      2. 슬라이딩 윈도우(window_size 토큰)로 Rabin 핑거프린트 계산
+      3. fingerprint & modulus == 0 인 위치에서 청크 경계 설정
+      4. min_chunk_size / max_chunk_size 제약 적용
+      5. 마지막 청크: 남은 토큰 모두 포함
 
-import threading
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
-
-import torch
-import torch.nn.functional as F
-
-from src.cache.base import CacheStore
-
-
-# ---- 플러그인 압축 코덱 인터페이스 ----
-
-class DraftCodec:
-    """압축 KV 생성 플러그인 인터페이스. 교체 가능."""
-
-    def compress(self, kv: torch.Tensor) -> torch.Tensor:
-        """전체 KV를 압축. kv: [n_tokens, d_head] -> compressed (크기 감소)."""
-        raise NotImplementedError
-
-    def decompress(self, compressed_kv: torch.Tensor) -> torch.Tensor:
-        """압축 KV를 원본 공간으로 복원 (근사). 검증용이 아닌 드래프팅용."""
-        raise NotImplementedError
-
-    @property
-    def compression_ratio(self) -> float:
-        """압축 비율 (>= 1.0, 클수록 강한 압축)."""
-        raise NotImplementedError
-
-
-class Int8DraftCodec(DraftCodec):
-    """INT8 양자화 기반 드래프트 코덱.
-
-    압축: FP16 -> INT8 (2x 메모리 절감).
-    복원: INT8 -> FP32 (근사, 양자화 오류 존재 — VeriCache 검증 단계에서 교정됨).
-
-    Algorithm:
-      compress(kv):
-        scale = kv.abs().max() / 127.0 + eps
-        quantized = (kv / scale).round().clamp(-128, 127).to(torch.int8)
-        return quantized, scale  # (INT8 tensor, scale factor)
-
-      decompress(compressed_kv, scale):
-        return compressed_kv.float() * scale
+    Returns:
+      List of chunks, each chunk is a list of token IDs.
     """
-
-    def __init__(self, symmetric: bool = True) -> None:
-        self.symmetric = symmetric
-
-    def compress(self, kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (int8_tensor, scale)."""
-        scale = kv.float().abs().max() / 127.0 + 1e-8
-        quantized = (kv.float() / scale).round().clamp(-128, 127).to(torch.int8)
-        return quantized, scale
-
-    def decompress(self, compressed_kv: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        """Returns FP32 approximate tensor."""
-        quantized, scale = compressed_kv
-        return quantized.float() * scale
-
-    @property
-    def compression_ratio(self) -> float:
-        return 2.0  # FP16(2bytes) -> INT8(1byte)
-
-
-class TokenEvictionDraftCodec(DraftCodec):
-    """토큰 퇴거 기반 드래프트 코덱. 중요도 하위 토큰을 제거.
-
-    Algorithm:
-      compress(kv):  # kv: [n_tokens, d_head]
-        n_keep = max(1, int(n_tokens * keep_ratio))
-        importance = kv.float().norm(dim=-1)           # [n_tokens]
-        kept_idx = importance.topk(n_keep).indices.sort().values
-        return kv[kept_idx], kept_idx                  # (kept_kv, kept_indices)
-
-      decompress: 불완전 복원 (kept 토큰만 반환, 퇴거된 토큰은 0으로 패딩)
-      — VeriCache 검증 단계가 오류를 교정하므로 완전 복원 불필요.
-    """
-
-    def __init__(self, keep_ratio: float = 0.5) -> None:
-        self.keep_ratio = keep_ratio
-
-    def compress(self, kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (kept_kv [n_keep, d_head], kept_indices [n_keep])."""
-        n_tokens = kv.shape[0]
-        n_keep = max(1, int(n_tokens * self.keep_ratio))
-        importance = kv.float().norm(dim=-1)
-        kept_idx = importance.topk(n_keep).indices.sort().values
-        return kv[kept_idx], kept_idx
-
-    def decompress(self, compressed: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        """패딩으로 원본 크기 복원 (드래프팅 전용 근사)."""
-        kept_kv, kept_idx = compressed
-        return kept_kv  # 드래프팅 시 패딩 없이 kept 토큰만 사용
-
-    @property
-    def compression_ratio(self) -> float:
-        return 1.0 / self.keep_ratio
-
-
-# ---- 핵심 코덱 클래스 ----
-
-@dataclass
-class SpeculativeKVEntry:
-    """VeriCache KV 스토어 엔트리."""
-    segment_id: str
-    compressed_kv: object          # DraftCodec.compress() 반환값 (코덱 의존)
-    full_kv_ref: torch.Tensor      # 전체 KV (검증용, DRAM 오프로딩 시뮬레이션)
-    original_seq_len: int
-    original_d_head: int
-    draft_acceptance_rate: float = 0.0
-    n_draft_calls: int = 0
-    n_accepted: int = 0
-
-
-@dataclass
-class VerificationResult:
-    """드래프트-검증 비교 결과."""
-    accepted: bool                  # 드래프트가 전체 KV와 일치하는지
-    draft_output: torch.Tensor      # 압축 KV로 계산한 어텐션 출력 [n_q, d_head]
-    verified_output: torch.Tensor   # 전체 KV로 계산한 어텐션 출력 [n_q, d_head]
-    relative_error: float           # ||draft - full||_F / ||full||_F
-    acceptance_threshold: float     # 수락 판정 임계값
-
-
-@dataclass
-class VeriCacheConfig:
-    d_head: int = 128
-    draft_length: int = 4           # 드래프트 토큰 수 (1/2/4/8 스위프)
-    acceptance_threshold: float = 0.01   # relative_error < 이 값이면 드래프트 수락
-    max_entries: int = 512
-    enable_async_verify: bool = True     # 비동기 병렬 검증 활성화
-    seed: int = 42
-
-
-class VeriCacheSpeculativeCodec(CacheStore):
-    """VeriCache 투기적 드래프트-검증 KV 압축 코덱 (arXiv 2605.17613).
-
-    Activity C: KV Cache Compression — 결정론적 accuracy-preserving.
-
-    핵심 알고리즘:
-      드래프트 단계 (HBM-대역폭 바운드):
-        1. 압축 KV로 어텐션 출력 계산: draft_output = attention(Q, compressed_K, compressed_V)
-
-      검증 단계 (PCIe-바운드, 병렬 실행):
-        2. 전체 KV 비동기 로드 (DRAM 오프로딩 시뮬레이션)
-        3. 전체 KV로 검증: verified_output = attention(Q, full_K, full_V)
-        4. 수락 판정: if relative_error(draft, verified) < threshold → 드래프트 수락
-                      else → 검증 출력으로 교체 (결정론적 보장)
-
-      결정론적 정확도 보장:
-        - 수락된 토큰: draft_output ≈ verified_output (threshold 이내)
-        - 거부된 토큰: verified_output 그대로 사용 (전체 KV 정확도)
-        - 어떤 압축 코덱을 사용해도 출력은 전체 KV 추론 이상의 정확도 보장
-
-    CacheStore 인터페이스:
-      - put(key, value): 전체 KV를 저장하고 드래프트 코덱으로 압축본 생성
-      - get(key): 압축 KV 반환 (드래프팅용)
-      - draft_and_verify(key, Q): 드래프팅 + 검증 수행, VerificationResult 반환
-      - evict(): LRU 퇴거
-      - hit_rate(), memory_bytes(), reset_stats()
-
-    압축 코덱 플러그인:
-      - set_draft_codec(codec: DraftCodec): 드래프트 코덱 교체 (기본: Int8DraftCodec)
-      - 지원: Int8DraftCodec, TokenEvictionDraftCodec, 임의 DraftCodec 구현체
-    """
-
-    def __init__(self, config: VeriCacheConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        self._draft_codec: DraftCodec = Int8DraftCodec()
-        self._store: OrderedDict[str, SpeculativeKVEntry] = OrderedDict()
-        self._hits: int = 0
-        self._misses: int = 0
-        self._total_draft_calls: int = 0
-        self._total_accepted: int = 0
-        self._relative_errors: List[float] = []
-        self._verify_lock = threading.Lock()
-
-    def set_draft_codec(self, codec: DraftCodec) -> None:
-        """드래프트 코덱 교체. 이미 저장된 항목은 재압축하지 않음."""
-        self._draft_codec = codec
-
-    # ---- CacheStore 인터페이스 ----
-
-    def put(self, key: str, value: torch.Tensor) -> None:
-        """전체 KV를 저장하고 드래프트 코덱으로 압축본 생성.
-
-        Args:
-            key: 세그먼트 식별자
-            value: 전체 KV 텐서 [n_tokens, d_head] (K 또는 V 중 하나)
-        """
-        if key in self._store:
-            self._store.move_to_end(key)
-            return
-        if len(self._store) >= self.config.max_entries:
-            self.evict()
-        compressed = self._draft_codec.compress(value.detach().clone())
-        entry = SpeculativeKVEntry(
-            segment_id=key,
-            compressed_kv=compressed,
-            full_kv_ref=value.detach().clone(),
-            original_seq_len=value.shape[0],
-            original_d_head=value.shape[-1] if value.dim() >= 2 else self.config.d_head,
-        )
-        self._store[key] = entry
-
-    def put_kv_pair(
-        self,
-        key: str,
-        K: torch.Tensor,   # [n_tokens, d_head]
-        V: torch.Tensor,   # [n_tokens, d_head]
-    ) -> None:
-        """K와 V를 별도 키로 저장. 키 규약: key+'_K', key+'_V'.
-
-        VeriCache는 K와 V를 독립적으로 압축하고 검증한다.
-        """
-        self.put(key + "_K", K)
-        self.put(key + "_V", V)
-
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        """압축 KV를 복원해 반환 (드래프팅용 근사 텐서).
-
-        Returns:
-            approximate KV tensor (압축 오류 포함), 또는 None (미스)
-        """
-        if key not in self._store:
-            self._misses += 1
-            return None
-        self._store.move_to_end(key)
-        self._hits += 1
-        entry = self._store[key]
-        return self._draft_codec.decompress(entry.compressed_kv)
-
-    def draft_and_verify(
-        self,
-        key_K: str,       # K 텐서 키 (put_kv_pair 에서 key+'_K')
-        key_V: str,       # V 텐서 키 (put_kv_pair 에서 key+'_V')
-        Q: torch.Tensor,  # [n_q, d_head]
-    ) -> Optional[VerificationResult]:
-        """투기적 드래프팅 + 전체 KV 검증 수행.
-
-        Algorithm:
-          1. 압축 K/V 복원 (드래프트 단계)
-          2. 드래프트 어텐션 출력 계산
-          3. 전체 K/V로 검증 어텐션 출력 계산 (병렬 또는 순차)
-          4. relative_error 계산
-          5. threshold 비교 → 수락/거부 판정
-
-        Returns:
-            VerificationResult (accepted 여부 + 두 출력 모두 포함)
-            None: 키 미스 (전체 KV 추론으로 fallback 필요)
-        """
-        if key_K not in self._store or key_V not in self._store:
-            self._misses += 1
-            return None
-
-        self._hits += 1
-        entry_K = self._store[key_K]
-        entry_V = self._store[key_V]
-
-        # 드래프트 단계: 압축 KV로 어텐션 계산
-        draft_K = self._draft_codec.decompress(entry_K.compressed_kv)
-        draft_V = self._draft_codec.decompress(entry_V.compressed_kv)
-        draft_output = self._compute_attention(Q, draft_K, draft_V)
-
-        # 검증 단계: 전체 KV로 검증 (병렬 실행 시뮬레이션)
-        if self.config.enable_async_verify:
-            verified_output = self._async_verify(
-                Q, entry_K.full_kv_ref, entry_V.full_kv_ref
-            )
-        else:
-            verified_output = self._compute_attention(
-                Q, entry_K.full_kv_ref, entry_V.full_kv_ref
-            )
-
-        # relative_error 계산
-        rel_error = float(
-            (draft_output.float() - verified_output.float()).norm()
-            / (verified_output.float().norm() + 1e-8)
-        )
-
-        # 수락 판정
-        accepted = rel_error < self.config.acceptance_threshold
-
-        # 통계 업데이트
-        self._total_draft_calls += 1
-        if accepted:
-            self._total_accepted += 1
-        self._relative_errors.append(rel_error)
-
-        # 항목별 수락률 업데이트
-        with self._verify_lock:
-            entry_K.n_draft_calls += 1
-            entry_V.n_draft_calls += 1
-            if accepted:
-                entry_K.n_accepted += 1
-                entry_V.n_accepted += 1
-            entry_K.draft_acceptance_rate = (
-                entry_K.n_accepted / max(1, entry_K.n_draft_calls)
-            )
-            entry_V.draft_acceptance_rate = (
-                entry_V.n_accepted / max(1, entry_V.n_draft_calls)
-            )
-
-        return VerificationResult(
-            accepted=accepted,
-            draft_output=draft_output,
-            verified_output=verified_output,
-            relative_error=rel_error,
-            acceptance_threshold=self.config.acceptance_threshold,
-        )
-
-    def get_final_output(
-        self,
-        result: VerificationResult,
-    ) -> torch.Tensor:
-        """결정론적 최종 출력 선택.
-
-        수락된 경우: draft_output 반환 (검증 통과, threshold 이내)
-        거부된 경우: verified_output 반환 (전체 KV 정확도 보장)
-
-        이 함수가 VeriCache의 결정론적 accuracy-preserving 보장의 핵심이다.
-        어떤 압축 코덱을 사용해도 최종 출력은 전체 KV 추론 이상의 정확도를 보장한다.
-        """
-        return result.draft_output if result.accepted else result.verified_output
-
-    def evict(self) -> int:
-        """LRU 퇴거. 바이트 수 반환."""
-        if not self._store:
-            return 0
-        key, entry = next(iter(self._store.items()))
-        self._store.pop(key)
-        return entry.full_kv_ref.nbytes
-
-    def hit_rate(self) -> float:
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
-
-    def memory_bytes(self) -> int:
-        """압축 KV 메모리 (full_kv_ref는 DRAM 오프로딩으로 HBM에 없다고 가정)."""
-        total = 0
-        for entry in self._store.values():
-            compressed = entry.compressed_kv
-            if isinstance(compressed, tuple):
-                # (tensor, scale) 형태
-                for t in compressed:
-                    if isinstance(t, torch.Tensor):
-                        total += t.nbytes
-            elif isinstance(compressed, torch.Tensor):
-                total += compressed.nbytes
-        return total
-
-    def memory_bytes_full_kv(self) -> int:
-        """전체 KV 메모리 (DRAM 오프로딩 포함 — 참조용)."""
-        return sum(e.full_kv_ref.nbytes for e in self._store.values())
-
-    def memory_reduction_ratio(self) -> float:
-        """압축 KV 메모리 / 전체 KV 메모리 기준 감소율."""
-        compressed_bytes = self.memory_bytes()
-        full_bytes = self.memory_bytes_full_kv()
-        if full_bytes == 0:
-            return 0.0
-        return 1.0 - compressed_bytes / full_bytes
-
-    def draft_acceptance_rate(self) -> float:
-        """전체 드래프트 수락률 (높을수록 처리량 이점 증가)."""
-        if self._total_draft_calls == 0:
-            return 0.0
-        return self._total_accepted / self._total_draft_calls
-
-    def mean_relative_error(self) -> float:
-        """드래프트 어텐션 출력의 평균 relative_error."""
-        if not self._relative_errors:
-            return 0.0
-        return sum(self._relative_errors) / len(self._relative_errors)
-
-    def reset_stats(self) -> None:
-        self._hits = 0
-        self._misses = 0
-        self._total_draft_calls = 0
-        self._total_accepted = 0
-        self._relative_errors.clear()
-
-    def get_importance_mask(self, key: str) -> Optional[torch.Tensor]:
-        """압축 KV의 중요도 마스크. TokenEviction 코덱 사용 시 kept_indices 기반 마스크 반환."""
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        compressed = entry.compressed_kv
-        if isinstance(compressed, tuple) and len(compressed) == 2:
-            # TokenEvictionDraftCodec: (kept_kv, kept_indices)
-            _, kept_idx = compressed
-            if isinstance(kept_idx, torch.Tensor) and kept_idx.dtype == torch.long:
-                mask = torch.zeros(entry.original_seq_len, dtype=torch.bool)
-                mask[kept_idx] = True
-                return mask
-        return None
-
-    def speculative_stats(self) -> dict:
-        """JSON 기록용 투기적 실행 통계."""
-        return {
-            "draft_acceptance_rate": self.draft_acceptance_rate(),
-            "mean_relative_error": self.mean_relative_error(),
-            "total_draft_calls": self._total_draft_calls,
-            "total_accepted": self._total_accepted,
-            "hit_rate": self.hit_rate(),
-            "memory_reduction_ratio": self.memory_reduction_ratio(),
-            "compression_codec": type(self._draft_codec).__name__,
-            "compression_ratio": self._draft_codec.compression_ratio,
-            "n_entries": len(self._store),
-        }
-
-    # ---- 내부 헬퍼 ----
-
-    @staticmethod
-    def _compute_attention(
-        Q: torch.Tensor,   # [n_q, d_head]
-        K: torch.Tensor,   # [n_kv, d_head]
-        V: torch.Tensor,   # [n_kv, d_head]
-    ) -> torch.Tensor:
-        """스케일드 닷-프로덕트 어텐션. [n_q, d_head] 반환."""
-        scale = Q.size(-1) ** -0.5
-        scores = (Q.float() @ K.float().T) * scale   # [n_q, n_kv]
-        attn = F.softmax(scores, dim=-1)
-        return (attn @ V.float()).to(Q.dtype)
-
-    def _async_verify(
-        self,
-        Q: torch.Tensor,
-        full_K: torch.Tensor,
-        full_V: torch.Tensor,
-    ) -> torch.Tensor:
-        """전체 KV 검증 (현재 구현: 동기 시뮬레이션, 병렬화 의도 표시).
-
-        실제 GPU 환경에서는 CUDA Stream을 사용해 드래프팅과 병렬 실행:
-          stream_draft = torch.cuda.Stream()
-          stream_verify = torch.cuda.Stream()
-          with torch.cuda.stream(stream_draft): draft_output = compute_attention(Q, compressed_K, V)
-          with torch.cuda.stream(stream_verify): verified_output = compute_attention(Q, full_K, full_V)
-          torch.cuda.synchronize()
-
-        현재 구현(CPU/단순화): 순차 실행으로 동일 결과 보장.
-        """
-        return self._compute_attention(Q, full_K, full_V)
+    if modulus == 0:
+        modulus = avg_chunk_size - 1
+
+    chunks: List[List[int]] = []
+    start = 0
+    n = len(token_ids)
+    fp = 0
+    BASE = 31
+    MOD = 2**32
+
+    while start < n:
+        end = start
+        current_len = 0
+        while end < n:
+            # 슬라이딩 윈도우 Rabin 핑거프린트 업데이트
+            fp = (fp * BASE + token_ids[end]) % MOD
+            current_len += 1
+            end += 1
+            # 최소 길이 이상이고 핑거프린트 경계 조건 만족 시 분할
+            if current_len >= min_chunk_size and (fp & modulus) == 0:
+                break
+            # 최대 길이 도달 시 강제 분할
+            if current_len >= max_chunk_size:
+                break
+        chunks.append(token_ids[start:end])
+        start = end
+        fp = 0
+
+    return chunks
+
+
+def cdc_segment_key(chunk_tokens: List[int]) -> str:
+    """청크 콘텐츠의 SHA256 해시를 세그먼트 키로 반환 (위치-독립)."""
+    import hashlib, struct
+    raw = struct.pack(f"{len(chunk_tokens)}I", *chunk_tokens)
+    return hashlib.sha256(raw).hexdigest()
 ```
 
 ---
 
-### KVPacketCache (Activity B)
+### 2. IrminsulMLASegmentCache (Activity B-1) — `src/cache/irminsul_mla_segment_cache.py`
 
 ```python
-# src/cache/kv_packet.py
-
-from __future__ import annotations
-
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from src.cache.base import CacheStore
-
+@dataclass
+class IrminsulKVEntry:
+    segment_key: str          # SHA256(token_content) — 위치-독립 키
+    c_kv: torch.Tensor        # [n_tokens, d_c]  위치-자유 압축 표현
+    k_r: torch.Tensor         # [n_tokens, 64]   64-dim RoPE 성분
+    source_position: int      # 원래 저장 위치 오프셋 (δ 계산용)
+    n_tokens: int
+    layer_idx: int
 
 @dataclass
-class KVPacketConfig:
-    n_heads: int = 8
-    d_head: int = 128
-    n_adapter_tokens: int = 4       # 소프트-토큰 어댑터 토큰 수 (KV Packet 논문 기본값)
-    adapter_lr: float = 1e-4        # AdamW 학습률
-    adapter_steps: int = 100        # 어댑터 훈련 스텝
-    distillation_loss_threshold: float = 0.1   # 품질 낮은 패킷 퇴거 기준
-    max_packets: int = 512
+class IrminsulMLAConfig:
+    avg_chunk_size: int = 256     # YAML 외부화
+    min_chunk_size: int = 64
+    max_chunk_size: int = 1024
+    rope_base: float = 10000.0
+    k_r_dim: int = 64             # MLA k_r 차원 (DeepSeek 고정값)
+    max_entries: int = 2000
     seed: int = 42
 
 
-@dataclass
-class KVPacket:
-    """VeriCache 통합용 KV Packet.
+class IrminsulMLASegmentCache(CacheStore):
+    """MLA-native position-independent non-contiguous KV cache (Activity B-1).
 
-    kv_data: [n_tokens, 2, n_heads, d_head] FP16 불변 KV 블록
-    adapter_K: [n_adapter_tokens, n_heads, d_head] 소프트-토큰 K 어댑터
-    adapter_V: [n_adapter_tokens, n_heads, d_head] 소프트-토큰 V 어댑터
-    distillation_loss: 어댑터 훈련 손실 (퇴거 우선순위)
-    segment_id: 세그먼트 해시 키
-    """
-    segment_id: str
-    kv_data: torch.Tensor              # [n_tokens, 2, n_heads, d_head]
-    adapter_K: torch.Tensor            # [n_adapter_tokens, n_heads, d_head]
-    adapter_V: torch.Tensor            # [n_adapter_tokens, n_heads, d_head]
-    distillation_loss: float = 1.0
-    n_reuses: int = 0
+    CDC 청킹 + SHA256 콘텐츠 해시 키잉으로 세그먼트를 인덱싱한다.
+    재사용 시 k_r에만 δ-회전을 적용하고 c_kv는 그대로 재사용한다.
 
-
-class KVPacketCache(CacheStore):
-    """KV Packet (arXiv 2604.13226) 기반 제로-FLOPs 비연속 재사용 캐시.
-
-    VeriCache 통합 최적화 버전 (src/cache/kv_packet_adapter.py와 독립적).
-
-    핵심 차이점 (vs. kv_packet_adapter.py):
-      - get_for_vericache(): K와 V를 분리 반환해 VeriCacheSpeculativeCodec.put_kv_pair()에 직접 공급
-      - assemble_multi(): 다중 패킷 조합 시 어댑터 토큰을 경계 삽입해 불연속성 흡수
-      - n_adapter_tokens=4 (KV Packet 논문 기본값, kv_packet_adapter.py의 rank=8과 다름)
-      - 퇴거 정책: LRU + distillation_loss > threshold 우선 퇴거
-
-    put(key, value): kv_data [n_tokens, 2, n_heads, d_head] 저장, 어댑터 초기화
-    get(key): adapter 적용된 KV 반환 [n_adapter_tokens+n_tokens, 2, n_heads, d_head]
-    get_for_vericache(key): (K, V) tuple 반환 (VeriCache 통합용)
-    train_adapter(key, context_sample): 자기지도 증류로 어댑터 훈련 (재계산 FLOPs = 0)
-    assemble_multi(keys): 다중 패킷 비연속 조합
+    CacheStore 인터페이스 완전 구현.
     """
 
-    def __init__(self, config: KVPacketConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        self._store: OrderedDict[str, KVPacket] = OrderedDict()
-        self._hits: int = 0
-        self._misses: int = 0
-        self._noncontiguous_hits: int = 0
-        self._access_order: List[str] = []
+    def __init__(self, config: IrminsulMLAConfig) -> None: ...
 
-    # ---- CacheStore 인터페이스 ----
+    # CacheStore 추상 메서드
+    def put(self, key: str, value: torch.Tensor) -> None: ...
+    def get(self, key: str) -> Optional[torch.Tensor]: ...
+    def evict(self) -> int: ...
+    def hit_rate(self) -> float: ...
+    def memory_bytes(self) -> int: ...
+    def reset_stats(self) -> None: ...
 
-    def put(self, key: str, value: torch.Tensor) -> None:
-        """kv_data 저장 + 소프트-토큰 어댑터 초기화.
-
-        Args:
-            key: 세그먼트 식별자
-            value: kv_data [n_tokens, 2, n_heads, d_head] FP16
-        """
-        if key in self._store:
-            self._store.move_to_end(key)
-            return
-        if len(self._store) >= self.config.max_packets:
-            self.evict()
-        c = self.config
-        # 소프트-토큰 어댑터 초기화 (n_adapter_tokens × d_head)
-        adapter_K = torch.randn(c.n_adapter_tokens, c.n_heads, c.d_head) * 0.02
-        adapter_V = torch.randn(c.n_adapter_tokens, c.n_heads, c.d_head) * 0.02
-        packet = KVPacket(
-            segment_id=key,
-            kv_data=value.detach().clone().to(torch.float16),
-            adapter_K=adapter_K,
-            adapter_V=adapter_V,
-        )
-        self._store[key] = packet
-
-    def get(self, key: str) -> Optional[torch.Tensor]:
-        """어댑터 적용된 KV 반환 [n_adapter_tokens+n_tokens, 2, n_heads, d_head].
-
-        재계산 FLOPs = 0: 어댑터 가중치는 훈련 완료 후 조회만 수행.
-        """
-        if key not in self._store:
-            self._misses += 1
-            return None
-        self._store.move_to_end(key)
-        self._hits += 1
-        packet = self._store[key]
-        packet.n_reuses += 1
-        self._track_noncontiguous(key)
-        return self._apply_adapter(packet)
-
-    def get_for_vericache(
+    # MLA 전용 확장 메서드
+    def put_mla_segment(
         self,
-        key: str,
+        chunk_tokens: List[int],
+        c_kv: torch.Tensor,       # [n_tokens, d_c]
+        k_r: torch.Tensor,        # [n_tokens, k_r_dim]
+        source_position: int,
+        layer_idx: int = 0,
+    ) -> str:
+        """CDC 청크의 MLA KV를 저장하고 segment_key를 반환."""
+        ...
+
+    def get_mla_segment_with_delta_rotation(
+        self,
+        segment_key: str,
+        target_position: int,
+        layer_idx: int = 0,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """VeriCache 통합용 (K, V) 분리 반환.
+        """segment_key에 해당하는 (c_kv, k_r_corrected) 반환.
 
-        Returns:
-            (K [n_adapter_tokens+n_tokens, n_heads, d_head],
-             V [n_adapter_tokens+n_tokens, n_heads, d_head]) or None
+        k_r_corrected = apply_delta_rotation(k_r, delta=target_position - source_position)
+        c_kv는 위치-자유이므로 수정 없이 반환.
+        미스 시 None 반환.
         """
-        adapted = self.get(key)
-        if adapted is None:
-            return None
-        K = adapted[:, 0, :, :]   # [n_adapter_tokens+n_tokens, n_heads, d_head]
-        V = adapted[:, 1, :, :]
-        return K, V
+        ...
 
-    def evict(self) -> int:
-        """LRU + distillation_loss 우선 퇴거.
-
-        Algorithm:
-          1. distillation_loss > threshold 항목 중 LRU 우선 퇴거
-          2. 없으면 LRU 퇴거 (OrderedDict 첫 항목)
-        """
-        if not self._store:
-            return 0
-        # 품질 낮은 패킷 우선
-        threshold = self.config.distillation_loss_threshold
-        low_quality = [
-            k for k, p in self._store.items()
-            if p.distillation_loss > threshold
-        ]
-        evict_key = low_quality[0] if low_quality else next(iter(self._store))
-        packet = self._store.pop(evict_key)
-        return packet.kv_data.nbytes + packet.adapter_K.nbytes + packet.adapter_V.nbytes
-
-    def hit_rate(self) -> float:
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
-
-    def memory_bytes(self) -> int:
-        total = 0
-        for p in self._store.values():
-            total += p.kv_data.nbytes + p.adapter_K.nbytes + p.adapter_V.nbytes
-        return total
-
-    def reset_stats(self) -> None:
-        self._hits = 0
-        self._misses = 0
-        self._noncontiguous_hits = 0
-        self._access_order.clear()
-
-    # ---- KV Packet 전용 API ----
-
-    def train_adapter(
+    def get_segments_mla(
         self,
-        key: str,
-        context_kv: torch.Tensor,     # 레퍼런스 KV [m_ref, 2, n_heads, d_head]
-        n_steps: Optional[int] = None,
-        lr: Optional[float] = None,
-    ) -> float:
-        """자기지도 증류로 소프트-토큰 어댑터 훈련.
-
-        목표 함수 (KV Packet 논문 방식):
-          L_adapter = ||attn_output(kv_packet + adapter, q) - attn_output(kv_ref, q)||_F
-          q: context_kv에서 16개 랜덤 샘플링한 레퍼런스 쿼리
-
-        재계산 없음: adapter 파라미터만 업데이트. kv_data는 불변.
+        token_ids: List[int],
+        target_offset: int,
+        layer_idx: int = 0,
+    ) -> Tuple[List[Tuple[int, torch.Tensor, torch.Tensor]], List[List[int]]]:
+        """CDC 청킹 후 전체 청크를 조회.
 
         Returns:
-            최종 훈련 손실 (distillation_loss)
+          hits: [(chunk_local_idx, c_kv, k_r_corrected), ...]
+          miss_chunks: [[token_ids...], ...]  재계산 필요한 청크의 토큰 목록
         """
-        if key not in self._store:
-            return float("inf")
-        packet = self._store[key]
-        steps = n_steps or self.config.adapter_steps
-        learning_rate = lr or self.config.adapter_lr
+        ...
 
-        adapter_K = nn.Parameter(packet.adapter_K.float().clone())
-        adapter_V = nn.Parameter(packet.adapter_V.float().clone())
-        optimizer = torch.optim.AdamW([adapter_K, adapter_V], lr=learning_rate)
-
-        kv_data_f = packet.kv_data.float()
-        ctx_f = context_kv.float()
-
-        final_loss = float("inf")
-        for _ in range(steps):
-            # 레퍼런스 쿼리 16개 무작위 샘플링
-            n_ref = min(16, ctx_f.shape[0])
-            ref_idx = torch.randperm(ctx_f.shape[0])[:n_ref]
-            q_ref = ctx_f[ref_idx, 0, 0, :]   # K 채널 첫 헤드를 쿼리로 사용 [n_ref, d_head]
-
-            # 어댑터 적용 KV 조합: [n_adapter_tokens + n_tokens, n_heads, d_head]
-            full_K = torch.cat([adapter_K, kv_data_f[:, 0, :, :]], dim=0)
-            full_V = torch.cat([adapter_V, kv_data_f[:, 1, :, :]], dim=0)
-
-            # 레퍼런스 KV (어댑터 없음)
-            ref_K = ctx_f[:, 0, :, :]  # [m_ref_full, n_heads, d_head]
-            ref_V = ctx_f[:, 1, :, :]
-
-            # 어텐션 출력 비교 (첫 헤드만 사용해 속도 최적화)
-            pred_out = self._attn_single_head(q_ref, full_K[:, 0, :], full_V[:, 0, :])
-            target_out = self._attn_single_head(q_ref, ref_K[:, 0, :], ref_V[:, 0, :])
-
-            loss = F.mse_loss(pred_out, target_out)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            final_loss = float(loss.item())
-
-        packet.adapter_K = adapter_K.detach().to(packet.adapter_K.dtype)
-        packet.adapter_V = adapter_V.detach().to(packet.adapter_V.dtype)
-        packet.distillation_loss = final_loss
-        return final_loss
-
-    def assemble_multi(
-        self,
-        keys: List[str],
-    ) -> Optional[torch.Tensor]:
-        """다중 패킷 비연속 조합 (제로-FLOPs 재계산).
-
-        각 패킷 경계에 어댑터 토큰을 삽입해 컨텍스트 불연속성 흡수.
-
-        Returns:
-            조합된 KV [sum(n_adapter_tokens + n_tokens_i), 2, n_heads, d_head]
-            None: 어느 키라도 미스
-        """
-        parts: List[torch.Tensor] = []
-        for k in keys:
-            if k not in self._store:
-                return None
-            packet = self._store[k]
-            parts.append(self._apply_adapter(packet))
-        return torch.cat(parts, dim=0) if parts else None
-
-    def noncontiguous_hit_rate(self) -> float:
-        if self._hits == 0:
-            return 0.0
-        return self._noncontiguous_hits / self._hits
-
-    # ---- 내부 헬퍼 ----
-
-    def _apply_adapter(self, packet: KVPacket) -> torch.Tensor:
-        """소프트-토큰 어댑터를 KV 데이터 앞에 삽입. FLOPs = 행렬 조회 + 연결.
-
-        Returns [n_adapter_tokens + n_tokens, 2, n_heads, d_head].
-        """
-        c = self.config
-        # adapter_K/V: [n_adapter_tokens, n_heads, d_head] -> [n_adapter_tokens, 2, n_heads, d_head]
-        adapter_kv = torch.stack([packet.adapter_K, packet.adapter_V], dim=1)
-        return torch.cat([adapter_kv.to(packet.kv_data.dtype), packet.kv_data], dim=0)
-
-    def _track_noncontiguous(self, key: str) -> None:
-        """비연속 히트 추적."""
-        if self._access_order:
-            prev = self._access_order[-1]
-            keys_list = list(self._store.keys())
-            if key in keys_list and prev in keys_list:
-                if abs(keys_list.index(key) - keys_list.index(prev)) > 1:
-                    self._noncontiguous_hits += 1
-            else:
-                self._noncontiguous_hits += 1
-        self._access_order.append(key)
-
-    @staticmethod
-    def _attn_single_head(
-        Q: torch.Tensor,   # [n_q, d_head]
-        K: torch.Tensor,   # [n_kv, d_head]
-        V: torch.Tensor,   # [n_kv, d_head]
-    ) -> torch.Tensor:
-        """단일 헤드 스케일드 닷-프로덕트 어텐션."""
-        scale = Q.size(-1) ** -0.5
-        attn = F.softmax(Q @ K.T * scale, dim=-1)
-        return attn @ V
+    def noncontiguous_hit_rate(self) -> float: ...
 ```
 
 ---
 
-### SpeculativePacketPipeline (Cross-1, B+C)
+### 3. δ-회전 위치 수정 — B-1 핵심 알고리즘
 
 ```python
-# src/engine/speculative_packet_pipeline.py
+def apply_delta_rotation(
+    k_r: torch.Tensor,          # [n_tokens, k_r_dim]  k_r_dim = 64
+    delta: int,                  # target_position - source_position
+    rope_base: float = 10000.0,
+    k_r_dim: int = 64,
+) -> torch.Tensor:
+    """MLA k_r에 δ-회전을 적용해 위치 수정.
 
-from __future__ import annotations
+    수학적 근거 (Irminsul arXiv 2605.05696):
+      - RoPE 공식: k_r_pos[i] = k_r[i] * cos(pos * θ_i) - k_r_perp[i] * sin(pos * θ_i)
+      - k_r_perp: k_r의 각 pair에서 [-sin, cos] 성분 (직교 회전)
+      - δ-회전: source → target은 δ = target - source 만큼의 추가 회전
+        k_r_corrected[i] = k_r[i] * cos(δ * θ_i) - k_r_perp[i] * sin(δ * θ_i)
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+    알고리즘:
+      1. θ_i = rope_base^(-2i/k_r_dim), i = 0..k_r_dim//2 - 1
+      2. delta_angles = delta * θ_i  shape [k_r_dim//2]
+      3. cos_a = cos(delta_angles), sin_a = sin(delta_angles)
+      4. k_r를 [..., k_r_dim//2, 2] 형태로 reshape
+         (각 쌍 [k_r[2i], k_r[2i+1]])
+      5. 2D 회전 적용:
+         new_k_r[..., 0] = k_r[..., 0] * cos_a - k_r[..., 1] * sin_a
+         new_k_r[..., 1] = k_r[..., 0] * sin_a + k_r[..., 1] * cos_a
+      6. 결과를 [..., k_r_dim]으로 reshape
 
-import torch
-
-from src.cache.kv_packet import KVPacketCache, KVPacketConfig
-from src.cache.vericache_speculative_codec import (
-    VeriCacheSpeculativeCodec,
-    VeriCacheConfig,
-    Int8DraftCodec,
-    TokenEvictionDraftCodec,
-    VerificationResult,
-)
+    오버헤드: 64-dim × n_tokens 행렬 연산 → < 0.1ms/세그먼트 (CPU)
+    """
+    ...
 
 
+def assert_delta_rotation_correctness(
+    k_r_dim: int = 64,
+    rope_base: float = 10000.0,
+    rtol: float = 1e-4,
+    atol: float = 1e-4,
+) -> None:
+    """δ-회전 정확성 단위 테스트용 검증 함수.
+
+    검증 방법:
+      1. 임의의 source_position, target_position 설정
+      2. RoPE를 source_position에서 직접 적용한 k_r_at_source 계산
+      3. apply_delta_rotation(k_r_at_source, delta=target-source)로 수정
+      4. RoPE를 target_position에서 직접 적용한 k_r_at_target 계산
+      5. k_r_corrected ≈ k_r_at_target (rtol, atol 이내) 검증
+    assert torch.allclose(k_r_corrected, k_r_at_target, rtol=rtol, atol=atol)
+    """
+    ...
+```
+
+---
+
+### 4. ArchitectureAwareNonContiguousRouter (Activity B-1) — `src/cache/arch_aware_noncontiguous_router.py`
+
+```python
 @dataclass
-class SpeculativePacketPipelineConfig:
-    kv_packet_config: Optional[KVPacketConfig] = None
-    vericache_config: Optional[VeriCacheConfig] = None
-    use_token_eviction_codec: bool = False    # True: TokenEviction, False: INT8
-    token_eviction_keep_ratio: float = 0.5
-    seed: int = 42
+class ModelConfig:
+    """모델 아키텍처 설정 파라미터."""
+    model_name: str
+    kv_lora_rank: Optional[int] = None     # MLA 전용: c_KV 압축 랭크
+    qk_rope_head_dim: Optional[int] = None # MLA 전용: k_r 차원 (=64)
+    num_kv_heads: int = 8
+    d_head: int = 64
+    rope_base: float = 10000.0
 
 
-@dataclass
-class PipelineResult:
-    """B+C 파이프라인 실행 결과."""
-    segment_id: str
-    path: str                          # "b_hit_c_draft", "b_miss_fallback", "c_reject_verified"
-    final_output: torch.Tensor         # 최종 어텐션 출력 [n_q, d_head]
-    b_hit: bool                        # B: KV Packet 히트 여부
-    c_accepted: bool                   # C: VeriCache 드래프트 수락 여부
-    relative_error: Optional[float]    # VeriCache 검증 relative_error
-    memory_compressed_bytes: int       # C 압축 KV 메모리
-    noncontiguous_adapter_applied: bool
+def detect_attention_arch(model_config: ModelConfig) -> str:
+    """모델 설정에서 어텐션 아키텍처 유형 감지.
+
+    Returns: "MLA" | "GQA" | "MHA"
+
+    MLA 감지 조건:
+      model_config.kv_lora_rank is not None AND
+      model_config.qk_rope_head_dim is not None AND
+      model_config.qk_rope_head_dim == 64
+    GQA 감지 조건: num_kv_heads < num_q_heads (단순화: num_kv_heads <= 4)
+    MHA: 그 외
+    arch_registry.yaml의 model_name 매핑이 우선 적용됨.
+    """
+    ...
 
 
-class SpeculativePacketPipeline:
-    """KV Packet (B) + VeriCache Speculative Codec (C) 통합 B+C 파이프라인.
+class ArchitectureAwareNonContiguousRouter(CacheStore):
+    """MLA vs GQA/MHA 아키텍처에 따라 최적 비연속 재사용 경로를 선택하는 라우터.
 
-    통합 처리 흐름:
+    MLA 경로: IrminsulMLASegmentCache (δ-회전)
+    GQA/MHA 경로: RoPEReencodingNonContiguousCache (AdapShot RoPE 재인코딩)
 
-    Step 1 (B-1, 비연속 히트 감지):
-      KVPacketCache.get_for_vericache(segment_id)
-      → 히트: (K_packet, V_packet) 반환, 어댑터 적용 (FLOPs = 0)
-
-    Step 2 (C-1, VeriCache 저장):
-      히트 시: VeriCacheSpeculativeCodec.put_kv_pair(segment_id, K_packet, V_packet)
-      → 압축 KV 생성 + 전체 KV 참조 저장
-
-    Step 3 (C-1, 투기적 드래프팅):
-      VeriCacheSpeculativeCodec.draft_and_verify(key_K, key_V, Q)
-      → VerificationResult 반환
-
-    Step 4 (C-1, 결정론적 출력 선택):
-      VeriCacheSpeculativeCodec.get_final_output(result)
-      → 수락: draft_output (압축 KV 기반, threshold 이내)
-      → 거부: verified_output (전체 KV 기반, 결정론적 보장)
-
-    B 미스 시: 전체 KV 직접 계산으로 fallback (표준 어텐션 경로)
+    CacheStore 인터페이스 완전 구현.
     """
 
-    def __init__(self, config: SpeculativePacketPipelineConfig) -> None:
-        torch.manual_seed(config.seed)
-        kv_cfg = config.kv_packet_config or KVPacketConfig(seed=config.seed)
-        vc_cfg = config.vericache_config or VeriCacheConfig(seed=config.seed)
-        self.kv_packet_cache = KVPacketCache(kv_cfg)
-        self.vericache = VeriCacheSpeculativeCodec(vc_cfg)
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        mla_cache: IrminsulMLASegmentCache,
+        gqa_mha_cache: CacheStore,   # RoPEReencodingNonContiguousCache 또는 SegmentedHashCache
+    ) -> None: ...
 
-        # 압축 코덱 설정
-        if config.use_token_eviction_codec:
-            self.vericache.set_draft_codec(
-                TokenEvictionDraftCodec(config.token_eviction_keep_ratio)
-            )
-        else:
-            self.vericache.set_draft_codec(Int8DraftCodec())
+    # CacheStore 추상 메서드 — 내부적으로 아키텍처에 따라 위임
+    def put(self, key: str, value: torch.Tensor) -> None: ...
+    def get(self, key: str) -> Optional[torch.Tensor]: ...
+    def evict(self) -> int: ...
+    def hit_rate(self) -> float: ...
+    def memory_bytes(self) -> int: ...
+    def reset_stats(self) -> None: ...
 
-        self._pipeline_stats: List[dict] = []
+    @property
+    def arch(self) -> str:
+        """현재 모델의 감지된 아키텍처 유형."""
+        ...
 
-    def store_segment(
+    def get_segments_routed(
+        self,
+        token_ids: List[int],
+        target_offset: int,
+        layer_idx: int = 0,
+    ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
+        """아키텍처 감지 후 적절한 비연속 세그먼트 조회 경로를 선택.
+
+        MLA: IrminsulMLASegmentCache.get_segments_mla()
+        GQA/MHA: RoPEReencodingNonContiguousCache.get_segments_with_rope()
+        반환 형식: (hits, miss_chunk_indices) — SegmentedHashCache 호환
+        """
+        ...
+```
+
+---
+
+### 5. CDCContentHashSegmentIDInterface (Activity B-2) — `src/cache/cdc_content_hash_interface.py`
+
+```python
+@dataclass
+class SegmentMetadata:
+    segment_id: str                  # SHA256(CDC_chunk_token_bytes)
+    source_position: int
+    n_tokens: int
+    model_arch: str                  # "MLA" | "GQA" | "MHA"
+    storage_tier: str                # "HBM" | "DRAM" | "SSD" | "S3"
+    layer_idx: int = 0
+
+
+class CDCContentHashSegmentIDInterface:
+    """Irminsul(B-1) + ObjectCache(A-1) 통합 세그먼트 주소 체계.
+
+    통일 키: SegmentID = SHA256(CDC_chunk_token_bytes)
+    계층 조회 순서: HBM → DRAM → SSD → S3 → 재계산
+
+    S3 접근은 boto3 / minio 클라이언트로 추상화한다.
+    S3 엔드포인트는 configs/objectcache_breakeven_table.yaml에서 로드한다.
+    S3 접근 불가 환경에서는 S3 계층을 건너뛰고 재계산으로 fallback한다.
+    """
+
+    def __init__(
+        self,
+        hbm_cache: CacheStore,
+        dram_cache: Optional[CacheStore] = None,
+        ssd_cache: Optional[CacheStore] = None,
+        s3_client: Optional[object] = None,   # boto3.client('s3') 또는 None
+        s3_bucket: str = "kvcache",
+        model_name: str = "default",
+    ) -> None: ...
+
+    def lookup(
         self,
         segment_id: str,
-        kv_block: torch.Tensor,    # [n_tokens, 2, n_heads, d_head]
-    ) -> None:
-        """세그먼트를 KV Packet 캐시에 저장 (어댑터 초기화 포함)."""
-        self.kv_packet_cache.put(segment_id, kv_block)
-
-    def train_segment_adapter(
-        self,
-        segment_id: str,
-        context_kv: torch.Tensor,  # [m_ref, 2, n_heads, d_head]
-    ) -> float:
-        """어댑터 자기지도 증류 훈련. 저장 직후 1회 호출 권장."""
-        return self.kv_packet_cache.train_adapter(segment_id, context_kv)
-
-    def run(
-        self,
-        segment_id: str,
-        Q: torch.Tensor,            # [n_q, d_head]
-        fallback_K: Optional[torch.Tensor] = None,  # B 미스 시 폴백 K
-        fallback_V: Optional[torch.Tensor] = None,  # B 미스 시 폴백 V
-    ) -> PipelineResult:
-        """B+C 통합 파이프라인 실행.
-
-        Args:
-            segment_id: 세그먼트 식별자
-            Q: 쿼리 텐서 [n_q, d_head]
-            fallback_K/V: B 미스 시 사용할 전체 KV (None이면 빈 텐서 반환)
+        layer_idx: int = 0,
+    ) -> Tuple[Optional[torch.Tensor], str]:
+        """계층 순서대로 세그먼트 조회.
 
         Returns:
-            PipelineResult
+          (kv_tensor, tier_name): 히트한 계층 이름과 KV 텐서
+          (None, "miss"): 전 계층 미스
         """
-        key_K = segment_id + "_K"
-        key_V = segment_id + "_V"
+        ...
 
-        # Step 1: KV Packet 히트 확인
-        kv_pair = self.kv_packet_cache.get_for_vericache(segment_id)
+    def store(
+        self,
+        segment_id: str,
+        kv: torch.Tensor,
+        tier: str = "HBM",
+        layer_idx: int = 0,
+    ) -> None:
+        """지정 계층에 KV 저장."""
+        ...
 
-        if kv_pair is None:
-            # B 미스: 전체 KV 직접 계산으로 fallback
-            if fallback_K is not None and fallback_V is not None:
-                final_out = VeriCacheSpeculativeCodec._compute_attention(
-                    Q, fallback_K, fallback_V
-                )
-            else:
-                final_out = torch.zeros(Q.shape[0], Q.shape[-1], dtype=Q.dtype)
-            result = PipelineResult(
-                segment_id=segment_id,
-                path="b_miss_fallback",
-                final_output=final_out,
-                b_hit=False,
-                c_accepted=False,
-                relative_error=None,
-                memory_compressed_bytes=0,
-                noncontiguous_adapter_applied=False,
-            )
-            self._pipeline_stats.append({"path": "b_miss_fallback"})
-            return result
+    def s3_object_key(self, segment_id: str, layer_idx: int) -> str:
+        """S3 오브젝트 키 생성: f"{model_name}/{segment_id}_{layer_idx}.kvcache" """
+        ...
 
-        # Step 2: VeriCache에 패킷 KV 저장 (압축본 생성)
-        K_packet, V_packet = kv_pair
-        # 첫 헤드만 사용해 VeriCache에 저장 (단순화: n_heads 차원 평탄화)
-        K_2d = K_packet.reshape(K_packet.shape[0], -1)   # [n_tokens, n_heads*d_head]
-        V_2d = V_packet.reshape(V_packet.shape[0], -1)
-        self.vericache.put_kv_pair(segment_id, K_2d, V_2d)
+    @staticmethod
+    def make_segment_id(chunk_tokens: List[int]) -> str:
+        """CDC 청크 콘텐츠의 SHA256 해시를 segment_id로 반환."""
+        return cdc_segment_key(chunk_tokens)  # B-1의 함수 재사용
+```
 
-        # Step 3: 투기적 드래프팅 + 검증
-        Q_2d = Q.reshape(Q.shape[0], -1) if Q.dim() > 2 else Q
-        verify_result = self.vericache.draft_and_verify(key_K, key_V, Q_2d)
+---
 
-        if verify_result is None:
-            # 드래프팅 실패: fallback
-            final_out = torch.zeros(Q.shape[0], Q.shape[-1], dtype=Q.dtype)
-            result = PipelineResult(
-                segment_id=segment_id,
-                path="b_hit_c_miss_fallback",
-                final_output=final_out,
-                b_hit=True,
-                c_accepted=False,
-                relative_error=None,
-                memory_compressed_bytes=self.vericache.memory_bytes(),
-                noncontiguous_adapter_applied=True,
-            )
-            self._pipeline_stats.append({"path": "b_hit_c_miss_fallback"})
-            return result
+### 6. ObjectCacheS3TierRouter (Activity A-1) — `src/scheduler/objectcache_s3_tier_router.py`
 
-        # Step 4: 결정론적 출력 선택
-        final_out = self.vericache.get_final_output(verify_result)
-        path = (
-            "b_hit_c_draft"
-            if verify_result.accepted
-            else "c_reject_verified"
-        )
+```python
+@dataclass
+class S3TierConfig:
+    """ObjectCache S3 티어 라우터 설정."""
+    context_lengths: List[int]         # [4096, 8192, 16384, 32768, 65536]
+    breakeven_table: Dict[int, float]  # {context_length: hit_rate_breakeven}
+    hysteresis_band: float = 0.05
+    ema_gamma: float = 0.9
+    max_s3_requests_per_batch: int = 4
+    s3_enabled_by_default: bool = False  # 테스트 환경에서 False
+    rdma_bandwidth_gbps: float = 100.0   # RoCE 100 Gbps
 
-        result = PipelineResult(
-            segment_id=segment_id,
-            path=path,
-            final_output=final_out.reshape(Q.shape[0], -1),
-            b_hit=True,
-            c_accepted=verify_result.accepted,
-            relative_error=verify_result.relative_error,
-            memory_compressed_bytes=self.vericache.memory_bytes(),
-            noncontiguous_adapter_applied=True,
-        )
-        self._pipeline_stats.append({
-            "path": path,
-            "c_accepted": verify_result.accepted,
-            "relative_error": verify_result.relative_error,
-        })
-        return result
 
-    def pipeline_summary(self) -> dict:
-        """JSON 기록용 파이프라인 통계."""
-        if not self._pipeline_stats:
-            return {}
-        b_hits = [s for s in self._pipeline_stats if s["path"] != "b_miss_fallback"]
-        c_drafts = [s for s in self._pipeline_stats if s.get("c_accepted") is True]
-        return {
-            "total_runs": len(self._pipeline_stats),
-            "b_hit_rate": len(b_hits) / max(1, len(self._pipeline_stats)),
-            "c_draft_acceptance_rate": self.vericache.draft_acceptance_rate(),
-            "mean_relative_error": self.vericache.mean_relative_error(),
-            "kv_packet_hit_rate": self.kv_packet_cache.hit_rate(),
-            "noncontiguous_hit_rate": self.kv_packet_cache.noncontiguous_hit_rate(),
-            "vericache_memory_reduction": self.vericache.memory_reduction_ratio(),
-            **self.vericache.speculative_stats(),
-        }
+class ObjectCacheS3TierRouter(BaseScheduler):
+    """S3 오브젝트 스토리지 4번째 KV 계층 브레이크이븐 기반 동적 라우터.
+
+    브레이크이븐 히트율 수식:
+      hit_rate_breakeven = T_recompute / (T_recompute + T_s3)
+
+    EMA 히트율 갱신:
+      hit_rate_ema = γ × current_hit_rate + (1 - γ) × hit_rate_ema
+
+    S3 티어 활성화 조건:
+      hit_rate_ema ≥ breakeven(context_length) + hysteresis_band
+
+    S3 티어 비활성화 조건:
+      hit_rate_ema < breakeven(context_length) - hysteresis_band
+
+    스케줄링 결정 단위: 요청(request) 단위.
+    캐시 상태 접근: CDCContentHashSegmentIDInterface.lookup() 결과를
+      배치 처리 전에 확인해 S3 라우팅 여부 결정.
+    """
+
+    def __init__(
+        self,
+        config: S3TierConfig,
+        segment_interface: CDCContentHashSegmentIDInterface,
+    ) -> None: ...
+
+    def schedule(self, requests: List[InferenceRequest]) -> List[InferenceRequest]:
+        """요청 목록을 받아 S3 라우팅 여부를 결정하고 재정렬.
+
+        1. 각 요청에 대해 context_length 기반 breakeven_table 조회
+        2. EMA 히트율과 브레이크이븐 비교로 s3_tier_active 플래그 설정
+        3. 배치 내 S3 요청 수 상한(max_s3_requests_per_batch) 적용
+        4. S3 라우팅 요청에 InferenceRequest.metadata["s3_tier"] = True 설정
+        5. 재정렬: S3 미라우팅 요청 먼저 처리 (캐시 워밍 효과)
+        """
+        ...
+
+    def update_hit_rate_ema(self, current_hit_rate: float) -> None:
+        """EMA 히트율 갱신. O(1)."""
+        ...
+
+    def compute_breakeven_hit_rate(
+        self,
+        t_recompute_ms: float,
+        t_s3_ms: float,
+    ) -> float:
+        """브레이크이븐 히트율 계산.
+        hit_rate_breakeven = t_recompute / (t_recompute + t_s3)
+        """
+        ...
+
+    def get_breakeven_for_context(self, context_length: int) -> float:
+        """컨텍스트 길이에 따른 브레이크이븐 히트율 조회 (룩업 테이블)."""
+        ...
+
+    @property
+    def s3_tier_active(self) -> bool:
+        """현재 S3 티어 활성화 여부."""
+        ...
+```
+
+---
+
+### 7. IrminsulObjectCachePipeline (Cross-1, A+B) — `src/engine/irminsul_objectcache_pipeline.py`
+
+```python
+class IrminsulObjectCachePipeline:
+    """Irminsul(B-1) + ObjectCache(A-1) A+B 통합 파이프라인.
+
+    처리 흐름:
+      Step 1 (B-1): CDC 청킹 + segment_id = SHA256(chunk_tokens)
+      Step 2 (B-2): CDCContentHashSegmentIDInterface.lookup(segment_id)
+                    → HBM/DRAM/SSD 히트 시 즉시 반환
+      Step 3 (A-1): S3 전체 미스 시 ObjectCacheS3TierRouter가 브레이크이븐 확인
+                    → 활성화 시 S3 모의 조회 (실제 환경: layerwise RDMA)
+      Step 4 (B-1): MLA 모델: apply_delta_rotation(k_r, delta) → 위치 수정
+                    GQA/MHA: AdapShot RoPE 재인코딩 fallback
+      Step 5: 수정된 (c_kv, k_r_corrected) 반환 → 어텐션 입력
+
+    InferenceRunner와 호환: get_segments() API 구현으로
+    runner.py의 `if hasattr(cache, "get_segments")` 분기에서 동작.
+    """
+
+    def __init__(
+        self,
+        arch_router: ArchitectureAwareNonContiguousRouter,
+        s3_router: ObjectCacheS3TierRouter,
+        segment_interface: CDCContentHashSegmentIDInterface,
+        config: IrminsulObjectCachePipelineConfig,
+    ) -> None: ...
+
+    def get_segments(
+        self,
+        token_ids: List[int],
+        layer_idx: int = 0,
+    ) -> Tuple[List[Tuple[int, torch.Tensor]], List[int]]:
+        """InferenceRunner 호환 API.
+        SegmentedHashCache.get_segments()와 동일한 반환 형식.
+        """
+        ...
+
+    def put_segment(
+        self,
+        token_ids: List[int],
+        chunk_idx: int,
+        kv: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> None:
+        """InferenceRunner 호환 API."""
+        ...
+```
+
+---
+
+### 8. MLATwoAxisCompressionCodec (Activity C-1, 선택적) — `src/cache/mla_two_axis_compression_codec.py`
+
+```python
+@dataclass
+class MLATwoAxisConfig:
+    depth_sharing_threshold: float = 0.90  # 레이어 간 c_KV 유사도 임계값
+    depth_sharing_k: int = 2               # k=2이면 50% 레이어 공유
+    position_dedup_enabled: bool = True    # 위치 축 중복 제거
+    fallback_threshold: float = 0.95       # accuracy delta > 1% 시 상향값
+
+
+class MLATwoAxisCompressionCodec(CacheStore):
+    """MLA c_KV 위치 축(Irminsul 재사용 지분) × 깊이 축(레이어 공유) 2축 압축 코덱.
+
+    위치 축 압축:
+      - 에이전틱 세션에서 동일 segment_id의 c_KV는 포인터만 유지 (중복 제거)
+      - c_KV 위치-자유성으로 정확도 손실 없음 (수학적 보장)
+
+    깊이 축 압축:
+      - cos_sim(c_kv[l], c_kv[l-1]) >= depth_sharing_threshold 이면
+        레이어 l의 c_KV를 레이어 l-1로 공유 (포인터)
+      - 임계값 이하 레이어는 독립 유지
+
+    2축 결합 절감율:
+      total_reduction = 1 - (1 - pos_reduction) × (1 - depth_reduction)
+
+    accuracy-preserving 설계:
+      - 위치 축: c_KV 위치-자유성으로 수학적 무손실
+      - 깊이 축: 유사도 임계값 ≥ 0.90에서만 공유
+      - Fallback: accuracy delta > 1% 시 depth_sharing_threshold → fallback_threshold
+
+    CacheStore 인터페이스 완전 구현.
+    """
+
+    def __init__(
+        self,
+        base_cache: IrminsulMLASegmentCache,
+        config: MLATwoAxisConfig,
+    ) -> None: ...
+
+    # CacheStore 추상 메서드
+    def put(self, key: str, value: torch.Tensor) -> None: ...
+    def get(self, key: str) -> Optional[torch.Tensor]: ...
+    def evict(self) -> int: ...
+    def hit_rate(self) -> float: ...
+    def memory_bytes(self) -> int: ...
+    def reset_stats(self) -> None: ...
+
+    def compress_layer_kv(
+        self,
+        c_kv_by_layer: Dict[int, torch.Tensor],
+    ) -> Tuple[Dict[int, torch.Tensor], float]:
+        """레이어별 c_KV 딕셔너리를 깊이 축 공유로 압축.
+
+        Returns:
+          compressed: 중복 제거된 레이어 → c_KV 매핑 (포인터 기반)
+          depth_reduction: 절감율 (0.0~1.0)
+        """
+        ...
+
+    def depth_sharing_reduction_rate(
+        self,
+        c_kv_by_layer: Dict[int, torch.Tensor],
+    ) -> float:
+        """현재 레이어 KV 세트에서의 깊이 축 절감율 계산."""
+        ...
 ```
 
 ---
 
 ## Activity C — Accuracy Preservation 검증 계획
 
-Activity C를 포함하므로 반드시 작성한다.
+(Activity C-1 `MLATwoAxisCompressionCodec` 포함)
 
-### C-1: VeriCacheSpeculativeCodec — 결정론적 ±0.0% 보장 메커니즘
+### perplexity 측정
 
-**perplexity 측정**:
-- **데이터셋**: WikiText-2 합성 proxy (`torch.randn`으로 FP32 synthetic Q/K/V 텐서 생성)
-- **측정 방법**:
-  ```python
-  # src/metrics/perplexity.py의 attention_output_relative_error() 사용
-  # 1. 전체 KV로 어텐션 출력 계산
-  out_full = compute_attention_output(Q, K_full, V_full)         # [n_q, d_head]
-  # 2. 압축 KV로 드래프트 어텐션 출력 계산
-  out_draft = compute_attention_output(Q, K_compressed, V_compressed)
-  # 3. relative_error
-  rel_error = ||out_full - out_draft||_F / ||out_full||_F
-  # 4. VeriCache 최종 출력 (수락/거부 후)
-  result = codec.draft_and_verify(key_K, key_V, Q)
-  out_final = codec.get_final_output(result)
-  final_error = ||out_full - out_final||_F / ||out_full||_F
-  ```
-- **허용 오차**: `final_error < 0.01` (MANDATORY) — 결정론적 보장
-  - 드래프트 수락 시: `relative_error < acceptance_threshold (0.01)` 이므로 자동 만족
-  - 드래프트 거부 시: `out_final = out_full` → `final_error = 0.0` (수학적 동일)
-- **테스트 설정**: n_q=8, d_head=64, N=128, acceptance_threshold=0.01
+- **데이터셋**: WikiText-2 (test split, 2,048 토큰 시퀀스 단위)
+- **모델**: DeepSeek-V2-Lite 또는 동등 MLA 모델 (테스트 환경에서는 d_c=512, k_r_dim=64 합성 모델)
+- **허용 오차**: perplexity 변화 ±1% 이내
+- **비교 기준**:
+  - Baseline: 압축 없는 전체 c_KV
+  - 위치 축 단독 (position_dedup_enabled=True, depth_sharing_threshold=1.0)
+  - 깊이 축 단독 (position_dedup_enabled=False, depth_sharing_threshold=0.90)
+  - 2축 결합 (position_dedup_enabled=True, depth_sharing_threshold=0.90)
 
-**태스크 정확도 측정**:
-- **AIME25 proxy**: cosine_similarity(out_final, out_full) >= 0.99 (MANDATORY)
-- **LongBench 8개 서브태스크 proxy**: 8개 독립 synthetic 시퀀스에서 각각 cosine_similarity >= 0.99
-- **결정론적 동일 출력 확인**: `assert_deterministic_output()` 단위 테스트
-  - 거부된 드래프트의 최종 출력 = 전체 KV 어텐션 출력 (float 비교 가능 수준)
+### 태스크 정확도 측정
 
-**드래프트 수락률 측정** (처리량 예측 핵심):
-- **코덱별 수락률 sweep**:
-  - `Int8DraftCodec`: 예상 수락률 0.7~0.9 (INT8 양자화 오류 작음)
-  - `TokenEvictionDraftCodec(keep_ratio=0.5)`: 예상 수락률 0.5~0.7
-  - `TokenEvictionDraftCodec(keep_ratio=0.3)`: 예상 수락률 0.3~0.5
-- **드래프트 길이 sweep**: draft_length ∈ {1, 2, 4, 8} 별 수락률 및 처리량 곡선
-- **acceptance_threshold sweep**: threshold ∈ {0.001, 0.005, 0.01, 0.02, 0.05} 별 수락률
+- **벤치마크**: LongBench 8개 서브태스크 (NarrativeQA, Qasper, MultiFieldQA-EN/ZH, HotpotQA, 2WikiMultihopQA, GovReport, QMSum 등)
+- **허용 오차**: ±1% 이내
+- **에이전틱 세션 반복 토큰 비율 측정**: 위치 축 절감율 실측 (목표: 에이전틱 세션에서 최대 48%)
 
-**추가 검증 실험**:
-1. 결정론적 보장 확인: 거부된 드래프트에서 `out_final == out_full` (fp32 기준 max_diff < 1e-5)
-2. 메모리 감소율: `memory_reduction_ratio()` INT8 기준 ~50%, TokenEviction(0.5) ~50%
-3. 수락률 vs. 처리량 트레이드오프 곡선 (acceptance_rate × draft_length 복합 효과)
+### depth_sharing_threshold 스윕
 
-**검증 테스트 파일**: `tests/unit/test_compression_accuracy.py` (C-1 VeriCache 케이스 추가)
+- threshold ∈ {0.85, 0.90, 0.95, 1.00}
+- 각 threshold에서 (memory_reduction, perplexity_delta, task_accuracy_delta) 3-way 측정
+- accuracy delta > 1% 감지 시 threshold를 fallback_threshold(0.95)로 자동 상향
 
----
+### Fallback 메커니즘
 
-### 검증 불변 조건 (VeriCache 수학적 보장)
+```python
+def auto_adjust_threshold(
+    self,
+    accuracy_delta: float,
+    max_allowed_delta: float = 0.01,
+) -> bool:
+    """accuracy delta > 1% 시 depth_sharing_threshold를 fallback_threshold로 상향.
+    Returns True if threshold was adjusted.
+    """
+    if abs(accuracy_delta) > max_allowed_delta:
+        self.config.depth_sharing_threshold = self.config.fallback_threshold
+        return True
+    return False
+```
 
-VeriCache의 accuracy-preserving 보장은 다음 불변 조건에서 도출된다:
+### 검증 테스트 파일
 
-1. **수락 경로**: `relative_error(draft_output, verified_output) < threshold`이므로
-   최종 출력 오류 ≤ threshold (기본 0.01 = 1%) — 허용 오차 ±1% 이내 보장.
+`tests/unit/test_compression_accuracy.py` — 기존 파일에 다음 케이스 추가:
 
-2. **거부 경로**: `final_output = verified_output = attention(Q, K_full, V_full)` — 전체 KV
-   어텐션과 수학적으로 동일. 오류 = 0.0%.
+```python
+def test_mla_two_axis_position_axis_lossless():
+    """위치 축 중복 제거가 정확도 손실 없음을 검증 (c_KV 위치-자유성 수학적 보장)."""
+    ...  # 동일 segment_id의 c_KV 두 번 저장 시 포인터만 추가, 텐서 동일
 
-3. **결합 보장**: 수락 여부와 무관하게 `relative_error(final_output, full_kv_output) < threshold`
-   — 드래프트 코덱의 압축 품질에 완전히 독립적.
+def test_mla_two_axis_depth_axis_cosine_threshold():
+    """깊이 축: cos_sim >= 0.90 레이어만 공유, 이하 독립 유지."""
+    ...
 
-따라서 `acceptance_threshold = 0.01`로 설정 시 항상 ±1% 이내 보장 (결정론적).
-이 보장은 테스트 케이스 `test_vericache_deterministic_guarantee()`에서 검증한다.
+def test_mla_two_axis_combined_reduction():
+    """2축 결합 절감율이 위치 축 × 깊이 축 곱연산과 일치."""
+    ...
+
+def test_mla_two_axis_fallback_threshold():
+    """accuracy delta > 1% 시 threshold 자동 상향 동작 검증."""
+    ...
+```
 
 ---
 
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-25.yaml
+# configs/experiments/2026-05-26.yaml
 experiment:
-  date: "2026-05-25"
-  activity: "B+C"
-  description: >
-    C-1 VeriCacheSpeculativeKVDraftVerifyLosslessCodec (투기적 드래프트-검증 결정론적 무손실 코덱,
-    결정론적 ±0.0% accuracy 보장) + B-1 KVPacketSoftTokenAdapterZeroFLOPsNonContiguousCache
-    (소프트-토큰 어댑터 자기지도 증류 제로-FLOPs 비연속 재사용) +
-    Cross-1 SpeculativePacketPipeline (B+C 통합 파이프라인).
-    VeriCache (arXiv 2605.17613) + KV Packet (arXiv 2604.13226) 기반.
-  cache_type: vericache_speculative_codec
-  compression_method: speculative_draft_verify
-  scheduler_type: default
+  date: "2026-05-26"
+  activity: "A+B+C_synergy"
+  cache_type: "irminsul_mla_arch_aware"
+  compression_method: "mla_two_axis"   # Activity C 시너지
+  scheduler_type: "objectcache_s3_tier"
 
-vericache_speculative:  # C-1
-  d_head: 128
-  draft_length: 4
-  acceptance_threshold: 0.01         # ±1% 이내 결정론적 보장
-  max_entries: 512
-  enable_async_verify: true
+# Activity B-1 Irminsul MLA 설정
+irminsul_mla:
+  avg_chunk_size: 256
+  min_chunk_size: 64
+  max_chunk_size: 1024
+  rope_base: 10000.0
+  k_r_dim: 64
+  max_entries: 2000
   seed: 42
 
-kv_packet:  # B-1
-  n_heads: 8
-  d_head: 128
-  n_adapter_tokens: 4
-  adapter_lr: 0.0001
-  adapter_steps: 100
-  distillation_loss_threshold: 0.1
-  max_packets: 512
-  seed: 42
+# Activity A-1 ObjectCache S3 브레이크이븐 설정
+objectcache_s3_tier:
+  context_lengths: [4096, 8192, 16384, 32768, 65536]
+  hysteresis_band: 0.05
+  ema_gamma: 0.9
+  max_s3_requests_per_batch: 4
+  s3_enabled_by_default: false  # 테스트 환경 기본값
+  rdma_bandwidth_gbps: 100.0
 
-speculative_packet_pipeline:  # Cross-1
-  use_token_eviction_codec: false   # INT8 기본
-  token_eviction_keep_ratio: 0.5
-  seed: 42
-
-benchmark:
-  accuracy:
-    method: "attention_output_proxy"
-    dataset_proxy: "wikitext2_synthetic"
-    task_accuracy_proxy: "cosine_similarity"
-    acceptance_threshold: 0.01             # ±1% MANDATORY
-    relative_error_max: 0.01               # MANDATORY
-    cosine_similarity_min: 0.99            # MANDATORY
-    draft_length_sweep: [1, 2, 4, 8]
-    codec_sweep:
-      - type: "int8"
-      - type: "token_eviction"
-        keep_ratio: 0.5
-      - type: "token_eviction"
-        keep_ratio: 0.3
-    acceptance_threshold_sweep: [0.001, 0.005, 0.01, 0.02, 0.05]
-    longbench_subtask_count: 8
-  activity_b:
-    noncontiguous_hit_rate_min: 0.30       # 전체 히트의 30% 이상
-    cache_hit_rate_improvement_min_pct: 5.0
-  activity_c:
-    memory_reduction_min_ratio: 0.30       # -30% 이상 (MANDATORY)
-    effective_context_multiplier: 2.0      # 동일 메모리 2x 이상
-    compression_overhead_ttft_max_pct: 10.0
-  cross_bc:
-    pipeline_cosine_min: 0.99             # MANDATORY
-    combined_noncontiguous_hit_rate_min: 0.30
-
-seed: 42
-results_dir: "results/2026-05-25"
+# Activity C-1 MLA 2축 압축 설정 (선택적)
+mla_two_axis:
+  depth_sharing_threshold: 0.90
+  depth_sharing_k: 2
+  position_dedup_enabled: true
+  fallback_threshold: 0.95
+  max_allowed_accuracy_delta: 0.01
 ```
 
 ```yaml
-# configs/vericache_speculative_policy.yaml
-acceptance_threshold: 0.01
-draft_length: 4
-draft_codecs:
-  - type: "int8"
-    compression_ratio: 2.0
-  - type: "token_eviction"
-    keep_ratio: 0.5
-    compression_ratio: 2.0
-  - type: "token_eviction"
-    keep_ratio: 0.3
-    compression_ratio: 3.33
-enable_async_verify: true
-auto_codec_selection:
-  enabled: false
-  acceptance_rate_threshold: 0.70       # 수락률 < 0.70 시 더 정확한 코덱으로 전환
+# configs/arch_registry.yaml
+architectures:
+  - model_pattern: "deepseek-v2*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "deepseek-v3*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "kimi*"
+    arch: "MLA"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+  - model_pattern: "llama*"
+    arch: "GQA"
+  - model_pattern: "gpt*"
+    arch: "MHA"
+  - model_pattern: "default"
+    arch: "MHA"
 ```
 
 ```yaml
-# configs/kv_packet_adapter_policy.yaml
-n_adapter_tokens: 4
-adapter_lr: 0.0001
-adapter_steps: 100
-distillation_loss_threshold: 0.1
-eviction_policy: "lru_plus_low_quality"   # LRU + distillation_loss 우선 퇴거
-zero_flops_verify: true                   # 재계산 FLOPs = 0 검증 활성화
+# configs/objectcache_breakeven_table.yaml
+# T_recompute / (T_recompute + T_s3) per context length
+# 값은 objectcache_breakeven_calibration.py로 측정해 채운다.
+# 테스트 환경 기본값 (ObjectCache 원논문 5.6% TTFT 기준 역산):
+breakeven_table:
+  4096:  0.15
+  8192:  0.18
+  16384: 0.22
+  32768: 0.28
+  65536: 0.35
+
+s3_endpoint: "http://localhost:9000"   # MinIO 테스트 엔드포인트
+s3_bucket: "kvcache"
+rdma_target: "gpu-node-0"
 ```
 
 ---
 
 ## 테스트 요구사항
 
-- [ ] `tests/unit/test_vericache_speculative_codec.py`
-  - `Int8DraftCodec.compress()`: int8 텐서 반환, scale 양수
-  - `Int8DraftCodec.decompress()`: float 복원, shape 동일
-  - `TokenEvictionDraftCodec.compress()`: kept_kv shape [n_keep, d_head], n_keep = max(1, int(N * keep_ratio))
-  - `VeriCacheSpeculativeCodec.put()`: 엔트리 저장 확인
-  - `VeriCacheSpeculativeCodec.get()`: 근사 텐서 반환 (shape 동일, dtype 일치)
-  - `VeriCacheSpeculativeCodec.put_kv_pair()`: key+'_K', key+'_V' 별도 저장 확인
-  - `VeriCacheSpeculativeCodec.draft_and_verify()`: VerificationResult 반환, accepted bool 확인
-  - `test_vericache_deterministic_guarantee()`:
-    - 거부된 드래프트: `final_output == verified_output` (max_diff < 1e-5)
-    - relative_error < acceptance_threshold 인 경우 accepted=True 확인
-    - 최종 출력 `relative_error(final_output, full_kv_output) <= acceptance_threshold` 보장
-  - `VeriCacheSpeculativeCodec.evict()`: LRU 퇴거, bytes 반환
-  - `VeriCacheSpeculativeCodec.hit_rate()`: 히트율 계산
-  - `VeriCacheSpeculativeCodec.memory_bytes()`: 압축 KV 메모리 (전체 KV 제외)
-  - `VeriCacheSpeculativeCodec.memory_reduction_ratio()`: 0.0~1.0 범위
-  - `VeriCacheSpeculativeCodec.set_draft_codec()`: 코덱 교체 후 동작 확인
-  - `VeriCacheSpeculativeCodec.get_importance_mask()`: TokenEviction 코덱 시 bool 마스크 반환
-  - `VeriCacheSpeculativeCodec.reset_stats()`: 카운터 초기화
-  - CacheStore 추상 메서드 전체 구현 확인
+### 필수 단위 테스트
 
-- [ ] `tests/unit/test_kv_packet.py`
-  - `KVPacketCache.put()`: 패킷 저장, adapter_K/V 초기화 (shape [n_adapter_tokens, n_heads, d_head])
-  - `KVPacketCache.get()`: 어댑터 적용 KV 반환, shape [n_adapter_tokens+n_tokens, 2, n_heads, d_head]
-  - `KVPacketCache.get_for_vericache()`: (K, V) tuple 반환, shape [n_adapter_tokens+n_tokens, n_heads, d_head]
-  - `KVPacketCache.get()` 재계산 FLOPs = 0 확인:
-    - `torch.autograd.profiler`로 backward pass 없음 확인
-    - 또는 `torch.no_grad()` 래핑 확인
-  - `KVPacketCache.train_adapter()`: distillation_loss 감소 확인 (100 스텝 후 < 초기값)
-  - `KVPacketCache.evict()`: distillation_loss > threshold 우선 퇴거, LRU fallback
-  - `KVPacketCache.assemble_multi()`: 다중 키 조합, 총 shape 합산 확인
-  - `KVPacketCache.assemble_multi()` 하나라도 미스 시 None 반환
-  - `KVPacketCache.hit_rate()`, `memory_bytes()`, `reset_stats()`
-  - `KVPacketCache.noncontiguous_hit_rate()`: 비연속 패턴 히트 추적
-  - CacheStore 추상 메서드 전체 구현 확인
-  - `n_adapter_tokens=4` 기본값 검증 (kv_packet_adapter.py의 rank=8과 다름)
+- [ ] `tests/unit/test_irminsul_mla_segment_cache.py`
+  - `test_cdc_chunking_avg_size()`: 평균 청크 크기가 avg_chunk_size ± 50% 이내
+  - `test_cdc_segment_key_position_independence()`: 동일 토큰 다른 위치에서 동일 segment_id
+  - `test_delta_rotation_correctness()`: `assert_delta_rotation_correctness()` 호출, 수학적 일치 검증
+  - `test_mla_put_get_segment()`: put_mla_segment → get_mla_segment_with_delta_rotation 왕복
+  - `test_mla_cache_store_interface()`: CacheStore 추상 메서드 전부 동작 확인
+  - `test_mla_noncontiguous_hit_rate()`: 비연속 히트 카운팅 정확성
+  - `test_mla_lru_eviction()`: max_entries 초과 시 LRU 퇴거 동작
 
-- [ ] `tests/unit/test_compression_accuracy.py` (기존 파일에 추가)
-  - C-1 VeriCache: `acceptance_threshold=0.01` → `final_error < 0.01` (MANDATORY)
-  - C-1 VeriCache 결정론적 보장: 거부된 드래프트 final_output = verified_output (max_diff < 1e-5)
-  - C-1 Int8DraftCodec: `memory_reduction_ratio >= 0.40` (INT8, FP16 대비 ~50%)
-  - C-1 TokenEvictionDraftCodec(0.5): `memory_reduction_ratio >= 0.40`
-  - C-1 코덱별 수락률 sweep: Int8, TokenEviction(0.5), TokenEviction(0.3) 각각 측정
-  - C-1 acceptance_threshold sweep [0.001, 0.005, 0.01, 0.02, 0.05] × 수락률 표
-  - Cross-1 B+C 파이프라인: `relative_error(final_output, full_kv_output) < 0.01` (MANDATORY)
-  - 기존 케이스 전부 유지 (회귀 없음)
+- [ ] `tests/unit/test_arch_aware_noncontiguous_router.py`
+  - `test_detect_mla_arch()`: kv_lora_rank + qk_rope_head_dim=64 → "MLA" 감지
+  - `test_detect_gqa_arch()`: num_kv_heads=4 → "GQA" 감지
+  - `test_detect_mha_arch()`: 기본 설정 → "MHA" 감지
+  - `test_arch_registry_override()`: arch_registry.yaml 모델명 매핑 우선 적용
+  - `test_mla_route_uses_irminsul()`: MLA 모델에서 IrminsulMLASegmentCache 경로 사용
+  - `test_gqa_mha_route_fallback()`: GQA/MHA 모델에서 기존 경로 fallback
+  - `test_cache_store_interface()`: CacheStore 추상 메서드 전부 동작
 
-- [ ] `tests/integration/test_speculative_packet_pipeline_e2e.py`
-  - `store_segment()` + `train_segment_adapter()` + `run()` 전체 파이프라인 실행
-  - B 히트 + C 수락 경로: path="b_hit_c_draft", c_accepted=True
-  - B 히트 + C 거부 경로: path="c_reject_verified", 최종 출력 = 전체 KV 어텐션
-  - B 미스 + 폴백 경로: path="b_miss_fallback", fallback_K/V 사용
-  - 결정론적 accuracy 보장: E2E 실행 후 `relative_error(final_output, full_kv) < 0.01`
-  - 비연속 히트율: 10개 무작위 순서 접근 후 `noncontiguous_hit_rate() >= 0.3`
-  - `pipeline_summary()` dict 반환 및 필수 필드 포함 확인
-  - 100회 실행 후 `mean_relative_error < 0.01` (MANDATORY)
-  - 메모리 감소율: `vericache.memory_reduction_ratio() >= 0.30`
+- [ ] `tests/unit/test_cdc_content_hash_interface.py`
+  - `test_segment_id_equals_sha256()`: make_segment_id가 SHA256(token_bytes)와 일치
+  - `test_hbm_hit_returns_first()`: HBM 히트 시 즉시 반환, S3 미조회
+  - `test_tier_waterfall_order()`: HBM miss → DRAM miss → SSD miss → S3 조회 순서
+  - `test_s3_unavailable_fallback()`: S3 없을 때 "miss" 반환 (예외 없이)
+  - `test_s3_object_key_format()`: model_name/segment_id_layer.kvcache 형식 검증
+  - `test_segment_id_dedup()`: 동일 segment_id 두 번 저장 시 중복 없음
+
+- [ ] `tests/unit/test_objectcache_s3_tier_router.py`
+  - `test_breakeven_formula()`: compute_breakeven_hit_rate(T_r, T_s3) 수식 검증
+  - `test_ema_update()`: update_hit_rate_ema γ=0.9 EMA 계산 정확성
+  - `test_s3_activation_above_threshold()`: hit_rate >= breakeven + hysteresis → s3_tier_active=True
+  - `test_s3_deactivation_below_threshold()`: hit_rate < breakeven - hysteresis → s3_tier_active=False
+  - `test_hysteresis_prevents_oscillation()`: breakeven 경계 근처에서 토글 없음 (히스테리시스 밴드)
+  - `test_max_s3_requests_per_batch()`: 배치 내 S3 요청 수 max_s3_requests_per_batch 상한 적용
+  - `test_schedule_returns_list()`: BaseScheduler.schedule() 반환 타입 List[InferenceRequest]
+  - `test_s3_disabled_default_no_crash()`: s3_enabled_by_default=False 시 예외 없이 동작
+
+### 필수 통합 테스트
+
+- [ ] `tests/integration/test_irminsul_objectcache_pipeline_e2e.py`
+  - `test_pipeline_mla_full_flow()`: CDC → B-2 계층 조회 → A-1 S3 라우팅 결정 → B-1 δ-회전 → 반환
+  - `test_pipeline_noncontiguous_hit_rate_above_30pct()`: 에이전틱 세션 시뮬레이션에서 비연속 히트율 ≥ 30%
+  - `test_pipeline_s3_breakeven_respected()`: EMA 히트율 < 브레이크이븐 시 S3 미활성화 확인
+  - `test_pipeline_gqa_fallback_works()`: GQA 모델 설정에서 기존 RoPEReencodingCache 경로 사용
+  - `test_pipeline_inference_runner_compat()`: InferenceRunner가 IrminsulObjectCachePipeline을
+    `cache`로 받아 get_segments/put_segment API를 통해 정상 동작
+
+### Activity C 검증 테스트 (기존 파일 추가)
+
+- [ ] `tests/unit/test_compression_accuracy.py` — 다음 케이스 추가:
+  - `test_mla_two_axis_position_axis_lossless()`
+  - `test_mla_two_axis_depth_axis_cosine_threshold()`
+  - `test_mla_two_axis_combined_reduction()`
+  - `test_mla_two_axis_fallback_threshold()`
+  - `test_mla_two_axis_cache_store_interface()`
 
 ---
 
 ## 완료 기준 (Definition of Done)
 
-- [ ] 단위 테스트 전부 통과 (신규 2종 + test_compression_accuracy.py 추가 케이스 + 기존 회귀 없음)
-- [ ] 통합 테스트 전부 통과
-- [ ] **evaluation_criteria.md §4 필수 (Activity C)**: `final_error < 0.01` (MANDATORY)
-  - C-1 VeriCache: acceptance_threshold=0.01 설정 시 결정론적 보장
-  - Cross-1 B+C 파이프라인: E2E relative_error < 0.01
-- [ ] **evaluation_criteria.md §4 필수 (Activity C)**: cosine_similarity >= 0.99 (MANDATORY)
-  - C-1: AIME25 proxy + LongBench proxy
-- [ ] **evaluation_criteria.md §5 필수 (C 포함)**: Cross-1 B+C cosine_similarity >= 0.99 (MANDATORY)
-- [ ] **evaluation_criteria.md §4 높음**: KV Memory Reduction >= -30%
-  - C-1 Int8DraftCodec: ~50% 목표
-- [ ] **evaluation_criteria.md §3 높음**: 비연속 히트율 >= 30%
-  - B-1 KVPacketCache + Cross-1 파이프라인
-- [ ] **evaluation_criteria.md §1 높음**: 처리량 시뮬레이션 +20% 이상
-  - C-1: 드래프트 수락률 0.7 × draft_length=4 기준 추정
-- [ ] **evaluation_criteria.md §4 높음**: 압축 오버헤드 TTFT +10% 이내
-  - C-1: 드래프팅 < 5ms/배치 (CPU 기준, GPU 시 < 1ms)
-- [ ] 결정론적 accuracy 보장 검증: `test_vericache_deterministic_guarantee()` 통과
-- [ ] `configs/experiments/2026-05-25.yaml` 생성됨
-- [ ] `configs/vericache_speculative_policy.yaml` 생성됨
-- [ ] `configs/kv_packet_adapter_policy.yaml` 생성됨
-- [ ] `results/2026-05-25/metrics.json` 기록됨
-  - 필수 필드: `{draft_acceptance_rate, mean_relative_error, memory_reduction_ratio,
-    compression_codec_name, noncontiguous_hit_rate, kv_packet_hit_rate,
-    b_hit_rate, c_draft_acceptance_rate, pipeline_cosine_similarity,
-    final_relative_error_max}`
-- [ ] 이전 사이클 모든 단위·통합 테스트 회귀 없이 통과
+1. **단위 테스트 100% 통과**: 위 명시된 모든 단위 테스트 케이스 통과
+2. **통합 테스트 100% 통과**: `test_irminsul_objectcache_pipeline_e2e.py` 전체 통과
+3. **기존 테스트 회귀 없음**: 이전 사이클 구현 파일의 모든 단위·통합 테스트 계속 통과
+4. **evaluation_criteria.md §3 (Activity B)** 기준 충족:
+   - 비연속 세그먼트 히트율 전체 히트의 30% 이상 (에이전틱 세션 시뮬레이션 기준)
+   - 전체 Cache Hit Rate 베이스라인 대비 +5%p 이상
+5. **evaluation_criteria.md §2 (Activity A)** 기준 충족:
+   - 스케줄링 오버헤드 TTFT p50 +5% 이내
+   - EMA 히트율 < 브레이크이븐 시 S3 미활성화 (불필요한 원격 지연 방지)
+6. **CacheStore 인터페이스 준수**: IrminsulMLASegmentCache, ArchitectureAwareNonContiguousRouter,
+   MLATwoAxisCompressionCodec 모두 추상 메서드 전부 구현
+7. **(C-1 포함 시) evaluation_criteria.md §4 Accuracy 보존 필수 항목 충족**:
+   - perplexity 변화 ±1% 이내
+   - depth_sharing_threshold ≥ 0.90 기준에서 WikiText-2 perplexity delta 검증
+8. **설정 파일 존재**: `configs/experiments/2026-05-26.yaml` 생성됨
+9. **시드 고정 재현성**: seed=42로 동일 결과 재현 가능
 
 ---
 
-## 구현 주의사항 및 함정 방지
+## 구현 우선순위 순서
 
-### VeriCacheSpeculativeCodec 구현 시
+1. B-1: `IrminsulMLASegmentCache` + `apply_delta_rotation` + `cdc_chunk`
+2. B-1: `ArchitectureAwareNonContiguousRouter` + `detect_attention_arch`
+3. A-1: `ObjectCacheS3TierRouter` + 브레이크이븐 계산
+4. B-2: `CDCContentHashSegmentIDInterface`
+5. Cross-1: `IrminsulObjectCachePipeline`
+6. C-1: `MLATwoAxisCompressionCodec` (선택적)
+7. 설정 파일: `configs/experiments/2026-05-26.yaml`, `configs/arch_registry.yaml`,
+              `configs/objectcache_breakeven_table.yaml`
+8. 단위 테스트 전부
+9. 통합 테스트
 
-1. **full_kv_ref 메모리 관리**: `memory_bytes()`는 압축 KV만 계산한다 (전체 KV는 DRAM 오프로딩
-   시뮬레이션). `memory_bytes_full_kv()`를 별도 제공해 참조용으로만 사용한다.
+---
 
-2. **코덱 분기 처리**: `Int8DraftCodec.compress()`는 `(tensor, scale)` tuple을 반환하고,
-   `TokenEvictionDraftCodec.compress()`는 `(kept_kv, kept_indices)` tuple을 반환한다.
-   `decompress()`가 이 tuple을 받아야 하므로 타입 확인을 거쳐야 한다.
-   `get_importance_mask()`는 두 번째 원소가 `torch.long` 텐서인 경우만 마스크를 반환한다.
+## 보존 파일 (수정 금지)
 
-3. **결정론적 보장 테스트**: `test_vericache_deterministic_guarantee()`는 반드시
-   `acceptance_threshold=0.0`으로 설정해 모든 드래프트를 강제 거부한 후
-   `final_output == verified_output`을 확인해야 한다.
-   그 다음 `acceptance_threshold=1.0`으로 모든 드래프트를 강제 수락해
-   `relative_error < 1.0` (기계적 항등)을 확인한다.
-
-4. **CacheStore 인터페이스 준수**: `get(key)`는 단일 KV 텐서를 반환해야 한다.
-   `draft_and_verify()`는 추가 API로 제공한다. `put_kv_pair()`도 `put()`을 내부에서 호출한다.
-
-### KVPacketCache 구현 시
-
-5. **kv_packet_adapter.py와의 차이점 유지**: `n_adapter_tokens=4` (논문 기본값)를
-   기본으로 사용한다. `kv_packet_adapter.py`의 `adapter_rank=8`과 혼동하지 않는다.
-   두 파일은 완전히 독립적이며 기존 파일은 수정하지 않는다.
-
-6. **train_adapter() FLOPs 제로 보장**: `train_adapter()`는 저장 시 1회만 호출된다.
-   재사용 시 `get()`은 저장된 adapter_K/V를 `torch.no_grad()` 없이 단순 조회+연결만 수행한다.
-   테스트에서 `torch.autograd.is_enabled()` 확인 또는 loss.backward() 호출 부재를 검증한다.
-
-7. **비연속 히트 추적**: `_track_noncontiguous()`는 `_store.keys()`의 순서 (삽입 순서)를 기준으로
-   한다. `move_to_end()` 호출로 순서가 바뀌므로, 삽입 순서를 별도 리스트로 유지하거나
-   현재 스토어 키 순서 대신 정적 기준을 사용해야 한다.
-   현재 구현은 단순화를 위해 현재 스토어 키 순서를 사용한다 (허용됨).
-
-### SpeculativePacketPipeline 구현 시
-
-8. **K/V 차원 정렬**: `KVPacketCache.get_for_vericache()`는
-   `[n_adapter_tokens+n_tokens, n_heads, d_head]` shape의 K, V를 반환한다.
-   `VeriCacheSpeculativeCodec.put_kv_pair()`는 `[n_tokens, d_head]` 2D 텐서를 기대한다.
-   따라서 `K_packet.reshape(K_packet.shape[0], -1)`로 평탄화가 필요하다 (구현에 포함됨).
-
-9. **Q 차원 정렬**: Q가 2D `[n_q, d_head]`가 아닌 3D `[n_q, n_heads, d_head]`로 들어올 수 있다.
-   `Q_2d = Q.reshape(Q.shape[0], -1)` 처리가 필요하다 (구현에 포함됨).
-
-SPEC_SAVED
+이전 사이클 구현 파일은 수정하지 않는다:
+- `src/cache/vericache_speculative_codec.py`
+- `src/cache/kv_packet.py`
+- `src/cache/kv_packet_adapter.py`
+- `src/engine/speculative_packet_pipeline.py`
+- `src/cache/segmented.py`
+- `src/cache/rope_reencoding_cache.py`
+- `src/scheduler/dualpath_nic_load_balancer.py`
+- 기타 모든 이전 사이클 파일
