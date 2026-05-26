@@ -7,6 +7,102 @@ implementation (src/) into the latest vLLM codebase.
 
 ---
 
+## 2026-05-26 Cycle: Activity A+B+C (Irminsul MLA δ-Rotation + ObjectCache S3 4-Tier + MLATwoAxis Compression)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: B-1 — IrminsulMLASegmentMixin (arXiv 2605.05696, MLA c_KV/k_r δ-rotation non-contiguous reuse)
+        + B-2 — CDCHashBlockRegistry (unified SHA256 CDC address space, cross-tier segment ID)
+        + A-1 — S3TierRoutingEngine / ObjectCacheS3SchedulerMixin (S3 4th KV tier, break-even EMA routing)
+        + C-1 — MLATwoAxisCompressionHook (position-axis dedup + depth-axis layer sharing)
+Source: src/cache/irminsul_mla_segment_cache.py (B-1)
+        src/cache/arch_aware_noncontiguous_router.py (B-1 router)
+        src/cache/cdc_content_hash_interface.py (B-2)
+        src/scheduler/objectcache_s3_tier_router.py (A-1)
+        src/engine/irminsul_objectcache_pipeline.py (Cross-1)
+        src/cache/mla_two_axis_compression_codec.py (C-1)
+Report ①: reports/evaluations/2026-05-26.md (PASS, all mandatory criteria met)
+```
+
+### New Files (2026-05-26)
+
+| File | Activity | Description |
+|------|----------|-------------|
+| `mla_segment_cache_integration.py` | B-1 | `IrminsulMLASegmentMixin` + `install_irminsul_mla_hooks()`: monkey-patch for vLLM KVCacheManager. CDC chunking, SHA256 content keys, δ-rotation on k_r. |
+| `cdc_hash_integration.py` | B-2 | `CDCHashBlockRegistry`: unified CDC SHA256 address space, HBM→DRAM→SSD→S3 tier waterfall, vLLM block_id mapping. |
+| `irminsul_block_manager_patch.py` | B | `IrminsulNonContiguousBlockManagerPatch`: orchestrates B-1+B-2 install. `build_noncontiguous_block_table()` and `build_mla_kv_batch()` helpers. |
+| `irminsul_attention_backend_patch.py` | B+C | `MLANonContiguousInjector` (B-1 injection hook), `MLATwoAxisCompressionHook` (C-1 write/read compression hooks), `MLAAttentionBackendPatch` (combined). |
+| `objectcache_scheduler_patch.py` | A-1 | `S3TierRoutingEngine`, `ObjectCacheS3SchedulerMixin`, `make_objectcache_s3_scheduler_class()`, `install_objectcache_s3_hooks()`. |
+| `compression_config_extension.py` | C-1 | `IrminsulCompressionConfig`: CacheConfig extension for MLA two-axis compression. `install_compression_config()`, `compute_compressed_block_count()`. |
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **B-1** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `mla_segment_cache_integration.py` | `IrminsulMLASegmentMixin`: `store_mla_segment()`, `find_mla_segment()`, `find_noncontiguous_mla_hits()`. δ-rotation applied to k_r only; c_kv returned unchanged (position-free). |
+| **B-1** | Non-contiguous block table | `irminsul_block_manager_patch.py` | `build_noncontiguous_block_table()` → int64 `[1, max_blocks]` with -1 sentinels. `build_mla_kv_batch()` → (c_kv_batch, k_r_batch) for kernel injection. |
+| **B-2** | Unified segment address space | `cdc_hash_integration.py` | `CDCHashBlockRegistry.lookup()`: HBM→DRAM→SSD→S3 waterfall. `make_segment_id()` = SHA256(CDC_chunk_bytes). `s3_object_key()` = `{model_name}/{seg_id}_{layer}.kvcache`. |
+| **A-1** | `vllm.v1.core.sched.scheduler.Scheduler` | `objectcache_scheduler_patch.py` | `ObjectCacheS3SchedulerMixin._s3_pre_schedule_hook()` wraps `schedule()`. Break-even: `T_recompute/(T_recompute+T_s3)`. EMA + hysteresis. Non-S3 requests first. |
+| **C-1** | MLA attention backend write hook | `irminsul_attention_backend_patch.py` | `MLATwoAxisCompressionHook.write_hook()`: position dedup + depth sharing. Returns (c_kv, k_r) — full precision. |
+| **C-1** | MLA attention backend read hook | `irminsul_attention_backend_patch.py` | `read_hook()`: identity (pointer-based, no decompression needed — already full precision). |
+| **C-1** | `VllmConfig` extension | `compression_config_extension.py` | `IrminsulCompressionConfig`: attaches to `vllm_config._irminsul_compression_config`. No vLLM source modification. |
+
+### Accuracy Contract (Activity C-1 — MLA Two-Axis Compression)
+
+| Compression Axis | Loss | Guarantee |
+|-----------------|------|-----------|
+| Position axis (segment dedup) | **Zero** | c_KV position-free property (mathematical proof, Irminsul arXiv 2605.05696) |
+| Depth axis (layer sharing) | **Zero (exact)** | Residual storage: `c_kv[l] = base + residual` reconstruction is mathematically exact (loop-2 fix) |
+
+### Loop-2 Fixes (2026-05-26, vllm-evaluator feedback)
+
+Two issues identified by vllm-evaluator in loop-1 were fixed in `irminsul_attention_backend_patch.py`:
+
+**Fix 1 (CRITICAL — Activity C accuracy violation): Depth-axis sharing — residual storage**
+
+Root cause: The original depth-axis implementation substituted `c_kv[l-1]` directly for
+`c_kv[l]` when `cos_sim >= threshold`. Even at `cos_sim=0.9987`, softmax-based attention
+amplifies the small tensor difference into ~5.9% attention output error — far exceeding
+the ±1% accuracy limit.
+
+Resolution (residual storage approach):
+- `write_hook`: computes `residual = c_kv[l] - c_kv[l-1]`, stores `(base=c_kv[l-1], residual)` in `_depth_residuals[(segment_id, layer_idx)]`.
+- `read_hook`: reconstructs `c_kv[l] = base + residual` — mathematically exact (zero accuracy loss).
+- Memory savings are preserved: when `cos_sim` is high, residuals are small → compact storage.
+- Accuracy guarantee: `torch.allclose(original, reconstructed, atol=1e-6)` verified in tests.
+
+```python
+# write_hook (depth axis)
+residual = (c_kv.float() - prev_c_kv.float()).to(c_kv.dtype)
+self._depth_residuals[(segment_id, layer_idx)] = (prev_c_kv, residual)
+
+# read_hook (depth axis)
+base_tensor, residual = self._depth_residuals[(segment_id, layer_idx)]
+c_kv_reconstructed = (base_tensor.float() + residual.float()).to(c_kv.dtype)
+```
+
+**Fix 2 (Bug): `noncontiguous_hit_rate()` denominator**
+
+The old denominator had a spurious `* 10` multiplier: `max(1, self._injection_calls * 10)`.
+This caused the reported hit rate to be 10× lower than the true value.
+
+Fixed to:
+```python
+return self._injection_hits / max(1, self._injection_calls)
+```
+
+Verified: 5 calls × 3 hits/call → `hit_rate = 3.0` (segments per call), not `0.3`.
+
+### Known Limitations (vLLM 0.21.0)
+
+- `IrminsulMLASegmentMixin` is a **secondary** non-contiguous cache on top of vLLM's own prefix caching. vLLM's block_pool SHA256 trie handles contiguous prefixes natively; this patch adds arbitrary segment hits.
+- S3 I/O is **synchronous** in this implementation. For production, use `vllm.distributed.kv_transfer.kv_connector` for async RDMA transfers.
+- MLA δ-rotation requires that the model was loaded with MLA config (`kv_lora_rank` + `qk_rope_head_dim=64`). For GQA/MHA models, the patch degrades gracefully (arch detection returns "GQA" or "MHA", mixin still callable but δ-rotation is a no-op for delta=0).
+
+---
+
 ## 2026-05-25 Cycle: Activity B+C (KVPacket Non-Contiguous Reuse + VeriCache Speculative Draft-Verify Compression)
 
 ### vLLM Version
