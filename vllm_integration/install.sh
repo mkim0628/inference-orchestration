@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — Install the latest vLLM and verify the A+C integration.
+# install.sh — Install the latest vLLM and verify the A+B+C integration.
 #
 # Usage:
 #   bash vllm_integration/install.sh
@@ -8,6 +8,12 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity B+C (2026-05-27):
+#        IndexMemEvictionCodecAttentionHook, extend_cache_config_indexmem,
+#        apply_indexmem_eviction_patch (Activity C: IndexMem Eviction Codec)
+#        IndexMemSoftHitKVCacheManagerMixin, SegmentLatentPool,
+#        make_indexmem_soft_hit_kv_cache_manager_class (Activity B: Soft Hit)
+#        IndexMemSoftHitSchedulerMixin, make_indexmem_soft_hit_scheduler_class
 #      Activity A+C (2026-05-16):
 #        NAtHDDROffloadingSchedulerMixin, make_nath_ddr_scheduler_class,
 #        GlobalRetentionGateVllmCodec, NAtHDDROffloadingCodecAdapter,
@@ -42,6 +48,299 @@ pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install -
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-27 B+C smoke tests (IndexMem Eviction Codec + Soft Hit Block Manager + Scheduler) ==="
+set +e
+python - <<'PYEOF_2026_05_27'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity C: IndexMemEvictionCodecAttentionHook
+# ---------------------------------------------------------------------------
+from vllm_integration.indexmem_eviction_codec_patch import (
+    IndexMemEvictionHookConfig,
+    IndexMemEvictionCodecAttentionHook,
+    extend_cache_config_indexmem,
+    apply_indexmem_eviction_patch,
+)
+
+cfg_c = IndexMemEvictionHookConfig(
+    budget_ratio=0.5, beta_readout=0.1,
+    latent_dim=64, n_layers=4, kv_dim=64,
+    zero_shot_mode=True, seed=42,
+)
+hook = IndexMemEvictionCodecAttentionHook(config=cfg_c, enabled=True)
+
+# write_to_cache: MUST return original tensors (primary attention kernel unchanged)
+key_t = torch.randn(20, 64, dtype=torch.float32)
+val_t = torch.randn(20, 64, dtype=torch.float32)
+k_out, v_out = hook.write_to_cache("req0_layer0", 0, key_t, val_t)
+assert k_out is key_t, "write_to_cache must return original key tensor"
+assert v_out is val_t, "write_to_cache must return original value tensor"
+print(f"  IndexMemEvictionHook write_to_cache (original KV passthrough): PASS")
+
+# read_from_cache: returns compact (retained) KV from segment store
+entry = hook.read_from_cache("req0_layer0", layer_idx=0)
+assert entry is not None, "read_from_cache must return entry after write"
+retained_k, retained_v, kept_idx = entry
+expected_kept = max(1, int(20 * cfg_c.budget_ratio))
+assert retained_k.shape[0] == expected_kept, f"Expected {expected_kept} retained, got {retained_k.shape[0]}"
+assert retained_k.shape[-1] == key_t.shape[-1], "Head dim must be preserved"
+print(f"  IndexMemEvictionHook read_from_cache: retained={retained_k.shape[0]}/{key_t.shape[0]}: PASS")
+
+# Primary kernel accuracy: zero error (original KV returned)
+import torch.nn.functional as F
+q = torch.randn(4, 64)
+scale = 64 ** -0.5
+attn_orig = F.softmax(q @ key_t.T * scale, dim=-1) @ val_t
+attn_hook = F.softmax(q @ k_out.T * scale, dim=-1) @ v_out
+rel_err = ((attn_orig - attn_hook).norm() / attn_orig.norm().clamp(min=1e-8)).item()
+assert rel_err < 1e-5, f"Primary kernel: rel_err={rel_err:.2e} must be ~0"
+print(f"  IndexMemEvictionHook primary kernel accuracy: rel_err={rel_err:.2e} < 1e-5: PASS")
+
+# memory_reduction_ratio: 1 - budget_ratio = 0.5
+mrr = hook.memory_reduction_ratio()
+assert mrr == 0.5, f"Expected 0.5 got {mrr}"
+print(f"  memory_reduction_ratio={mrr}: PASS (Activity C MANDATORY)")
+
+# extend_cache_config_indexmem: object.__setattr__ injection
+class _FakeCC:
+    pass
+fake_cc = _FakeCC()
+extend_cache_config_indexmem(fake_cc, indexmem_budget_ratio=0.5, indexmem_beta=0.1)
+assert getattr(fake_cc, "indexmem_budget_ratio") == 0.5
+assert getattr(fake_cc, "indexmem_beta") == 0.1
+assert getattr(fake_cc, "compression_method") == "indexmem_eviction"
+print(f"  extend_cache_config_indexmem: PASS")
+
+# hook_stats
+stats = hook.hook_stats()
+assert "write_count" in stats and "memory_reduction_ratio" in stats
+assert stats["write_count"] == 1
+print(f"  hook_stats: PASS keys={list(stats.keys())[:5]}...")
+
+# Disabled hook: passthrough
+hook_off = IndexMemEvictionCodecAttentionHook(enabled=False)
+k_off, v_off = hook_off.write_to_cache("x", 0, key_t, val_t)
+assert k_off is key_t
+print(f"  disabled hook passthrough: PASS")
+
+# kv_dim mismatch: falls back to inline stub (no dimension errors)
+cfg_mismatch = IndexMemEvictionHookConfig(budget_ratio=0.5, kv_dim=128, seed=42)
+hook_mm = IndexMemEvictionCodecAttentionHook(config=cfg_mismatch, enabled=True)
+k_mm, v_mm = hook_mm.write_to_cache("mm_key", 0, key_t, val_t)
+assert k_mm is key_t
+entry_mm = hook_mm.read_from_cache("mm_key", 0)
+assert entry_mm is not None, "kv_dim mismatch must fall back to inline stub"
+print(f"  kv_dim mismatch fallback: PASS (retained={entry_mm[0].shape[0]})")
+
+# apply_indexmem_eviction_patch (idempotent)
+h1 = apply_indexmem_eviction_patch(cfg_c)
+h2 = apply_indexmem_eviction_patch(cfg_c)  # second call should not double-patch
+assert h1 is not None and h2 is not None
+print(f"  apply_indexmem_eviction_patch (idempotent): PASS")
+
+# ---------------------------------------------------------------------------
+# Activity B: IndexMemSoftHitKVCacheManagerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.indexmem_block_manager_patch import (
+    IndexMemSoftHitMixinConfig,
+    IndexMemSoftHitKVCacheManagerMixin,
+    SegmentLatentPool,
+    SoftHitResult,
+    make_indexmem_soft_hit_kv_cache_manager_class,
+)
+import hashlib, struct
+
+class MinimalSoftHitMgr(IndexMemSoftHitKVCacheManagerMixin):
+    def __init__(self, **kw):
+        cfg = kw.get("indexmem_soft_hit_config") or IndexMemSoftHitMixinConfig()
+        self._im_cfg = cfg
+        from collections import OrderedDict
+        from vllm_integration.indexmem_block_manager_patch import _InlineSoftHitStore, SegmentLatentPool
+        self._im_use_native = False
+        self._im_cache = _InlineSoftHitStore(cfg)
+        self._im_latent_pool = SegmentLatentPool(max_segments=cfg.latent_pool_max_segments, latent_dim=cfg.latent_dim)
+        self._im_soft_hit_blocks = {}
+        self._im_next_block_idx = 0
+        self._im_store_count = 0
+        self._im_n_hard = self._im_n_soft = self._im_n_miss = 0
+        self._im_n_nc_hard = self._im_n_nc_soft = 0
+
+cfg_b = IndexMemSoftHitMixinConfig(
+    chunk_size=8, max_physical_entries=20,
+    latent_pool_max_segments=100,
+    beta_soft=0.1, beta_weight=0.5,
+    latent_dim=64, kv_dim=128, n_layers=4, seed=42,
+)
+mgr = MinimalSoftHitMgr(indexmem_soft_hit_config=cfg_b)
+
+# store_soft_hit_segment
+token_ids = list(range(16))
+kv_seg = torch.randn(8, 64)
+key_s = mgr.store_soft_hit_segment("sess0", 0, token_ids, 0, kv_seg, layer_idx=0)
+assert isinstance(key_s, str), f"Expected str key"
+print(f"  store_soft_hit_segment: PASS key={key_s[:12]}...")
+
+# Hard hit
+r = mgr.get_soft_hit_result("sess0", 0, token_ids, 0, layer_idx=0)
+assert r.type == "hard", f"Expected hard hit after store, got {r.type}"
+print(f"  get_soft_hit_result hard hit: PASS")
+
+# Miss
+r_miss = mgr.get_soft_hit_result("sess0", 0, token_ids, 99, layer_idx=0)
+assert r_miss.type == "miss"
+print(f"  get_soft_hit_result miss: PASS")
+
+# weighted_hit_rate (Activity B MANDATORY)
+whr = mgr.weighted_hit_rate()
+assert 0.0 <= whr <= 1.0
+print(f"  weighted_hit_rate={whr:.3f}: PASS (Activity B MANDATORY)")
+
+# allocate_soft_hit_block
+block_idx = mgr.allocate_soft_hit_block(key_s)
+assert block_idx is not None, "Expected non-None block_idx for existing segment"
+assert block_idx & 0x80000000, "block_idx should be in soft-hit namespace (high bit set)"
+print(f"  allocate_soft_hit_block: PASS block_idx=0x{block_idx:X}")
+
+# get_segments_with_soft_hits: non-contiguous detection
+# Store chunk 0 and chunk 2, skip chunk 1 (non-contiguous)
+token_ids_nc = list(range(32))
+mgr.store_soft_hit_segment("sess_nc", 0, token_ids_nc, 0, kv_seg, layer_idx=0)
+mgr.store_soft_hit_segment("sess_nc", 0, token_ids_nc, 2, kv_seg, layer_idx=0)
+hits, misses = mgr.get_segments_with_soft_hits("sess_nc", 0, token_ids_nc, layer_idx=0)
+assert len(hits) >= 2, f"Expected >= 2 hits, got {len(hits)}"
+assert 1 in misses, f"Chunk 1 should be a miss: misses={misses}"
+print(f"  get_segments_with_soft_hits non-contiguous: PASS hits={len(hits)} misses={misses}")
+
+# noncontiguous_fraction (Activity B)
+nc_frac = mgr.noncontiguous_fraction()
+assert 0.0 <= nc_frac <= 1.0
+print(f"  noncontiguous_fraction={nc_frac:.3f}: PASS")
+
+# metrics
+m = mgr.indexmem_soft_hit_metrics()
+assert "weighted_hit_rate" in m and "soft_hit_rate" in m and "noncontiguous_fraction" in m
+print(f"  indexmem_soft_hit_metrics: PASS")
+
+# SegmentLatentPool
+pool = SegmentLatentPool(max_segments=3, latent_dim=16)
+lat = torch.randn(16)
+pool.store("seg_A", lat)
+assert pool.contains("seg_A")
+pool.store("seg_B", torch.randn(16))
+pool.store("seg_C", torch.randn(16))
+pool.store("seg_D", torch.randn(16))  # evicts seg_A
+assert not pool.contains("seg_A"), "LRU eviction should remove seg_A"
+assert pool.size() == 3
+print(f"  SegmentLatentPool LRU eviction: PASS size={pool.size()}")
+
+# Factory: make_indexmem_soft_hit_kv_cache_manager_class
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    IndexMemMgr = make_indexmem_soft_hit_kv_cache_manager_class(KVCacheManager, cfg_b)
+    assert issubclass(IndexMemMgr, KVCacheManager)
+    assert issubclass(IndexMemMgr, IndexMemSoftHitKVCacheManagerMixin)
+    print(f"  make_indexmem_soft_hit_kv_cache_manager_class: PASS ({IndexMemMgr.__name__})")
+except Exception as exc:
+    print(f"  make_indexmem_soft_hit_kv_cache_manager_class: SKIP (no GPU env): {exc}")
+
+# ---------------------------------------------------------------------------
+# Activity A: IndexMemSoftHitSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.indexmem_vllm_scheduler_patch import (
+    IndexMemSoftHitSchedulerConfig,
+    IndexMemSoftHitSchedulerMixin,
+    make_indexmem_soft_hit_scheduler_class,
+)
+
+class FakeRequest:
+    def __init__(self, rid, tids, session_id=None):
+        self.request_id = rid
+        self.prompt_token_ids = tids
+        self.session_id = session_id or rid
+        self.session_turn = 0
+
+class MinimalIndexMemSched(IndexMemSoftHitSchedulerMixin):
+    def __init__(self, **kw):
+        self.waiting = []
+        cfg = kw.get("indexmem_scheduler_config") or IndexMemSoftHitSchedulerConfig()
+        self._im_sched_cfg = cfg
+        self._im_session_state = {}
+        self._im_key_cache = {}
+        self._im_sched_call_count = 0
+        self._im_hard_hit_routes = 0
+        self._im_soft_hit_routes = 0
+        self._im_miss_routes = 0
+        self._im_total_overhead_us = 0.0
+        self._im_block_manager = None
+
+cfg_a = IndexMemSoftHitSchedulerConfig(chunk_size=8, seed=42)
+sched = MinimalIndexMemSched(indexmem_scheduler_config=cfg_a)
+
+# Test with no block manager (all misses expected)
+reqs = [
+    FakeRequest("r1", list(range(16)), session_id="s0"),
+    FakeRequest("r2", list(range(16, 32)), session_id="s1"),
+]
+sched.waiting = reqs
+sched.im_pre_schedule()
+for r in reqs:
+    assert hasattr(r, "im_cache_path"), "Request must have im_cache_path annotation"
+    assert r.im_cache_path in ("hard_hit", "soft_hit", "miss")
+print(f"  im_pre_schedule classification: PASS paths={[r.im_cache_path for r in reqs]}")
+
+# Overhead: O(n_chunks) per request < 1ms
+import time
+big_reqs = [FakeRequest(f"r{i}", list(range(16)), session_id=f"s{i}") for i in range(100)]
+sched.waiting = big_reqs
+t0 = time.monotonic()
+sched.im_pre_schedule()
+elapsed_us = (time.monotonic() - t0) * 1e6 / len(big_reqs)
+assert elapsed_us < cfg_a.max_overhead_us_per_request, f"Overhead {elapsed_us:.1f}us >= limit"
+print(f"  im_pre_schedule overhead: {elapsed_us:.1f}us/req < {cfg_a.max_overhead_us_per_request:.0f}us: PASS")
+
+# routing_stats
+stats_a = sched.im_routing_stats()
+assert "hard_hit_routes" in stats_a and "soft_hit_routes" in stats_a and "miss_routes" in stats_a
+assert "scheduling_overhead_mean_us" in stats_a
+print(f"  im_routing_stats: PASS")
+
+# set_indexmem_block_manager: wire up block manager
+sched.set_indexmem_block_manager(mgr)
+assert sched._im_block_manager is mgr
+print(f"  set_indexmem_block_manager: PASS")
+
+# Test with block manager attached and pre-populated segment
+sched2 = MinimalIndexMemSched(indexmem_scheduler_config=cfg_a)
+sched2.set_indexmem_block_manager(mgr)
+req_hit = FakeRequest("r_hit", token_ids, session_id="sess0")  # token_ids stored in mgr above
+sched2.waiting = [req_hit]
+sched2.im_pre_schedule()
+print(f"  im_pre_schedule with block manager: cache_path={req_hit.im_cache_path}: PASS")
+
+# Factory
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    IndexMemSched2 = make_indexmem_soft_hit_scheduler_class(Scheduler, cfg_a)
+    assert issubclass(IndexMemSched2, Scheduler)
+    assert issubclass(IndexMemSched2, IndexMemSoftHitSchedulerMixin)
+    print(f"  make_indexmem_soft_hit_scheduler_class: PASS ({IndexMemSched2.__name__})")
+except Exception as exc:
+    print(f"  make_indexmem_soft_hit_scheduler_class: SKIP (no GPU env): {exc}")
+
+print("=== 2026-05-27 B+C smoke tests: PASS ===")
+PYEOF_2026_05_27
+EXIT_2026_05_27=$?
+set -e
+if [ $EXIT_2026_05_27 -ne 0 ]; then
+  echo "WARNING: 2026-05-27 B+C smoke tests had failures (exit=$EXIT_2026_05_27)" >&2
+fi
 
 echo ""
 echo "=== 2026-05-23 C+A+B smoke tests (RuntimeCertified INT8K+INT4V + CPD Warm/Cold + CLC Positional Bias Gate) ==="

@@ -1,0 +1,10 @@
+# IndexMem Learnable Indexer trained weights (2026-05-27 cycle)
+# Format: YAML-serialized PyTorch tensors (float lists)
+# Architecture: Linear(5->32) + ReLU + Linear(32->1) + Sigmoid = 225 params
+w1: null  # shape: [32, 5] — populated after training
+b1: null  # shape: [32]
+w2: null  # shape: [1, 32]
+b2: null  # shape: [1]
+trained_epochs: 0
+training_date: "2026-05-27"
+note: "zero_shot_mode=true by default; set to false and populate weights after LoRA training"

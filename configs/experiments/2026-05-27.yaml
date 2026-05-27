@@ -1,0 +1,48 @@
+experiment:
+  date: "2026-05-27"
+  activity: "B+C"
+  cache_type: "indexmem_soft_hit_segment"
+  compression_method: "indexmem_eviction"
+  scheduler_type: "default"
+  seed: 42
+
+indexmem_eviction:
+  budget_ratio: 0.5
+  base_eviction_policy: "snapkv"
+  alpha_ema: 0.3
+  beta_readout: 0.1
+  latent_dim: 64
+  n_layers: 32
+  kv_dim: 128
+  zero_shot_mode: true
+  max_accuracy_delta: 0.01
+  fallback_budget_ratio: 0.6
+  fallback_beta: 0.05
+  budget_ratio_sweep: [0.3, 0.4, 0.5, 0.6, 0.7]
+  beta_sweep: [0.05, 0.10, 0.15, 0.20]
+
+indexmem_soft_hit:
+  chunk_size: 128
+  max_physical_entries: 1000
+  latent_pool_max_segments: 10000
+  beta_soft: 0.1
+  beta_weight: 0.5
+  latent_dim: 64
+  kv_dim: 128
+  n_layers: 32
+
+bc_pipeline:
+  segment_latent_pool_mb: 128.0
+  token_latent_pool_mb: 64.0
+  unified_hit_weights: [1.0, 0.7, 0.4]
+
+learnable_indexer:
+  weights_path: "configs/indexmem_indexer_weights.yaml"
+  zero_shot_mode: true
+  lora_rank: 4
+  epochs: 5
+  lr: 1.0e-3
+
+metrics:
+  output_dir: "results/2026-05-27"
+  metrics_file: "results/2026-05-27/metrics.json"
