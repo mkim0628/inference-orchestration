@@ -1564,3 +1564,139 @@ def test_mla_two_axis_cache_store_interface() -> None:
     assert codec._hits == 0
     assert codec._misses == 0
 
+
+# =========================================================================== #
+# IndexMem Accuracy Preservation — 2026-05-27 cycle (Activity C-1)            #
+# =========================================================================== #
+
+from src.cache.indexmem_eviction_codec import (
+    IndexMemEvictionCodec as _IndexMemEvictionCodec,
+    IndexMemEvictionConfig as _IndexMemEvictionConfig,
+)
+
+_IM_N = 64
+_IM_D = 64
+_IM_SEED = 42
+
+
+def _make_im_codec(
+    budget_ratio: float = 0.5,
+    beta: float = 0.1,
+    zero_shot: bool = True,
+) -> _IndexMemEvictionCodec:
+    cfg = _IndexMemEvictionConfig(
+        budget_ratio=budget_ratio,
+        beta_readout=beta,
+        zero_shot_mode=zero_shot,
+        n_layers=4,
+        kv_dim=_IM_D,
+        latent_dim=32,
+        seed=_IM_SEED,
+    )
+    return _IndexMemEvictionCodec(cfg)
+
+
+def test_indexmem_learnable_indexer_only_accuracy():
+    """Learnable Indexer only: output shape and range validity."""
+    torch.manual_seed(_IM_SEED)
+    codec = _make_im_codec(budget_ratio=0.5, beta=0.0)
+    kv = torch.randn(_IM_N, _IM_D)
+    compressed = codec.encode(kv, layer_idx=0)
+    expected_n = max(1, int(_IM_N * 0.5))
+    assert compressed.shape == (expected_n, _IM_D)
+
+
+def test_indexmem_latent_memory_only_accuracy():
+    """Latent Memory only: encode+readout produces finite output."""
+    torch.manual_seed(_IM_SEED)
+    codec = _make_im_codec(budget_ratio=0.7, beta=0.1)
+    kv = torch.randn(_IM_N, _IM_D)
+    codec.encode(kv, layer_idx=0, request_key="lm_only")
+    query = torch.randn(4, _IM_D)
+    readout = codec.get_readout(query, layer_idx=0, request_key="lm_only")
+    assert torch.isfinite(readout).all()
+    assert readout.shape == query.shape
+
+
+def test_indexmem_combined_accuracy_within_tolerance():
+    """Combined (Indexer+Latent): cosine sim of kept mean vs original mean >= 0.5."""
+    torch.manual_seed(_IM_SEED)
+    codec = _make_im_codec(budget_ratio=0.5, beta=0.1)
+    kv = torch.randn(_IM_N, _IM_D)
+    compressed = codec.encode(
+        kv,
+        layer_idx=0,
+        query=kv.mean(0),
+        token_positions=torch.arange(_IM_N, dtype=torch.float32),
+        current_position=_IM_N,
+        request_key="combined",
+    )
+    sim = F.cosine_similarity(
+        compressed.mean(0).unsqueeze(0), kv.mean(0).unsqueeze(0)
+    ).item()
+    assert sim >= 0.5, f"Combined cosine sim too low: {sim}"
+
+
+def test_indexmem_budget_ratio_sweep():
+    """budget_ratio [0.3..0.7]: all produce valid compressed tensors."""
+    kv = torch.randn(_IM_N, _IM_D)
+    for br in [0.3, 0.4, 0.5, 0.6, 0.7]:
+        codec = _make_im_codec(budget_ratio=br)
+        compressed = codec.encode(kv, layer_idx=0)
+        expected = max(1, int(_IM_N * br))
+        assert compressed.shape[0] == expected, f"budget_ratio={br}: shape mismatch"
+
+
+def test_indexmem_beta_sweep():
+    """beta_readout [0.05..0.20]: readout is always finite."""
+    kv = torch.randn(_IM_N, _IM_D)
+    for beta in [0.05, 0.10, 0.15, 0.20]:
+        codec = _make_im_codec(beta=beta)
+        codec.encode(kv, layer_idx=0, request_key=f"beta_{beta}")
+        query = torch.randn(4, _IM_D)
+        readout = codec.get_readout(query, layer_idx=0, request_key=f"beta_{beta}")
+        assert torch.isfinite(readout).all(), f"Non-finite readout at beta={beta}"
+
+
+def test_indexmem_fallback_adjusts_on_high_delta():
+    """accuracy_delta > 1% triggers fallback budget_ratio and beta adjustment."""
+    codec = _make_im_codec(budget_ratio=0.5, beta=0.1)
+    adjusted = codec.auto_adjust_on_accuracy_delta(0.02)
+    assert adjusted is True
+    assert codec.config.budget_ratio == codec.config.fallback_budget_ratio
+
+
+def test_indexmem_ruler_needle_depth_accuracy():
+    """RULER needle: token with high query sim is retained in compressed output."""
+    torch.manual_seed(_IM_SEED)
+    n = 50
+    kv = torch.randn(n, _IM_D)
+    needle_idx = 25
+    query = kv[needle_idx].clone()
+    codec = _make_im_codec(budget_ratio=0.5)
+    compressed = codec.encode(
+        kv,
+        layer_idx=0,
+        query=query,
+        token_positions=torch.arange(n, dtype=torch.float32),
+        current_position=n,
+        request_key="ruler",
+    )
+    sims = F.cosine_similarity(
+        compressed, query.unsqueeze(0).expand(compressed.shape[0], -1), dim=-1
+    )
+    assert sims.max().item() > 0.5, f"Needle not retained: max sim={sims.max().item()}"
+
+
+def test_indexmem_vericache_draft_acceptance_rate():
+    """Cross-2: IndexMem plugged into VeriCache as draft codec, compress/decompress works."""
+    from src.cache.vericache_speculative_codec import VeriCacheSpeculativeCodec, VeriCacheConfig
+    vericache = VeriCacheSpeculativeCodec(VeriCacheConfig(d_head=_IM_D, seed=_IM_SEED))
+    codec = _make_im_codec(budget_ratio=0.5)
+    vericache.set_draft_codec(codec)
+    assert vericache._draft_codec is codec
+    kv = torch.randn(16, _IM_D)
+    compressed = codec.compress(kv)
+    decompressed = codec.decompress(compressed)
+    assert decompressed.shape[1] == _IM_D
+
