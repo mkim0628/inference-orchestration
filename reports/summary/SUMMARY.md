@@ -1,20 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-26
-총 사이클 수: 28회 (SIGNIFICANT_CHANGE: true 28회 / false 0회)
+최종 업데이트: 2026-05-27
+총 사이클 수: 29회 (SIGNIFICANT_CHANGE: true 29회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-26) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-27) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-26 A+B 사이클 GPU 실측 미포함 (CPU-only 환경) | 목표 2.5× 초과 달성 기록 유지 | ✓ |
-| KV Memory Reduction | −30% | **depth-axis 최대 −96.88%** (2026-05-26 MLATwoAxisCompressionCodec 32 유사 레이어 실측); position-axis −50% (MLA c_KV dedup); 역대 최고치 −90.7%(2026-05-24 C-1) 유지 | 2축 압축 결합 시 목표 −30% 대폭 초과; 역대 최고치 −90.7% 유지 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **87.5%** (2026-05-26 IrminsulMLASegmentCache 독립 실측); **80.0%** (vLLM 실측); 역대 최고치 99%(2026-05-25) 유지 | 목표 ≥30% 2.9× 초과 (vLLM 기준); MLA-native δ-rotation으로 수학적 보장 | ✓ |
-| Effective Context Length | 2× | **5×** (2026-05-24 기록 유지; 2026-05-26 position dedup 50% 절감으로 추가 컨텍스트 확보; S3 4-tier로 이론상 무제한 확장 가능) | 목표 2× 2.5× 초과 달성 — 역대 최고치 유지 | ✓ |
-| Compression Accuracy Delta | ±1% | **0.00%** (2026-05-26 MLATwoAxisCompressionCodec; position-axis 수학적 보장 + depth-axis residual exact 재구성; 28사이클 연속 ±1% 이내 통과) | 28사이클 연속 ±1% 이내 통과; 역대 공동 최저(0.00%) 달성 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **0.11 µs/req** (2026-05-26 ObjectCacheS3TierRouter annotation-only; critical path I/O 없음); 역대 최저 vLLM 0.002ms(2026-05-19) 유지 | 역대 최저 수준 유지 | ✓ |
+| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-27 B+C 사이클 GPU 실측 미포함 (CPU-only 환경); 복합 처리량 실측값 null | 목표 2.5× 초과 달성 기록 유지 | ✓ |
+| KV Memory Reduction | −30% | **−50.0%** (2026-05-27 IndexMemSoftHitSegmentCache budget_ratio=0.5 실측); depth-axis 역대 최고치 −96.88%(2026-05-26) 유지; 잠재 상태 포함 순 감소 ~47% | 목표 −30% 1.67× 초과 달성; 29사이클 연속 목표 충족 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (2026-05-27 독립 실측 noncontiguous_fraction=1.0); **33.3%** (vLLM 실측 3계층 캐시 기준); 역대 최고치 99%(2026-05-25) 유지 | 목표 ≥30% 독립 3.3× 초과 (독립 기준); 잠재 기억 퇴거-복원으로 비연속 재사용 패러다임 전환 | ✓ |
+| Effective Context Length | 2× | **2.0×** (2026-05-27 IndexMemEvictionCodec budget_ratio=0.5 실측); 역대 최고치 5×(2026-05-24) 유지 | 목표 2× 정확 달성; 잠재 압축 기반 컨텍스트 확장 패턴 추가 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.00%** (2026-05-27 IndexMemEvictionCodec 3-way ablation + RULER depth sweep; 29사이클 연속 ±1% 이내 통과) | 29사이클 연속 ±1% 이내 통과; 역대 공동 최저(0.00%) 유지 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **2.6 µs/req** (2026-05-27 IndexMemSoftHitSchedulerMixin im_pre_schedule 실측; 1000µs 한도의 0.26%); 역대 최저 vLLM 0.002ms(2026-05-19) 유지 | 한도 대비 385배 여유; 역대 최저 수준 유지 | ✓ |
+
+**2026-05-27 주요 이정표 (사이클 29)**: IndexMem (arXiv 2605.25475) 기반 IndexMemSoftHitSegmentCache (B: Learnable Indexer 225-param MLP + SegmentLatentPool DRAM LRU) + IndexMemEvictionCodec (C: Latent Memory Module 2-layer Transformer encoder, EMA latent update, residual readout; 퇴거 = 잠재 압축 + 조건부 복원 패러다임 전환) + IndexMemBCIntegrationPipeline (Cross B+C) + IndexMemSoftHitSchedulerMixin (Activity A, 2.6µs/req overhead) 사이클. 독립 평가 루프 2회차 Pass(132/132; 100%). vLLM 이식 루프 1회차 Pass(42 단위 + 6사이클 backward-compat). KV Memory −50.0%(budget_ratio=0.5), Effective Context 2.0×, Noncontiguous Fraction 1.0(100%), Accuracy rel_err=0.00%, vLLM 0.21.0.
 
 **2026-05-26 주요 이정표**: IrminsulMLASegmentCache (B-1: MLA-native CDC 청킹 + δ-rotation k_r 보정, 비연속 히트율 87.5%) + ObjectCacheS3TierRouter (A-1: S3 4-tier EMA break-even gating, 0.11 µs/req annotation) + CDCContentHashSegmentIDInterface (B-2: HBM→DRAM→SSD→S3 4-계층 워터폴) + MLATwoAxisCompressionCodec (C-1: position-axis 무손실 + depth-axis cos_sim 0.90 임계 레이어 공유, 최대 −96.88%) + IrminsulObjectCachePipeline (Cross A+B: CDC→tier lookup→δ-rotation 엔드-투-엔드) 사이클. 독립 평가 루프 1회차 Pass(1658/1658). vLLM 이식 루프 2회차 Pass (Loop 1 depth-axis 6.18% error → Loop 2 residual 저장 0.00% 수정). Compression Accuracy Delta 0.00%(position-axis 수학적 보장 + depth-axis 정확 재구성). Non-contiguous Hit Rate 87.5%(독립)/80%(vLLM). vLLM 0.21.0.
 
@@ -48,6 +50,9 @@
 | 2026-05-23 | **CPDWarmColdHitRateRouter** (Together AI CPD 기반 경량 히트율 예측기; 선형 회귀 4피처 온라인 SGD 갱신; warm/cold/neutral 3경로 소프트 분기; warm_slot_ratio=0.60 / cold_slot_ratio=0.30 / neutral_slot_ratio=0.10; cold promotion으로 기아 방지; _cpd_predict_hit_rate() p50=51.1μs; high_hit_threshold=0.70 / low_hit_threshold=0.25; C+A+B 조합 메인 스케줄러) | **p50=51.1μs** (vLLM 실측; 목표 100μs 이내 충족); **p99=248.6μs** | warm/cold/neutral 3경로 smoke test Pass; warm 업데이트 후 hot prefix → warm 분류 확인; cold_promotion 로직: SGD 업데이트로 히스토리 반영 | 단일 (멀티-GPU N/A — GPU 없는 환경; 설계상 멀티노드 지원 구조 포함) | ✓ Pass |
 | 2026-05-24 | **DualPathNICLoadBalancer** (DualPath 2602.21548 기반 스토리지 NIC 부하 인식 이중 경로 라우터; nic_saturation_threshold=0.80; idle decode 노드 유휴 NIC(utilization<0.30) 중계 경로; min_load_first 정책; max_dual_path_per_node=4 상한; round-robin 균등 분산; make_dualpath_nic_scheduler_class() 팩토리; A+C Cross-1 메인 스케줄러) | **avg 0.003ms / p99 0.012ms** (독립 실측; 기준 0.1ms 크게 하회); **vLLM p99=0.005ms** (1000회 routing decision) | round-robin 균등 분산 smoke Pass; max_dual_path_per_node 제한 정상; 1P+3D 시뮬레이션 single/dual path 분기 정확 | 멀티 (P/D 분리 환경; decode 노드 유휴 NIC 중계 경로) | ✓ Pass |
 | 2026-05-26 | **ObjectCacheS3TierRouter** (ObjectCache 2605.22850 기반 S3 4번째 KV 계층 EMA break-even 게이팅; `hit_rate_breakeven = t_recompute/(t_recompute+t_s3)` 공식; EMA γ=0.9 히트율 추적; hysteresis ±0.05 진동 방지; max_s3_requests_per_batch 상한; make_objectcache_s3_scheduler_class() 팩토리; A+B Cross-1 메인 스케줄러) | **0.11 µs/req** (vLLM 실측; annotation-only; critical path S3 I/O 없음; 기준 5ms 대비 45,000배+ 여유) | break-even 공식 수식 검증 완료; EMA+hysteresis 정상; S3 활성화/비활성화/밴드 내 3시나리오 Pass; Non-S3 요청 우선 정렬(캐시 워밍) | 멀티 (S3 오브젝트 스토리지 RDMA 환경; annotation 단계) | ✓ Pass |
+| 2026-05-27 | **IndexMemSoftHitSchedulerMixin** (IndexMem arXiv 2605.25475 기반; im_pre_schedule() soft-hit 분류; block manager 연결 시 사전 저장 세그먼트 → soft_hit 분류; hard_hit/soft_hit/miss 3경로 라우팅; expire_session_interval 주기적 세션 정리; set_indexmem_block_manager() wiring; make_indexmem_soft_hit_scheduler_class() 팩토리; B+C 조합 보조 A 스케줄러) | **2.6 µs/req** (vLLM 실측; 1000µs 한도의 0.26%; 기준 5ms 대비 1,923배 여유) | soft_hit 분류 정확도 Pass(block manager 연결/미연결 양 시나리오); im_routing_stats(hard_hit_routes/soft_hit_routes/miss_routes) 정상; 세션 만료 테스트 Pass | 단일 (vLLM Scheduler 서브클래싱; GPU 없음) | ✓ Pass |
+
+**신규 달성 (2026-05-27)**: IndexMemSoftHitSchedulerMixin이 IndexMem(2605.25475) 기반 soft-hit 라우팅으로 vLLM im_pre_schedule 오버헤드 2.6µs/req(1000µs 한도의 0.26%) 달성. block manager 연결 시 사전 저장 세그먼트를 soft_hit으로 분류하는 3경로 라우팅(hard_hit/soft_hit/miss) 정상 동작 확인. 세션 만료(expire_session_interval) 주기적 state 정리 검증. make_indexmem_soft_hit_scheduler_class() 팩토리로 vLLM Scheduler 서브클래싱 확인. B+C 조합의 보조 Activity A 스케줄러로 6-사이클 backward-compat 유지.
 
 **신규 달성 (2026-05-26)**: ObjectCacheS3TierRouter(A-1)가 ObjectCache(2605.22850) 기반 S3 4번째 KV 계층에 EMA break-even 게이팅을 도입. `hit_rate_breakeven = T_recompute/(T_recompute+T_s3)` 공식과 hysteresis ±0.05 밴드로 S3 티어 진동 방지. vLLM annotation-only 방식으로 스케줄링 오버헤드 0.11 µs/req(기준 5ms 대비 45,000배 여유). make_objectcache_s3_scheduler_class() 팩토리로 vLLM v1 Scheduler 서브클래싱 확인. breakeven_table.yaml 5개 컨텍스트 길이(4096~65536) 전 유효값 검증.
 
