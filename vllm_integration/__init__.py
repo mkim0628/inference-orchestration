@@ -687,3 +687,51 @@ except (ImportError, AttributeError):
     KVPacketSegmentConfig = None               # type: ignore
     KVPacketSegmentMixin = None                # type: ignore
     make_kv_packet_kv_cache_manager_class = None  # type: ignore
+
+# ===========================================================================
+# 2026-05-27 imports (Activity B+C — IndexMem Soft Hit + Eviction Codec)
+# ===========================================================================
+
+# Activity C: IndexMem Eviction Codec attention hook
+try:
+    from vllm_integration.indexmem_eviction_codec_patch import (
+        IndexMemEvictionHookConfig,
+        IndexMemEvictionCodecAttentionHook,
+        extend_cache_config_indexmem,
+        apply_indexmem_eviction_patch,
+    )
+except (ImportError, AttributeError):
+    IndexMemEvictionHookConfig = None              # type: ignore
+    IndexMemEvictionCodecAttentionHook = None      # type: ignore
+    extend_cache_config_indexmem = None            # type: ignore
+    apply_indexmem_eviction_patch = None           # type: ignore
+
+# Activity B: IndexMem Soft Hit KV cache manager
+try:
+    from vllm_integration.indexmem_block_manager_patch import (
+        IndexMemSoftHitMixinConfig,
+        IndexMemSoftHitKVCacheManagerMixin,
+        SegmentLatentPool,
+        SoftHitResult,
+        make_indexmem_soft_hit_kv_cache_manager_class,
+        apply_indexmem_block_manager_patch,
+    )
+except (ImportError, AttributeError):
+    IndexMemSoftHitMixinConfig = None                      # type: ignore
+    IndexMemSoftHitKVCacheManagerMixin = None              # type: ignore
+    SegmentLatentPool = None                               # type: ignore
+    SoftHitResult = None                                   # type: ignore
+    make_indexmem_soft_hit_kv_cache_manager_class = None  # type: ignore
+    apply_indexmem_block_manager_patch = None              # type: ignore
+
+# Activity A+B: IndexMem Soft Hit Scheduler mixin
+try:
+    from vllm_integration.indexmem_vllm_scheduler_patch import (
+        IndexMemSoftHitSchedulerConfig,
+        IndexMemSoftHitSchedulerMixin,
+        make_indexmem_soft_hit_scheduler_class,
+    )
+except (ImportError, AttributeError):
+    IndexMemSoftHitSchedulerConfig = None              # type: ignore
+    IndexMemSoftHitSchedulerMixin = None               # type: ignore
+    make_indexmem_soft_hit_scheduler_class = None      # type: ignore

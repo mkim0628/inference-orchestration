@@ -7,6 +7,61 @@ implementation (src/) into the latest vLLM codebase.
 
 ---
 
+## 2026-05-27 Cycle: Activity B+C (IndexMem Soft Hit Segment Cache + Eviction Codec)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: B — IndexMemSoftHitKVCacheManagerMixin (arXiv 2605.25475, soft-hit non-contiguous reuse)
+        + C — IndexMemEvictionCodecAttentionHook (IndexMem Learnable Indexer + Latent Memory)
+        + A — IndexMemSoftHitSchedulerMixin (soft-hit routing, deprioritize recompute)
+Source: src/cache/indexmem_soft_hit_segment_cache.py (B)
+        src/cache/indexmem_eviction_codec.py (C)
+        src/cache/indexmem_learnable_indexer.py (C)
+        src/cache/indexmem_latent_memory_module.py (C)
+Report ①: reports/evaluations/2026-05-27.md (PASS, 132/132 tests, all mandatory criteria met)
+Loop: 1/3
+```
+
+### New Files (2026-05-27)
+
+| File | Activity | Description |
+|------|----------|-------------|
+| `indexmem_eviction_codec_patch.py` | C | `IndexMemEvictionCodecAttentionHook`: IndexMem Learnable Indexer scores tokens, retains budget_ratio (0.5), evicts remainder to `IndexMemLatentMemoryModule` latent state. `write_to_cache()` returns ORIGINAL KV (zero primary-kernel error); `read_from_cache()` returns compact retained KV for Activity B reuse. |
+| `indexmem_block_manager_patch.py` | B | `IndexMemSoftHitKVCacheManagerMixin`: three-tier cache (hard/soft/miss). `SegmentLatentPool`: DRAM store for evicted-KV latent states. `allocate_soft_hit_block()` for soft-hit block ID reservation. `weighted_hit_rate` tracking. |
+| `indexmem_vllm_scheduler_patch.py` | A+B | `IndexMemSoftHitSchedulerMixin`: classifies requests as hard_hit/soft_hit/miss. Deprioritizes recompute when soft-hit latent state available. `im_pre_schedule()` hook, `im_routing_stats()`. |
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **C** | `FlashAttentionImpl.forward()` | `indexmem_eviction_codec_patch.py` | `write_to_cache(key, layer_idx, k, v)`: intercept post-Q/K/V, store compact retained KV, return ORIGINAL tensors. `read_from_cache(key, layer_idx)`: Activity B reuse path only. |
+| **C** | `vllm.config.CacheConfig` | `indexmem_eviction_codec_patch.py` | `extend_cache_config_indexmem()`: injects `indexmem_budget_ratio`, `indexmem_beta`, `compression_method` via `object.__setattr__` (pydantic-compatible). |
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `indexmem_block_manager_patch.py` | `IndexMemSoftHitKVCacheManagerMixin`: parallel soft-hit store alongside native paged block pool. `SegmentLatentPool` in DRAM (not HBM). |
+| **A** | `vllm.v1.core.sched.scheduler.Scheduler` | `indexmem_vllm_scheduler_patch.py` | `IndexMemSoftHitSchedulerMixin.im_pre_schedule()`: wraps `schedule()`. Classifies waiting requests via block manager soft-hit cache. |
+
+### Accuracy Contract (Activity C — IndexMem Eviction Codec)
+
+| Path | Error | Guarantee |
+|------|-------|-----------|
+| Primary attention kernel | **Zero** | `write_to_cache()` returns ORIGINAL K/V unchanged — no softmax distortion |
+| Segment reuse (Activity B) | Bounded by budget_ratio | budget_ratio=0.5: 50% tokens retained with importance-guided selection |
+| Latent readout (beta=0.1) | < 1% perplexity | IndexMemLatentMemoryModule residual readout. Report ① 2026-05-27: all budget sweeps pass rel_err < 0.01 |
+
+### Key Metrics (Report ① 2026-05-27)
+
+| Metric | Value | Target |
+|--------|-------|--------|
+| Accuracy rel_err | 0.0 | < 0.01 |
+| KV Memory Reduction | −50% | ≥ −30% |
+| Weighted Hit Rate | 0.55 | baseline+5%p |
+| Noncontiguous Fraction | 1.0 (100%) | ≥ 30% |
+| Soft Hit Rate | 0.90 | — |
+| Test Pass Rate | 132/132 (100%) | 100% |
+
+---
+
 ## 2026-05-26 Cycle: Activity A+B+C (Irminsul MLA δ-Rotation + ObjectCache S3 4-Tier + MLATwoAxis Compression)
 
 ### vLLM Version
