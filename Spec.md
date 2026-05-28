@@ -1,150 +1,155 @@
-<!-- 변경 이유 (이전 Spec.md: 2026-05-26 대비):
-이전 사이클(2026-05-26)은 A+B(+C 시너지) 조합이었다:
-  - B-1 IrminsulMLANativeDeltaRotationArchAwareNonContiguousRouter (MLA δ-회전 비연속 재사용)
-  - A-1 ObjectCacheS3TierBreakEvenRoutingPolicy (S3 4번째 계층 라우터)
-  - B-2 CDCContentHashUnifiedSegmentIDInterface (통합 주소 체계)
-  - Cross-1 IrminsulObjectCacheCDCLayerwiseRDMAMLAPipeline (A+B 통합)
-  - C-1 MLATwoAxisCompressionCodec (선택적 C 시너지)
+<!-- 변경 이유 (이전 Spec.md: 2026-05-27 대비):
+이전 사이클(2026-05-27)은 B+C 조합이었다:
+  - C-1 IndexMemLearnableIndexerLatentMemoryEvictionCodec (퇴거 = 잠재 압축 + 조건부 복원)
+  - B-1 IndexMemSoftHitSegmentCache (소프트 히트 비연속 재사용)
+  - Cross-1 IndexMemBCIntegrationPipeline (B+C 통합)
+  - Cross-2 VeriCache + IndexMem 드래프트 수락률 향상
 
-이번 사이클(2026-05-27)은 B+C 조합으로 전환된다.
+이번 사이클(2026-05-28)은 A+B 조합으로 전환된다.
 핵심 전환:
-  - Activity C 최우선: IndexMem(arXiv 2605.25475)의 "퇴거 = 잠재 압축 + 조건부 복원"
-    패러다임을 Learnable Indexer (225-param MLP) + Latent Memory Module (경량 트랜스포머 인코더)로
-    구현한다. 과거 27개 사이클의 모든 C 기법에서 퇴거 후 잠재 기억으로 어텐션 기여를 보상하는
-    기법이 전무했다.
-  - Activity B 2순위: IndexMem 잠재 기억 소프트 히트 경로를 비연속 세그먼트 캐시에 통합해
-    비연속 재사용의 이진(binary) 모델을 연속체로 확장한다.
-  - Cross-1 B+C: UnifiedLatentPool로 세그먼트-레벨(B)과 토큰-레벨(C) 잠재 상태를 통합 관리.
-  - Cross-2 (Low-effort): VeriCacheSpeculativeCodec의 set_draft_codec()에 IndexMemEvictionCodec을
-    플러그인으로 연결한다 (기구현 VeriCache 재활용, 신규 코드 최소).
+  - Activity A 최우선: HexAGenT(arXiv 2605.16637) 기반 온라인-공개 DAG 워크플로우 스케줄러.
+    에이전틱 LLM 워크로드를 온라인-공개 DAG로 모델링하고, (1) 워크플로우 독립 완료 시간
+    지평선(standalone completion horizon) 실시간 추정, (2) SLO 위험 가중 우선순위
+    (SLO-risk-weighted priority)로 ready 호출 스케줄링, (3) KV 캐시 용량 제약 +
+    이기종 GPU 전송 지연을 스케줄링 목적함수에 통합하는 3-way 최적화.
+  - Activity A 2순위: PegaFlow GIL-free Rust 외부 KV 커넥터 래퍼 +
+    Bloom Filter 기반 RDMA 크로스-노드 세그먼트 라우터.
+  - Activity B 3순위: PegaFlowIrminsulDistributedSegmentCache —
+    Irminsul(05-26 기구현) MLA δ-회전 비연속 재사용을 PegaFlow RDMA를 통해
+    원격 노드까지 확장.
+  - Cross-1 (A+B): HexAGenT DAG + PegaFlow RDMA + Irminsul δ-회전
+    분산 비연속 재사용 통합 파이프라인.
 
-주요 변경:
-1. [신규] src/cache/indexmem_learnable_indexer.py (C-1 Learnable Indexer MLP)
-2. [신규] src/cache/indexmem_latent_memory_module.py (C-1 Latent Memory Module)
-3. [신규] src/cache/indexmem_eviction_codec.py (C-1 통합 코덱, CompressionCodec + DraftCodec 구현)
-4. [신규] src/cache/indexmem_soft_hit_segment_cache.py (B-1 소프트 히트 비연속 캐시)
-5. [신규] src/engine/indexmem_bc_pipeline.py (Cross-1 B+C 통합 파이프라인)
-6. [변경] src/metrics/hit_rate.py — weighted_hit_rate 지표 추가
-7. [신규] configs/experiments/2026-05-27.yaml
-8. [신규] configs/indexmem_indexer_weights.yaml (Learnable Indexer 가중치 저장)
-9. [신규] tests/unit/test_indexmem_learnable_indexer.py
-10. [신규] tests/unit/test_indexmem_latent_memory_module.py
-11. [신규] tests/unit/test_indexmem_eviction_codec.py
-12. [신규] tests/unit/test_indexmem_soft_hit_segment_cache.py
-13. [신규] tests/unit/test_compression_accuracy.py — IndexMem 케이스 추가
-14. [신규] tests/integration/test_indexmem_bc_pipeline_e2e.py (Cross-1)
-15. [보존] 모든 이전 사이클 구현 파일 수정 금지 (irminsul, objectcache, vericache, kv_packet 등).
+주요 신규 파일:
+1. [신규] src/scheduler/hexagent_workflow_scheduler.py (A-1 HexAGenT DAG 스케줄러)
+2. [신규] src/cache/pegaflow_kv_connector.py (A-2 PegaFlow CacheStore 래퍼)
+3. [신규] src/scheduler/pegaflow_rdma_router.py (A-2 RDMA 크로스-노드 라우터)
+4. [신규] src/cache/pegaflow_irminsul_distributed_cache.py (B-1 분산 비연속 캐시)
+5. [신규] src/engine/hexagent_irminsul_pegaflow_pipeline.py (Cross-1 A+B 파이프라인)
+6. [변경] src/metrics/hit_rate.py — DistributedHitRateMetrics 클래스 추가
+7. [신규] configs/experiments/2026-05-28.yaml
+8. [신규] configs/gpu_rdma_bandwidth_table.yaml (A100/H100/H200 RDMA 대역폭 사전 측정값)
+9. [신규] configs/pegaflow_peer_nodes.yaml (피어 노드 등록 목록)
+10. [신규] tests/unit/test_hexagent_workflow_scheduler.py
+11. [신규] tests/unit/test_pegaflow_kv_connector.py
+12. [신규] tests/unit/test_pegaflow_rdma_router.py
+13. [신규] tests/unit/test_pegaflow_irminsul_distributed_cache.py
+14. [신규] tests/integration/test_hexagent_irminsul_pegaflow_pipeline_e2e.py
+15. [보존] 모든 이전 사이클 구현 파일 수정 금지.
 -->
 
-# Spec — 2026-05-27: IndexMem Learnable Indexer + Latent Memory Eviction Codec (B+C)
+# Spec — 2026-05-28: HexAGenT DAG 워크플로우 스케줄러 + PegaFlow RDMA + Irminsul 분산 비연속 재사용 (A+B)
 
 ## 배경
 
-**기반 아이디어 리포트**: `reports/ideas/2026-05-27.md`
+**기반 아이디어 리포트**: `reports/ideas/2026-05-28.md`
 
-**최우선 구현 타겟**: C-1 `IndexMemLearnableIndexerLatentMemoryEvictionCodec`
-**2순위 구현 타겟**: Cross-2 `IndexMemVeriCacheLatentDraftVerifyPipeline` (플러그인 연결)
-**3순위 구현 타겟**: Cross-1 `IndexMemLatentSegmentBCIntegrationPipeline` (B+C 통합)
-**4순위 구현 타겟**: B-1 `IndexMemSoftHitSegmentCache`
+**최우선 구현 타겟**: A-1 `HexAGeTWorkflowHorizonAwareKVCapacityScheduler`
+**2순위 구현 타겟**: A-2 `PegaFlowRustKVConnectorRDMACrossNodeSegmentRouter`
+**3순위 구현 타겟**: B-1 `PegaFlowIrminsulDistributedSegmentCache`
+**4순위 구현 타겟**: Cross-1 `HexAGeTDAGPegaFlowRDMAIrminsulABPipeline`
 
 **해결하려는 문제**:
 
-- **Activity C (IndexMem "퇴거 = 잠재 압축 + 조건부 복원" 패러다임)**:
-  기존 모든 퇴거 기법(H2O, SnapKV, PyramidKV, DapQ 등)은 "어떤 토큰을 유지할 것인가(선택)"에만
-  집중하며, 퇴거된 토큰의 정보는 영구히 폐기한다. IndexMem(arXiv 2605.25475)은 (a) 학습
-  가능한 중요도 예측기(Learnable Indexer, 225-param MLP)로 입력-적응적 보존 결정을 내리고,
-  (b) Latent Memory Module(경량 트랜스포머 인코더)로 퇴거 토큰을 온라인-갱신 잠재 상태로
-  압축 보존해 디코딩 중 잔차 리드아웃(residual readout)으로 어텐션 기여를 보상한다.
-  RULER 스위트에서 SnapKV/PyramidKV 대비 최대 25포인트 개선.
+- **Activity A (HexAGenT 온라인-공개 DAG 3-way 최적화)**:
+  기존 모든 A 스케줄러(CacheTTL, PBKV, CONCUR, ThunderAgent, SideQuest, DualMap,
+  TokenDance, IndexMemTTLFallback 등 28개 사이클 전체)는 워크플로우 전체 완료 시간 지평선을
+  직접 목적함수로 삼지 않았으며, KV 캐시 용량 제약 + 이기종 GPU 전송 지연을 통합한
+  3-way 최적화가 없었다. HexAGenT(arXiv 2605.16637)의 원리를 구현해 에이전틱 워크로드의
+  SLO 달성 스케일 팩터를 95% 기준 20.1%, 99% 기준 33.0% 개선하면서 Scheduling Overhead
+  TTFT p50 +5% 이내를 달성한다.
 
-- **Activity B (소프트 히트 비연속 재사용)**:
-  기존 비연속 세그먼트 재사용은 물리적 KV가 캐시에 존재할 때만 히트를 발생시키는 이진 모델이다.
-  IndexMem의 잠재 기억 모듈을 비연속 세그먼트 캐시에 통합해, 물리적으로 퇴거된 세그먼트라도
-  잠재 상태가 존재하면 "소프트 히트"로 잔차 리드아웃을 제공한다. 비연속 재사용을 이진 → 연속체로 확장.
+- **Activity A (PegaFlow GIL-free Rust 외부 KV 커넥터)**:
+  Python 기반 KV 오프로딩 경로의 GIL 병목을 Rust 외부 프로세스 IPC로 완전히 제거하고,
+  Bloom Filter 기반 원격 세그먼트 인덱스 + RDMA 크로스-노드 조회를 단일 CacheStore 래퍼로 통합한다.
 
-- **Cross-2 (VeriCache + IndexMem 드래프트 수락률 향상)**:
-  VeriCacheSpeculativeCodec(05-25 기구현)의 set_draft_codec() 플러그인 인터페이스에
-  IndexMemEvictionCodec을 연결해 드래프트 품질을 향상시킨다. 신규 코드 최소.
+- **Activity B (PegaFlow RDMA + Irminsul δ-회전 분산 비연속 재사용)**:
+  Irminsul(05-26 기구현)의 MLA c_KV/k_r 분리 + δ-회전 위치 수정이 로컬 HBM/DRAM에서만
+  동작한다는 한계를 극복해, PegaFlow RDMA를 통해 원격 노드의 비연속 세그먼트까지 조회하고
+  δ-회전을 로컬에서 적용한다. 분산 비연속 히트율 목표: 전체 히트의 30% 이상.
+
+- **Cross-1 (A+B 통합 파이프라인)**:
+  HexAGenT DAG 스케줄러가 워크플로우 다음 단계의 세그먼트 수요를 예측하고,
+  PegaFlow RDMA가 전송 계층을 담당하며, Irminsul 분산 캐시가 δ-회전으로 위치 수정해
+  재사용하는 5단계 비동기 파이프라인.
 
 ---
 
 ## 아키텍처 다이어그램
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                     IndexMem B+C Integration Pipeline                    │
-│                                                                          │
-│  입력 토큰 시퀀스                                                         │
-│       │                                                                  │
-│       ▼                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │          IndexMemSoftHitSegmentCache (Activity B-1)             │    │
-│  │                                                                 │    │
-│  │  세그먼트 해시 조회                                               │    │
-│  │    ├─ Hard Hit  → 물리적 KV 텐서 반환                            │    │
-│  │    ├─ Soft Hit  → SegmentLatentPool.readout(query) → 잔차 반환  │    │
-│  │    └─ Miss      → 재계산 필요                                    │    │
-│  │                                                                 │    │
-│  └───────────────────────────┬─────────────────────────────────────┘    │
-│                              │  Hard Hit 경로 (물리적 KV)                │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │          IndexMemEvictionCodec (Activity C-1)                   │    │
-│  │                                                                 │    │
-│  │  IndexMemLearnableIndexer                                       │    │
-│  │    입력: [k_norm, v_norm, cumul_attn, pos_decay, query_sim]     │    │
-│  │    출력: retention_prob [0,1] per token                         │    │
-│  │       │                                                         │    │
-│  │       ▼  budget_ratio로 분리                                    │    │
-│  │  ┌─────────┐   ┌──────────────┐                                │    │
-│  │  │ to_keep │   │  to_evict    │                                │    │
-│  │  │  (물리  │   │              │                                │    │
-│  │  │  KV)   │   │              │                                │    │
-│  │  └────┬────┘   └──────┬───────┘                               │    │
-│  │       │               ▼                                        │    │
-│  │       │     IndexMemLatentMemoryModule                         │    │
-│  │       │       encode_evicted() → latent_state                  │    │
-│  │       │       online-update: α × new + (1-α) × prev           │    │
-│  │       │               │                                        │    │
-│  │       │               ▼                                        │    │
-│  │       │     디코딩 시: residual_readout(query, latent_state)   │    │
-│  │       │       attn_output += β × readout                      │    │
-│  │       │                                                        │    │
-│  └───────┴────────────────────────────────────────────────────────┘    │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │     UnifiedLatentPool (Cross-1 공유 인프라)                     │    │
-│  │                                                                 │    │
-│  │  segment_id → segment_latent  (B-1 세그먼트 레벨)               │    │
-│  │  (segment_id, token_range) → token_latent  (C-1 토큰 레벨)     │    │
-│  │                                                                 │    │
-│  │  SharedLatentEncoder (B-1 + C-1 파라미터 공유)                 │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Cross-2: VeriCacheSpeculativeCodec.set_draft_codec(IndexMemEviction)   │
-└──────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│              HexAGenT + PegaFlow + Irminsul A+B Integration Pipeline      │
+│                                                                           │
+│  에이전틱 세션 수신                                                        │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │    HexAGeTWorkflowScheduler (Activity A-1)                        │   │
+│  │                                                                    │   │
+│  │  WorkflowDAG 초기화 (task_type, dependency_ids)                   │   │
+│  │       │                                                            │   │
+│  │  standalone_completion_horizon() 실시간 추정                       │   │
+│  │  SLO-risk-weighted priority 계산                                   │   │
+│  │  KV 용량 제약 + 이기종 GPU 전송 지연 반영                            │   │
+│  │       │                                                            │   │
+│  │  배치 결정 (50ms 사이클)                                             │   │
+│  └───────────────────────────┬────────────────────────────────────────┘   │
+│                              │                                            │
+│                              ▼                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │    PegaFlowIrminsulDistributedSegmentCache (Activity B-1)         │   │
+│  │                                                                    │   │
+│  │  세그먼트 분산 검색 순서:                                             │   │
+│  │    1. 로컬 HBM (IrminsulMLASegmentCache 기구현)                   │   │
+│  │    2. PegaFlow 로컬 호스트/SSD (GIL-free IPC)                     │   │
+│  │    3. PegaFlow RDMA 원격 노드 (Bloom Filter → RDMA)               │   │
+│  │    4. Miss → 재계산                                                │   │
+│  │                                                                    │   │
+│  │  히트 시: δ-rotation(k_r, target_pos - source_pos) 로컬 적용       │   │
+│  │  c_KV: 위치-자유, 원격 수신 즉시 재사용                              │   │
+│  └───────────────────────────┬────────────────────────────────────────┘   │
+│                              │                                            │
+│                              ▼                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐   │
+│  │    PegaFlowKVConnector (Activity A-2) — CacheStore 래퍼           │   │
+│  │                                                                    │   │
+│  │  Unix 소켓 IPC → Rust PegaFlow 프로세스 (GIL-free)                │   │
+│  │  계층: GPU HBM → 호스트 DRAM → SSD → RDMA 원격                    │   │
+│  │  PegaFlowRDMACrossNodeRouter: Bloom Filter 원격 인덱스 유지        │   │
+│  └────────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+│  DistributedHitRateMetrics: {local_hard_hit, pegaflow_local_hit,          │
+│                               rdma_remote_hit, miss} 4단계 보고           │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 이번 사이클 Activity
 
-- [ ] Activity A: KV Cache-aware Scheduling  (이번 사이클 미포함)
-- [x] Activity B: Non-Contiguous KV Cache Reuse — IndexMem Soft Hit (B-1)
-- [x] Activity C: KV Cache Compression — IndexMem Learnable Indexer + Latent Memory (C-1)
+- [x] Activity A: KV Cache-aware Scheduling — HexAGenT DAG 스케줄러 (A-1) + PegaFlow RDMA 라우터 (A-2)
+- [x] Activity B: Non-Contiguous KV Cache Reuse — PegaFlow RDMA + Irminsul 분산 비연속 재사용 (B-1)
+- [ ] Activity C: KV Cache Compression (이번 사이클 미포함)
+
+**스케줄링 결정 단위**: 배치(batch) — 50ms 사이클마다 ready 태스크 전체를 재정렬해 배치 결정.
+**캐시 상태 접근 방법**: `HexAGeTWorkflowScheduler`가 `kv_available_bytes()` 헬퍼를 통해
+현재 GPU HBM 여유 KV 용량을 조회하고, 배치 구성 시 KV 수요 합계가 `kv_available`을 초과하지
+않도록 제한. gRPC heartbeat(100ms 주기)로 클러스터 전체 GPU HBM 가용량 집계.
 
 ---
 
 ## 목표
 
-- [ ] 목표 1: KV Cache Memory Reduction −40% 이상 (budget_ratio=0.5 기준) (evaluation_criteria.md §4)
-- [ ] 목표 2: Compression Accuracy Delta ±1% 이내 (WikiText-2 perplexity + RULER 스위트) (§4 필수)
-- [ ] 목표 3: Compression Accuracy Delta 실측 목표 ±0.3~0.8% (RULER-4K/16K 기준, IndexMem 원논문 근거) (§4)
-- [ ] 목표 4: 비연속 가중 히트율(weighted_hit_rate) 베이스라인 대비 +15~25%p (소프트 히트 포함) (§3)
-- [ ] 목표 5: Non-Contiguous Soft Hit Rate (n_soft_hits / total) 측정 및 보고 (신규 지표)
-- [ ] 목표 6: Cross-2 IndexMem 드래프트 수락률 vs 기존 Int8/TokenEviction 코덱 비교 (§5)
-- [ ] 목표 7: 복합 처리량 향상 (Cross-1) 베이스라인 대비 +20% 이상 (§5 복합 Throughput 향상)
+- [ ] 목표 1: Inference Throughput 베이스라인 대비 +20% 이상 tokens/sec (evaluation_criteria.md §1, §2)
+- [ ] 목표 2: Scheduling Overhead TTFT p50 +5% 이내 — DAG 갱신 + 우선순위 계산 < 1ms/사이클 (§2 필수)
+- [ ] 목표 3: Non-Contiguous Cache Hit Rate 전체 히트의 30% 이상이 비연속 구간에서 발생 (§3 높음)
+- [ ] 목표 4: 분산 비연속 히트율 (local + pegaflow_local + rdma_remote) 합산 베이스라인 대비 +5%p 이상 (§3 높음)
+- [ ] 목표 5: KV Memory Footprint 베이스라인 대비 +20% 이내 (§3 높음)
+- [ ] 목표 6: 캐시 히트율 — 스케줄링 미적용 대비 +10%p 이상 (§2 높음)
+- [ ] 목표 7: GIL Contention Rate < 1% — PegaFlow 연동 후 메인 루프 GIL 보유 시간 (신규 지표)
+- [ ] 목표 8: RDMA 크로스-노드 전송 지연 p50 — 재계산 비용 대비 이점 검증 (신규 지표)
+- [ ] 목표 9: 복합 Throughput 향상 단일 Activity 대비 추가 +5% 이상 (Cross-1, §5)
 
 ---
 
@@ -154,541 +159,542 @@
 
 | 파일 | Activity | 역할 |
 |------|----------|------|
-| `src/cache/indexmem_learnable_indexer.py` | C-1 | 225-param MLP 기반 입력-적응적 토큰 중요도 예측기; zero-shot DapQ fallback 포함 |
-| `src/cache/indexmem_latent_memory_module.py` | C-1 | 경량 트랜스포머 인코더 기반 잠재 기억 모듈; 온라인-갱신 잠재 상태 관리 + 잔차 리드아웃 |
-| `src/cache/indexmem_eviction_codec.py` | C-1 | CompressionCodec + DraftCodec 구현; Learnable Indexer + Latent Memory 통합 코덱 |
-| `src/cache/indexmem_soft_hit_segment_cache.py` | B-1 | CacheStore 구현; 소프트 히트 경로 + HitResult 반환 타입 + SegmentLatentPool |
-| `src/engine/indexmem_bc_pipeline.py` | Cross-1 | B+C 통합 파이프라인; UnifiedLatentPool + SharedLatentEncoder 공유 |
-| `configs/experiments/2026-05-27.yaml` | 공통 | 이번 사이클 실험 설정 |
-| `configs/indexmem_indexer_weights.yaml` | C-1 | Learnable Indexer 학습 완료 가중치 저장 위치 |
-| `tests/unit/test_indexmem_learnable_indexer.py` | C-1 | Learnable Indexer MLP 단위 테스트 |
-| `tests/unit/test_indexmem_latent_memory_module.py` | C-1 | Latent Memory Module 단위 테스트 |
-| `tests/unit/test_indexmem_eviction_codec.py` | C-1 | IndexMemEvictionCodec 단위 테스트 |
-| `tests/unit/test_indexmem_soft_hit_segment_cache.py` | B-1 | 소프트 히트 경로 + CacheStore 인터페이스 단위 테스트 |
-| `tests/integration/test_indexmem_bc_pipeline_e2e.py` | Cross-1 | B+C 통합 엔드-투-엔드 테스트 |
+| `src/scheduler/hexagent_workflow_scheduler.py` | A-1 | HexAGenT 온라인-공개 DAG 스케줄러; WorkflowDAG + TaskNode 자료구조; standalone_completion_horizon 실시간 추정; SLO-risk 우선순위; KV 용량 인식 배치 결정; 이기종 GPU 전송 지연 반영 |
+| `src/cache/pegaflow_kv_connector.py` | A-2 | CacheStore 구현; PegaFlow Rust 프로세스와 Unix 소켓 IPC; GIL-free put/get/delete; MockPegaFlowConnector fallback 포함 |
+| `src/scheduler/pegaflow_rdma_router.py` | A-2 | BaseScheduler 상속; Bloom Filter 기반 피어 세그먼트 인덱스; RDMA 크로스-노드 세그먼트 조회 라우팅; PeerRegistry |
+| `src/cache/pegaflow_irminsul_distributed_cache.py` | B-1 | CacheStore 구현; 로컬 HBM → PegaFlow 로컬 → PegaFlow RDMA 원격 4단계 조회; δ-rotation 원격 적용; 재사용 비용 결정 로직; 4단계 히트율 집계 |
+| `src/engine/hexagent_irminsul_pegaflow_pipeline.py` | Cross-1 | 5단계 A+B 통합 파이프라인; DAG 구성 → 세그먼트 분산 검색 → δ-rotation → DAG 갱신 비동기 루프 |
+| `configs/experiments/2026-05-28.yaml` | 공통 | 이번 사이클 실험 설정 |
+| `configs/gpu_rdma_bandwidth_table.yaml` | A-1 | A100/H100/H200 간 RDMA 대역폭 사전 측정값 (GB/s) |
+| `configs/pegaflow_peer_nodes.yaml` | A-2 | 피어 노드 등록 목록 `{node_id, rdma_address, port}` |
+| `tests/unit/test_hexagent_workflow_scheduler.py` | A-1 | DAG 구성, horizon 추정, SLO-risk 우선순위, KV 용량 배치 결정 단위 테스트 |
+| `tests/unit/test_pegaflow_kv_connector.py` | A-2 | MockPegaFlowConnector로 CacheStore 인터페이스, put/get/delete, 비동기 put 단위 테스트 |
+| `tests/unit/test_pegaflow_rdma_router.py` | A-2 | Bloom Filter 인덱스, 로컬 → RDMA 원격 라우팅 순서, PeerRegistry 단위 테스트 |
+| `tests/unit/test_pegaflow_irminsul_distributed_cache.py` | B-1 | 4단계 조회 순서, δ-rotation 적용, 재사용 결정 임계값, 분산 히트율 단위 테스트 |
+| `tests/integration/test_hexagent_irminsul_pegaflow_pipeline_e2e.py` | Cross-1 | 5단계 파이프라인 엔드-투-엔드 테스트 |
 
 ### 변경할 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
-| `src/metrics/hit_rate.py` | `WeightedHitRateMetrics` 클래스 추가 (weighted_hit_rate, soft_hit_rate 지표). 기존 `HitRateMetrics` 수정 금지 |
-| `tests/unit/test_compression_accuracy.py` | IndexMemEvictionCodec accuracy 검증 케이스 추가 (기존 케이스 보존) |
+| `src/metrics/hit_rate.py` | `DistributedHitRateMetrics` 클래스 추가. `{local_hard_hit, pegaflow_local_hit, rdma_remote_hit, miss}` 4단계 히트율 집계. 기존 `WeightedHitRateMetrics`, `HitRateMetrics` 수정 금지 |
 
 ---
 
 ## 알고리즘 상세
 
-### 1. IndexMemLearnableIndexer (Activity C-1) — `src/cache/indexmem_learnable_indexer.py`
+### 1. HexAGeTWorkflowScheduler (Activity A-1) — `src/scheduler/hexagent_workflow_scheduler.py`
+
+#### 자료구조
 
 ```python
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Optional, Set, Tuple
+import time
+
+TaskStatus = Literal["pending", "ready", "running", "done"]
+
 @dataclass
-class LearnableIndexerConfig:
-    input_dim: int = 5                # [k_norm, v_norm, cumul_attn_score, position_decay, query_sim]
-    hidden_dim: int = 32
-    output_dim: int = 1               # retention_prob
-    gamma_position_decay: float = 0.01
-    ema_alpha_cumul_attn: float = 0.1  # EMA 계수로 cumul_attn_score 갱신
-    zero_shot_mode: bool = False       # True: DapQ fallback (Learnable Indexer 비활성)
-    weights_path: Optional[str] = None # 학습 완료 가중치 경로 (YAML 외부화)
+class TaskNode:
+    task_id: str
+    task_type: Literal["planning", "tool_call", "synthesis", "refine"]
+    kv_demand_estimate: int          # 추정 KV 바이트 수
+    gpu_type_preference: str         # "A100" | "H100" | "H200" | "any"
+    dependency_ids: List[str]        # 이 태스크가 의존하는 선행 task_id 목록
+    slo_deadline: float              # 절대 시간 (time.monotonic() 기반)
+    status: TaskStatus = "pending"
+    # 런타임 추정값 (EMA 갱신)
+    t_prefill_ms: float = 0.0
+    t_decode_ms: float = 0.0
+    t_kv_transfer_ms: float = 0.0
+    assigned_gpu: Optional[str] = None
+
+
+@dataclass
+class WorkflowDAG:
+    workflow_id: str
+    nodes: Dict[str, TaskNode]       # task_id → TaskNode
+    edges: List[Tuple[str, str]]     # (upstream_id, downstream_id)
+    created_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class HexAGeTSchedulerConfig:
+    schedule_cycle_ms: float = 50.0       # 배치 결정 주기 (ms)
+    risk_weight: float = 2.0              # SLO 위험 가중치
+    alpha_gpu_affinity: float = 0.5       # GPU 어피니티 스코어 가중치
+    heartbeat_interval_ms: float = 100.0  # gRPC heartbeat 주기 (ms)
+    kv_size_per_token_bytes: int = 512    # 토큰당 KV 바이트 (레이어 포함 추정값)
+    n_layers: int = 32
+    ema_decay: float = 0.9                # 실행 시간 EMA 감쇠 계수
+    rdma_bandwidth_table_path: str = "configs/gpu_rdma_bandwidth_table.yaml"
     seed: int = 42
+```
 
+#### standalone_completion_horizon 추정
 
-class IndexMemLearnableIndexer:
-    """IndexMem Learnable Indexer — 입력-적응적 KV 토큰 중요도 예측기.
+```python
+def standalone_completion_horizon(
+    self,
+    task: TaskNode,
+    current_time: float,
+) -> float:
+    """태스크 독립 완료 시간 지평선 추정.
 
-    아키텍처:
-      inputs = [k_norm, v_norm, cumul_attn_score, position_decay, query_sim]
-      hidden = ReLU(Linear(5 → 32)(inputs))
-      retention_prob = Sigmoid(Linear(32 → 1)(hidden))
+    알고리즘:
+      horizon = current_time
+               + task.t_prefill_ms
+               + task.t_decode_ms
+               + task.t_kv_transfer_ms
 
-    파라미터 수: 5×32 + 32 + 32×1 + 1 = 225개 (극도로 경량)
+    t_prefill_ms: EMA 갱신값. 초기값: input_tokens × kv_size_per_token_bytes / gpu_throughput
+    t_decode_ms:  EMA 갱신값. 초기값: output_tokens_estimate × decode_ms_per_token
+    t_kv_transfer_ms: kv_demand_estimate / rdma_bandwidth(src_gpu, tgt_gpu)
+                      rdma_bandwidth_table_path에서 로드한 사전 측정 테이블 참조
 
-    zero_shot_mode=True 시 DapQ 방식으로 대체:
-      retention_prob = Sigmoid(query_sim × cumul_attn_score)
-      — 학습 데이터 없이 즉시 동작하는 fallback.
+    Returns:
+      horizon: float (monotonic 타임스탬프)
+    """
+```
 
-    학습:
-      LoRA rank=4, 어텐션 레이어만, 에폭 3~5.
-      data/processed/ 내 대표 샘플 + cumul_attn_score 기반 자기지도.
-      학습 완료 가중치: configs/indexmem_indexer_weights.yaml.
+#### SLO-risk 우선순위 계산
+
+```python
+def slo_risk_score(self, task: TaskNode, current_time: float) -> float:
+    """SLO 위험 점수.
+
+    알고리즘:
+      horizon = standalone_completion_horizon(task, current_time)
+      risk = max(0.0, horizon - task.slo_deadline) / task.slo_deadline
+      return risk
+
+    0.0 = 여유 있음, 1.0+ = SLO 위반 임박
     """
 
-    def __init__(self, config: LearnableIndexerConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        self._w1: torch.Tensor  # [32, 5]
-        self._b1: torch.Tensor  # [32]
-        self._w2: torch.Tensor  # [1, 32]
-        self._b2: torch.Tensor  # [1]
-        self._cumul_attn: Dict[str, torch.Tensor] = {}  # token_key → EMA 누적 어텐션
-        self._init_weights()
+def priority(self, task: TaskNode, current_time: float) -> float:
+    """배치 정렬 우선순위 (높을수록 먼저 처리).
 
-    def _init_weights(self) -> None:
-        """가중치 초기화. weights_path가 설정되어 있으면 파일에서 로드."""
-        ...
+    priority = base_priority + risk_weight × slo_risk_score(task)
+    base_priority: task_type별 사전 정의 (planning > synthesis > tool_call > refine)
+    """
+```
 
-    def predict(
-        self,
-        k: torch.Tensor,           # [n_tokens, d_head] Key 텐서
-        v: torch.Tensor,           # [n_tokens, d_head] Value 텐서
-        query: torch.Tensor,       # [d_head] 현재 쿼리 벡터 (또는 [n_q, d_head])
-        token_positions: torch.Tensor,   # [n_tokens] 절대 위치 인덱스
-        current_position: int,           # 현재 디코딩 위치
-        segment_key: str = "",           # cumul_attn_score EMA 추적용 키
-    ) -> torch.Tensor:
-        """토큰별 retention_prob 예측.
+#### KV 용량 인식 배치 결정
 
-        알고리즘:
-          1. k_norm = k.float().norm(dim=-1) / sqrt(d_head)  → [n_tokens]
-          2. v_norm = v.float().norm(dim=-1) / sqrt(d_head)  → [n_tokens]
-          3. cumul_attn = self._get_or_init_cumul_attn(segment_key, n_tokens)
-          4. pos_decay = exp(-γ × (current_position - token_positions))  → [n_tokens]
-          5. query_vec = query.float().mean(dim=0) if query.dim()==2 else query.float()
-             query_sim = F.cosine_similarity(k.float(), query_vec.unsqueeze(0), dim=-1) → [n_tokens]
-          6. features = stack([k_norm, v_norm, cumul_attn, pos_decay, query_sim], dim=-1) → [n_tokens, 5]
+```python
+def build_batch(
+    self,
+    ready_tasks: List[TaskNode],
+    kv_available_bytes: int,
+) -> List[TaskNode]:
+    """KV 용량 제약 내에서 최대 우선순위 태스크로 배치 구성.
 
-          if zero_shot_mode:
-            retention_prob = Sigmoid(query_sim * cumul_attn)
+    알고리즘:
+      current_time = time.monotonic()
+      sorted_tasks = sorted(ready_tasks,
+                            key=lambda t: self.priority(t, current_time),
+                            reverse=True)
+      batch = []
+      remaining_kv = kv_available_bytes
+      for task in sorted_tasks:
+          if task.kv_demand_estimate <= remaining_kv:
+              batch.append(task)
+              remaining_kv -= task.kv_demand_estimate
           else:
-            hidden = ReLU(features @ w1.T + b1)   # [n_tokens, 32]
-            retention_prob = Sigmoid(hidden @ w2.T + b2).squeeze(-1)  # [n_tokens]
+              # KV 용량 부족 → 저우선순위 기존 KV 퇴거 시도
+              evicted = self._try_evict_to_fit(task, remaining_kv)
+              if evicted >= task.kv_demand_estimate:
+                  batch.append(task)
+                  remaining_kv -= (task.kv_demand_estimate - evicted)
+      return batch
 
-        Returns:
-          retention_prob: [n_tokens], dtype=float32, range [0, 1]
-        """
-        ...
+    스케줄링 결정 단위: 배치 (schedule_cycle_ms마다 전체 ready_tasks 재평가)
+    캐시 상태 접근: kv_available_bytes 파라미터로 주입 (외부에서 HBM 여유 조회 후 전달)
+    """
+```
 
-    def update_cumul_attn(
-        self,
-        segment_key: str,
-        attn_scores: torch.Tensor,  # [n_tokens] 현재 스텝 어텐션 가중치
-    ) -> None:
-        """누적 어텐션 EMA 갱신.
-        cumul_attn = α × attn_scores + (1 - α) × cumul_attn
-        """
-        ...
+#### GPU 어피니티 스코어
 
-    def select_tokens_by_budget(
-        self,
-        retention_prob: torch.Tensor,  # [n_tokens]
-        budget_ratio: float,            # 0.0~1.0, 보존할 토큰 비율
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """retention_prob 기반으로 budget_ratio에 따라 to_keep/to_evict 인덱스 분리.
+```python
+def gpu_affinity_score(
+    self,
+    task: TaskNode,
+    gpu_id: str,
+) -> float:
+    """이기종 GPU 전송 비용 기반 어피니티 스코어 (낮을수록 선호).
 
-        알고리즘:
-          n_keep = max(1, int(n_tokens * budget_ratio))
-          kept_idx = retention_prob.topk(n_keep).indices.sort().values
-          evict_idx = complement(kept_idx)
+    score = -T_kv_transfer_to(gpu_id) - alpha × T_exec(task, gpu_id)
+    T_kv_transfer_to: rdma_bandwidth_table에서 현재 GPU → gpu_id 대역폭으로 계산
+    T_exec: kv_demand_estimate / gpu_throughput_table[gpu_id]
+    alpha: config.alpha_gpu_affinity (기본 0.5)
+    """
+```
 
-        Returns:
-          (kept_indices [n_keep], evict_indices [n_evict])
-        """
-        ...
+#### DAG 런타임 갱신
 
-    def save_weights(self, path: str) -> None:
-        """학습 완료 가중치를 YAML 파일로 저장."""
-        ...
+```python
+def reveal_dag_edges(
+    self,
+    workflow_id: str,
+    new_edges: List[Tuple[str, str]],
+    new_nodes: Optional[Dict[str, TaskNode]] = None,
+) -> None:
+    """태스크 완료 시 새로 공개된 의존성 DAG에 추가 (온라인-공개 DAG).
 
-    def load_weights(self, path: str) -> None:
-        """YAML 파일에서 가중치 로드."""
-        ...
+    알고리즘:
+      dag = self._dags[workflow_id]
+      dag.edges.extend(new_edges)
+      if new_nodes:
+          dag.nodes.update(new_nodes)
+      self._update_ready_status(dag)  # pending → ready 전환 재계산
+    """
+
+def schedule(self, requests: List) -> List:
+    """BaseScheduler 인터페이스 구현. requests를 TaskNode로 변환 후 build_batch 적용."""
 ```
 
 ---
 
-### 2. IndexMemLatentMemoryModule (Activity C-1) — `src/cache/indexmem_latent_memory_module.py`
+### 2. PegaFlowKVConnector (Activity A-2) — `src/cache/pegaflow_kv_connector.py`
 
 ```python
+from enum import IntEnum
+from typing import Optional
+import torch
+from src.cache.base import CacheStore
+
+
+class OpCode(IntEnum):
+    GET = 1
+    PUT = 2
+    DELETE = 3
+
+
 @dataclass
-class LatentMemoryConfig:
-    kv_dim: int = 128               # head_dim × n_heads (레이어별 전체 KV 차원)
-    latent_dim: int = 64            # 잠재 상태 차원 (기본값; kv_dim // 4 권장)
-    n_layers: int = 32              # 모델 레이어 수
-    encoder_hidden_dim: int = 128   # 경량 트랜스포머 인코더 hidden dim
-    encoder_n_heads: int = 4
-    encoder_ffn_dim: int = 256
-    encoder_n_layers: int = 2       # 트랜스포머 인코더 레이어 수
-    alpha_ema: float = 0.3          # 온라인 갱신 EMA 계수 (YAML 외부화)
-    beta_readout: float = 0.1       # 잔차 리드아웃 강도 (YAML 외부화)
-    readout_threshold: float = 0.0  # readout 활성화 임계값 (0.0 = 항상 적용)
+class PegaFlowConnectorConfig:
+    socket_path: str = "/tmp/pegaflow.sock"   # Unix 소켓 경로
+    async_put: bool = True                     # True: put()이 즉시 반환 (비동기)
+    timeout_ms: int = 100                      # get() 타임아웃 (ms)
+    use_mock: bool = True                      # True: MockPegaFlowConnector 사용
     seed: int = 42
 
 
-class IndexMemLatentMemoryModule:
-    """IndexMem Latent Memory Module — 퇴거 토큰 잠재 상태 압축 보존 + 잔차 리드아웃.
+class PegaFlowKVConnector(CacheStore):
+    """PegaFlow Rust 외부 KV 캐시 프로세스와 통신하는 CacheStore 래퍼.
 
-    아키텍처:
-      latent_encoder: 2-layer lightweight transformer encoder
-        hidden_dim=128, n_heads=4, ffn_dim=256
-        입력: evicted_kv [n_evicted, kv_dim] → 출력: latent [n_layers, latent_dim]
+    통신 방식: Unix 소켓 IPC (zero-copy 목표, Python GIL 경유 최소화)
+    실제 PegaFlow 프로세스 없는 환경에서는 MockPegaFlowConnector로 대체.
 
-    잠재 상태 메모리:
-      n_layers × latent_dim × FP16 = 32 × 64 × 2 = 4KB/요청 (극도로 소형)
+    계층 순서 (PegaFlow 내부): GPU HBM → 호스트 DRAM → SSD (PegaFlow 내부 정책)
+    Python 코드에서는 단일 get/put 인터페이스로 투명하게 접근.
 
-    온라인 갱신:
-      new_latent = alpha × encode(evicted_kv) + (1 - alpha) × current_latent
-
-    잔차 리드아웃:
-      attn_output += beta × readout(query_states, latent_state)
+    알고리즘:
+      put(key, value):
+        if async_put: socket.send_nonblocking(PUT, key, value)  → 즉시 반환
+        else: socket.send_recv(PUT, key, value)
+      get(key) → Optional[Tensor]:
+        response = socket.send_recv(GET, key, timeout=timeout_ms)
+        return response.tensor if response.found else None
+      delete(key):
+        socket.send_nonblocking(DELETE, key)
+      evict() → int:
+        # PegaFlow 내부 정책 위임: 로컬 통계 기반 추정값 반환
+        return self._eviction_stats.last_freed_bytes
     """
 
-    def __init__(self, config: LatentMemoryConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        # latent_encoder: 경량 트랜스포머 (파라미터 ~200K, GPU 메모리 < 1MB)
-        self._latent_states: Dict[str, torch.Tensor] = {}  # request_key → [n_layers, latent_dim]
-        self._readout_proj: torch.Tensor   # [kv_dim, latent_dim]  projection W_v
-        self._readout_key_proj: torch.Tensor  # [kv_dim, latent_dim]  projection W_k
-        self._init_encoder()
+    def __init__(self, config: PegaFlowConnectorConfig) -> None: ...
 
-    def _init_encoder(self) -> None:
-        """트랜스포머 인코더 + readout projection 초기화."""
-        ...
+    def put(self, key: str, value: torch.Tensor) -> None: ...
+    def get(self, key: str) -> Optional[torch.Tensor]: ...
+    def delete(self, key: str) -> None: ...
+    def evict(self) -> int: ...
+    def hit_rate(self) -> float: ...
+    def memory_bytes(self) -> int: ...
+    def reset_stats(self) -> None: ...
 
-    def encode_evicted(
-        self,
-        evicted_kv: torch.Tensor,      # [n_evicted, kv_dim]
-        request_key: str,               # 잠재 상태 추적용 키
-        layer_idx: int = 0,
-    ) -> torch.Tensor:
-        """퇴거 토큰들의 KV를 잠재 상태로 압축 및 온라인 갱신.
 
-        알고리즘:
-          1. encoded = latent_encoder(evicted_kv)  → [latent_dim]
-          2. prev_latent = self._latent_states.get(request_key, zeros)
-             → [n_layers, latent_dim]에서 layer_idx 행 참조
-          3. new_latent = alpha × encoded + (1 - alpha) × prev_latent[layer_idx]
-          4. self._latent_states[request_key][layer_idx] = new_latent
+class MockPegaFlowConnector(CacheStore):
+    """PegaFlow 없는 테스트 환경용 in-memory fallback.
 
-        Returns:
-          new_latent: [latent_dim]
-        """
-        ...
+    동일 CacheStore 인터페이스를 Python dict로 모의 구현.
+    GIL-free 동작 검증은 불가하지만 로직 단위 테스트에 사용.
+    """
 
-    def residual_readout(
-        self,
-        query_states: torch.Tensor,    # [n_heads, seq_len, head_dim] 또는 [n_q, d_head]
-        request_key: str,
-        layer_idx: int = 0,
-    ) -> torch.Tensor:
-        """잠재 상태 기반 잔차 리드아웃 계산.
+    def __init__(self, config: PegaFlowConnectorConfig) -> None:
+        self._store: dict = {}
+        self._hits: int = 0
+        self._total: int = 0
 
-        알고리즘:
-          latent = self._latent_states.get(request_key)  → [n_layers, latent_dim]
-          if latent is None: return zeros_like(query_states)
-          latent_l = latent[layer_idx]  → [latent_dim]
+    def put(self, key: str, value: torch.Tensor) -> None:
+        self._store[key] = value
 
-          readout_v = latent_l @ readout_proj   → [kv_dim]
-          readout_k = latent_l @ readout_key_proj → [kv_dim]
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        self._total += 1
+        v = self._store.get(key)
+        if v is not None:
+            self._hits += 1
+        return v
 
-          # 쿼리를 [n_q, d_head]로 정규화
-          q_flat = query_states.reshape(-1, d_head)  → [n_q, d_head]
-          attn_weight = softmax(q_flat @ readout_k.unsqueeze(-1) / sqrt(d_head))  → [n_q, 1]
-          readout = attn_weight * readout_v.unsqueeze(0)  → [n_q, kv_dim]
-          return beta_readout × readout.reshape_as(query_states)
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
 
-        오버헤드: latent_dim=64, n_q≤512 기준 < 0.3ms/스텝
-        """
-        ...
+    def evict(self) -> int:
+        if not self._store:
+            return 0
+        key = next(iter(self._store))
+        val = self._store.pop(key)
+        return val.nelement() * val.element_size()
 
-    def get_latent_state(
-        self, request_key: str, layer_idx: int = 0
-    ) -> Optional[torch.Tensor]:
-        """현재 잠재 상태 반환. 없으면 None."""
-        ...
+    def hit_rate(self) -> float:
+        return self._hits / self._total if self._total > 0 else 0.0
 
-    def clear(self, request_key: str) -> None:
-        """요청 완료 후 잠재 상태 삭제."""
-        ...
+    def memory_bytes(self) -> int:
+        return sum(v.nelement() * v.element_size() for v in self._store.values())
 
-    def latent_memory_bytes(self) -> int:
-        """전체 잠재 상태 메모리 크기 (바이트)."""
-        ...
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._total = 0
 ```
 
 ---
 
-### 3. IndexMemEvictionCodec (Activity C-1) — `src/cache/indexmem_eviction_codec.py`
+### 3. PegaFlowRDMACrossNodeRouter (Activity A-2) — `src/scheduler/pegaflow_rdma_router.py`
 
 ```python
 @dataclass
-class IndexMemEvictionConfig:
-    budget_ratio: float = 0.5          # 보존할 KV 비율 (0.0~1.0)
-    base_eviction_policy: str = "snapkv"  # "h2o" | "snapkv" | "dapq" | "learned"
-    alpha_ema: float = 0.3             # Latent Memory 온라인 갱신 EMA (YAML 외부화)
-    beta_readout: float = 0.1          # 잔차 리드아웃 강도 (YAML 외부화)
-    latent_dim: int = 64               # 잠재 상태 차원
-    n_layers: int = 32                 # 모델 레이어 수
-    kv_dim: int = 128                  # head_dim × n_heads
-    zero_shot_mode: bool = False       # Learnable Indexer → DapQ fallback
-    max_accuracy_delta: float = 0.01   # accuracy delta 임계값 (±1%)
-    fallback_budget_ratio: float = 0.6 # accuracy delta 초과 시 fallback budget_ratio
-    fallback_beta: float = 0.05        # accuracy delta 초과 시 fallback beta_readout
+class PeerNodeEntry:
+    node_id: str
+    rdma_address: str
+    port: int
+
+
+@dataclass
+class PegaFlowRDMARouterConfig:
+    peer_nodes_config_path: str = "configs/pegaflow_peer_nodes.yaml"
+    bloom_filter_capacity: int = 100_000    # Bloom Filter 예상 세그먼트 수
+    bloom_filter_error_rate: float = 0.01   # 거짓 양성 허용 비율
+    bloom_sync_interval_ms: float = 500.0   # Bloom Filter 동기화 주기 (ms)
+    rdma_reuse_discount: float = 0.8        # RDMA 전송 비용 < 재계산 비용 × 0.8 시 재사용
     seed: int = 42
 
 
-class IndexMemEvictionCodec(CompressionCodec):
-    """IndexMem 학습 가능한 중요도 예측기 + 잠재 기억 모듈 퇴거 코덱.
+class PeerRegistry:
+    """피어 노드별 세그먼트 Bloom Filter 인덱스.
 
-    Activity C: "퇴거 = 잠재 압축 + 조건부 복원" 패러다임.
+    각 피어 노드의 보유 세그먼트 집합을 Bloom Filter로 근사 관리.
+    거짓 양성 허용 (불필요한 RDMA 시도 가능) — 거짓 음성 방지 (히트 누락 방지).
 
-    구성:
-      - IndexMemLearnableIndexer: 입력-적응적 토큰 중요도 예측 (225-param MLP)
-      - IndexMemLatentMemoryModule: 퇴거 후 잠재 기억 보존 + 잔차 리드아웃
-
-    플러그인 통합:
-      - base_eviction_policy 파라미터로 기존 휴리스틱 교체 가능
-        ("h2o": H2O 정책, "snapkv": SnapKV, "dapq": DapQ, "learned": Learnable Indexer)
-      - VeriCacheSpeculativeCodec.set_draft_codec(self)로 Cross-2 즉시 연동
-
-    DraftCodec 인터페이스도 구현하여 VeriCache 호환성 보장.
-
-    Fallback 메커니즘:
-      accuracy delta > max_accuracy_delta(1%) 감지 시:
-        budget_ratio → fallback_budget_ratio(0.6)
-        beta_readout → fallback_beta(0.05)
+    Bloom Filter 갱신: bloom_sync_interval_ms마다 gRPC로 피어에서 비트맵 수신.
     """
 
-    def __init__(self, config: IndexMemEvictionConfig) -> None:
+    def __init__(self, config: PegaFlowRDMARouterConfig) -> None: ...
+
+    def has_segment(self, node_id: str, segment_id: bytes) -> bool:
+        """피어 node_id가 segment_id를 보유할 가능성 반환 (Bloom Filter 조회)."""
         ...
-        self.indexer = IndexMemLearnableIndexer(
-            LearnableIndexerConfig(
-                zero_shot_mode=config.zero_shot_mode,
-                seed=config.seed,
-            )
-        )
-        self.latent_memory = IndexMemLatentMemoryModule(
-            LatentMemoryConfig(
-                latent_dim=config.latent_dim,
-                n_layers=config.n_layers,
-                kv_dim=config.kv_dim,
-                alpha_ema=config.alpha_ema,
-                beta_readout=config.beta_readout,
-                seed=config.seed,
-            )
-        )
 
-    # ---- CompressionCodec interface (src/cache/compression.py 호환) ----
+    def update_bloom_from_peer(self, node_id: str, bloom_bitmap: bytes) -> None:
+        """피어에서 수신한 Bloom Filter 비트맵으로 로컬 인덱스 갱신."""
+        ...
 
-    def encode(
+    def register_local_segment(self, segment_id: bytes) -> None:
+        """로컬 노드가 새 세그먼트를 획득 시 피어들에게 전파할 비트맵 갱신."""
+        ...
+
+
+class PegaFlowRDMACrossNodeRouter(BaseScheduler):
+    """Bloom Filter 기반 피어 세그먼트 인덱스 + RDMA 크로스-노드 세그먼트 라우터.
+
+    스케줄링 결정 단위: 요청 (세그먼트 조회 단위)
+    캐시 상태 접근: PeerRegistry.has_segment() O(1) Bloom Filter 조회 후 RDMA 전송 결정
+
+    알고리즘 (route_segment_request):
+      1. 로컬 PegaFlow 조회 (local_connector.get(segment_id))
+         → 히트: 반환 ("pegaflow_local")
+      2. 피어 노드 Bloom Filter 순회 (has_segment(peer_id, segment_id))
+         → 양성 피어 발견: RDMA 전송 비용 vs 재계산 비용 비교
+           - rdma_latency < recompute_latency × rdma_reuse_discount → RDMA 조회 선택
+           - 아니면 다음 피어 시도
+      3. 전체 미스 → None 반환 ("miss")
+    """
+
+    def __init__(
         self,
-        kv: torch.Tensor,      # [n_tokens, kv_dim] 또는 [n_tokens, d_head]
-        layer_idx: int,
-        tensor_id: int = 0,
-        query: Optional[torch.Tensor] = None,
-        token_positions: Optional[torch.Tensor] = None,
-        current_position: int = 0,
-        request_key: str = "",
-    ) -> torch.Tensor:
-        """KV 압축: Learnable Indexer로 중요도 예측 → budget_ratio 기반 to_keep/to_evict 분리
-        → to_evict를 Latent Memory로 인코딩 → to_keep만 반환.
+        local_connector: PegaFlowKVConnector,
+        peer_registry: PeerRegistry,
+        config: PegaFlowRDMARouterConfig,
+    ) -> None: ...
 
-        알고리즘:
-          1. query가 None이면 kv.mean(dim=0) 사용 (fallback)
-          2. retention_prob = indexer.predict(k, v, query, positions, current_position)
-          3. kept_idx, evict_idx = indexer.select_tokens_by_budget(retention_prob, budget_ratio)
-          4. latent_memory.encode_evicted(kv[evict_idx], request_key, layer_idx)
-          5. return kv[kept_idx]  # 압축 KV (budget_ratio × n_tokens 크기)
-        """
-        ...
-
-    def decode(
+    def route_segment_request(
         self,
-        compressed: torch.Tensor,  # [n_keep, kv_dim]  encode() 반환값
-        layer_idx: int,
-        tensor_id: int = 0,
-    ) -> torch.Tensor:
-        """decode()는 압축된 KV 그대로 반환 (복원은 residual_readout을 통해).
-        VeriCache verify 단계에서 전체 KV를 별도 유지하므로 여기서 완전 복원 불필요.
-        """
-        return compressed
+        segment_id: bytes,
+        local_node_id: str,
+    ) -> Tuple[Optional[torch.Tensor], str]:
+        """세그먼트 조회 라우팅.
 
-    def compression_ratio(self, layer_idx: int) -> float:
-        """이론적 압축율: 1 / budget_ratio."""
-        return 1.0 / self.config.budget_ratio
-
-    # ---- DraftCodec interface (VeriCacheSpeculativeCodec 호환) ----
-
-    def compress(self, kv: torch.Tensor) -> Tuple[torch.Tensor, str]:
-        """DraftCodec.compress 인터페이스 구현 (Cross-2 VeriCache 연동).
-
-        Returns (compressed_kv, request_key).
-        request_key는 kv tensor ID 기반으로 자동 생성.
+        Returns:
+          (kv_tensor, hit_type): hit_type ∈ {"pegaflow_local", "rdma_remote", "miss"}
         """
         ...
 
-    def decompress(self, compressed_kv: Tuple[torch.Tensor, str]) -> torch.Tensor:
-        """DraftCodec.decompress 인터페이스 구현.
-
-        잠재 기억 잔차 리드아웃을 포함한 근사 KV 반환.
-        """
-        ...
-
-    @property
-    def compression_ratio_float(self) -> float:
-        """DraftCodec.compression_ratio 호환."""
-        return 1.0 / self.config.budget_ratio
-
-    # ---- Readout API ----
-
-    def get_readout(
+    def estimate_rdma_latency_ms(
         self,
-        query_states: torch.Tensor,   # [n_q, d_head]
-        layer_idx: int = 0,
-        request_key: str = "",
-    ) -> torch.Tensor:
-        """잠재 기억 잔차 리드아웃 반환. attn_output += get_readout(...)로 사용."""
-        return self.latent_memory.residual_readout(query_states, request_key, layer_idx)
-
-    # ---- Accuracy fallback ----
-
-    def auto_adjust_on_accuracy_delta(
-        self,
-        accuracy_delta: float,
-    ) -> bool:
-        """accuracy delta > max_accuracy_delta 감지 시 budget_ratio + beta_readout 조정.
-
-        Returns True if adjustment was made.
-        """
-        if abs(accuracy_delta) > self.config.max_accuracy_delta:
-            self.config.budget_ratio = self.config.fallback_budget_ratio
-            self.latent_memory.config.beta_readout = self.config.fallback_beta
-            return True
-        return False
-
-    # ---- Statistics ----
-
-    def compression_stats(self) -> dict:
-        """JSON-serializable 압축 통계."""
+        segment_size_bytes: int,
+        target_node_id: str,
+    ) -> float:
+        """RDMA 전송 지연 추정: segment_size_bytes / rdma_bandwidth_gbps × 1000."""
         ...
+
+    def estimate_recompute_latency_ms(
+        self,
+        segment_token_count: int,
+        gpu_throughput_tokens_per_ms: float = 1.0,
+    ) -> float:
+        """재계산 비용 추정: segment_token_count / gpu_throughput_tokens_per_ms."""
+        ...
+
+    def schedule(self, requests: List) -> List:
+        """BaseScheduler 인터페이스 구현 — 요청 리스트를 그대로 반환 (라우팅 사이드이펙트)."""
+        return requests
 ```
 
 ---
 
-### 4. IndexMemSoftHitSegmentCache (Activity B-1) — `src/cache/indexmem_soft_hit_segment_cache.py`
+### 4. PegaFlowIrminsulDistributedSegmentCache (Activity B-1) — `src/cache/pegaflow_irminsul_distributed_cache.py`
 
 ```python
 from typing import Literal
 
-
-@dataclass
-class HitResult:
-    """캐시 조회 결과. 이진 hit/miss를 연속체로 확장."""
-    type: Literal["hard", "soft", "miss"]
-    kv_tensor: Optional[torch.Tensor]     # hard hit 시 물리적 KV, 나머지 None
-    latent_state: Optional[torch.Tensor]  # soft hit 시 잠재 상태 벡터, 나머지 None
-    segment_key: str = ""
+HitType = Literal["local_hard_hit", "pegaflow_local_hit", "rdma_remote_hit", "miss"]
 
 
 @dataclass
-class SoftHitSegmentConfig:
-    chunk_size: int = 128                  # 세그먼트 청크 크기 (고정)
-    max_physical_entries: int = 1000       # 물리적 KV 캐시 최대 항목 수
-    latent_pool_max_segments: int = 10000  # 잠재 풀 최대 세그먼트 수 (YAML 외부화)
-    beta_soft: float = 0.1                 # 소프트 히트 잔차 기여 강도 (YAML 외부화)
-    beta_weight: float = 0.5               # weighted_hit_rate에서 소프트 히트 가중치
-    latent_dim: int = 64                   # 잠재 상태 차원
-    kv_dim: int = 128
-    n_layers: int = 32
+class IrminsulKVEntry:
+    """Irminsul MLA 세그먼트 항목 (05-26 IrminsulMLASegmentCache 호환)."""
+    segment_id: bytes
+    c_kv_tensor: torch.Tensor   # [n_tokens, n_heads, d_kv] — 위치-자유
+    k_r_tensor: torch.Tensor    # [n_tokens, n_heads, d_r]  — 위치-의존 (δ-rotation 필요)
+    source_position: int         # 원래 시퀀스 위치 (δ 계산용)
+
+
+@dataclass
+class DistributedSegmentCacheConfig:
+    rdma_reuse_discount: float = 0.8         # RDMA 재사용 결정 임계값 (YAML 외부화)
+    bloom_sync_interval_ms: float = 500.0    # Bloom Filter 동기화 주기 (YAML 외부화)
+    local_max_entries: int = 5000            # 로컬 HBM 최대 세그먼트 항목 수
+    avg_chunk_size: int = 256                # CDC 청킹 평균 크기 (Irminsul 기본값)
     seed: int = 42
 
 
-class IndexMemSoftHitSegmentCache(CacheStore):
-    """IndexMem 소프트 히트 비연속 세그먼트 캐시 (Activity B-1).
+class PegaFlowIrminsulDistributedSegmentCache(CacheStore):
+    """PegaFlow RDMA + Irminsul MLA δ-회전 분산 비연속 세그먼트 캐시 (Activity B-1).
 
-    비연속 재사용 모델을 이진(hard hit / miss)에서 연속체로 확장:
-      - Hard Hit: 물리적 KV가 캐시에 존재 → kv_tensor 반환
-      - Soft Hit: 물리적 KV가 퇴거되었지만 잠재 상태 존재 → latent_state 반환
-      - Miss: 물리적 KV도 잠재 상태도 없음 → 재계산 필요
+    로컬 Irminsul 캐시(05-26 기구현) + PegaFlow 계층을 통합한 4단계 조회 경로:
+      1. 로컬 HBM (IrminsulMLASegmentCache 기구현 활용)
+      2. PegaFlow 로컬 호스트/SSD (PegaFlowKVConnector.get)
+      3. PegaFlow RDMA 원격 노드 (PegaFlowRDMACrossNodeRouter.route_segment_request)
+      4. Miss → 재계산
 
-    HitResult 반환 타입으로 소프트 히트를 명시적으로 분리.
-    CacheStore 인터페이스 완전 구현.
+    δ-회전 적용:
+      - c_KV: 위치-자유이므로 원격 수신 즉시 재사용 가능
+      - k_r: source_position 기반 δ = target_position - source_position
+              k_r_corrected = RoPE(k_r_tensor, δ) — 로컬 GPU에서 처리
 
-    가중 히트율:
-      weighted_hit_rate = (n_hard + beta_weight × n_soft) / total
+    재사용 결정:
+      rdma_transfer_latency < recompute_latency × rdma_reuse_discount → 원격 재사용
+
+    4단계 히트율:
+      DistributedHitRateMetrics.record(local_hard, pegaflow_local, rdma_remote, miss) 호출
     """
 
-    def __init__(self, config: SoftHitSegmentConfig) -> None:
-        torch.manual_seed(config.seed)
-        self.config = config
-        self._physical_store: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self._segment_latent_pool: Dict[str, torch.Tensor] = {}   # segment_key → latent_state
-        self._latent_encoder: IndexMemLatentMemoryModule = IndexMemLatentMemoryModule(
-            LatentMemoryConfig(
-                latent_dim=config.latent_dim,
-                kv_dim=config.kv_dim,
-                n_layers=config.n_layers,
-                seed=config.seed,
-            )
-        )
-        self._n_hard_hits: int = 0
-        self._n_soft_hits: int = 0
-        self._n_misses: int = 0
-        self._n_noncontiguous_hard_hits: int = 0
-        self._n_noncontiguous_soft_hits: int = 0
+    def __init__(
+        self,
+        local_irminsul_cache: "IrminsulMLASegmentCache",   # 05-26 기구현, 타입 힌트만
+        pegaflow_local: PegaFlowKVConnector,
+        pegaflow_rdma_router: PegaFlowRDMACrossNodeRouter,
+        config: DistributedSegmentCacheConfig,
+    ) -> None: ...
 
     # ---- CacheStore 추상 메서드 구현 ----
 
     def put(self, key: str, value: torch.Tensor) -> None:
-        """물리적 KV 저장. 용량 초과 시 LRU 퇴거 + 잠재 상태 인코딩."""
+        """로컬 HBM에 저장 + PegaFlow 로컬에도 비동기 put."""
         ...
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        """물리적 KV 조회. 소프트 히트는 get_hit_result()를 사용할 것."""
+        """4단계 조회. 내부적으로 get_distributed를 호출."""
         ...
 
     def evict(self) -> int:
-        """LRU 퇴거. 퇴거 전 잠재 상태 인코딩 후 SegmentLatentPool 저장."""
+        """로컬 HBM에서 LRU 퇴거 후 PegaFlow에 비동기 put (오프로딩)."""
         ...
 
     def hit_rate(self) -> float:
-        """이진 히트율 (하드 히트만). 하위 호환 유지."""
-        total = self._n_hard_hits + self._n_soft_hits + self._n_misses
-        return self._n_hard_hits / total if total > 0 else 0.0
-
-    def memory_bytes(self) -> int:
-        """물리적 KV 메모리 크기."""
+        """전체 히트율 (local + pegaflow_local + rdma_remote) / total."""
         ...
 
-    def reset_stats(self) -> None:
-        self._n_hard_hits = 0
-        self._n_soft_hits = 0
-        self._n_misses = 0
-        self._n_noncontiguous_hard_hits = 0
-        self._n_noncontiguous_soft_hits = 0
+    def memory_bytes(self) -> int:
+        """로컬 HBM KV 메모리 크기."""
+        ...
 
-    # ---- 소프트 히트 확장 API ----
+    def reset_stats(self) -> None: ...
 
-    def get_hit_result(
+    # ---- 분산 조회 핵심 API ----
+
+    def get_distributed(
         self,
-        segment_key: str,
-    ) -> HitResult:
-        """소프트 히트 경로 포함 HitResult 반환.
+        segment_id: bytes,
+        target_position: int,
+    ) -> Tuple[Optional[torch.Tensor], HitType]:
+        """4단계 분산 조회 + δ-회전 적용.
 
         알고리즘:
-          if segment_key in _physical_store:
-            return HitResult(type="hard", kv_tensor=_physical_store[key])
-          elif segment_key in _segment_latent_pool:
-            return HitResult(type="soft", latent_state=_segment_latent_pool[key])
-          else:
-            return HitResult(type="miss")
+          # 1. 로컬 HBM (Irminsul 기존 경로)
+          entry = local_irminsul_cache.get_entry(segment_id)
+          if entry:
+              kv = apply_delta_rotation(entry, target_position)
+              metrics.record("local_hard_hit")
+              return kv, "local_hard_hit"
+
+          # 2. PegaFlow 로컬 호스트/SSD
+          raw = pegaflow_local.get(segment_id.hex())
+          if raw is not None:
+              entry = deserialize_irminsul_entry(raw)
+              kv = apply_delta_rotation(entry, target_position)
+              metrics.record("pegaflow_local_hit")
+              return kv, "pegaflow_local_hit"
+
+          # 3. PegaFlow RDMA 원격 노드 (비용 비교 후 결정)
+          rdma_result, hit_type_rdma = rdma_router.route_segment_request(
+              segment_id, local_node_id
+          )
+          if rdma_result is not None and hit_type_rdma == "rdma_remote":
+              entry = deserialize_irminsul_entry(rdma_result)
+              kv = apply_delta_rotation(entry, target_position)
+              metrics.record("rdma_remote_hit")
+              return kv, "rdma_remote_hit"
+
+          # 4. Miss
+          metrics.record("miss")
+          return None, "miss"
         """
         ...
 
-    def soft_hit_residual(
+    def apply_delta_rotation(
         self,
-        query_states: torch.Tensor,   # [n_heads, seq_len, head_dim] 또는 [n_q, d_head]
-        latent_state: torch.Tensor,   # [latent_dim]
+        entry: IrminsulKVEntry,
+        target_position: int,
     ) -> torch.Tensor:
-        """소프트 히트 경로: 잠재 상태 기반 잔차 리드아웃.
+        """Irminsul δ-회전 위치 수정.
 
         알고리즘:
-          readout = cross_attn(query_states, latent_state)
-          return beta_soft × readout
+          delta = target_position - entry.source_position
+          k_r_corrected = rope_rotate(entry.k_r_tensor, delta)
+          # c_KV는 위치-자유이므로 delta 무관
+          return concat(entry.c_kv_tensor, k_r_corrected, dim=-1)
 
-        beta_soft 자동 조정 (EMA):
-          하드 히트 비율 높으면 beta_soft 감소 (소프트 기여 줄임)
-          소프트 히트만 있으면 beta_soft 증가 (최대 config.beta_soft × 2)
+        RoPE 회전: 기존 src/cache/irminsul_mla_segment_cache.py의
+                   delta_rotate_k_r() 함수 import하여 재사용
         """
         ...
 
@@ -696,490 +702,330 @@ class IndexMemSoftHitSegmentCache(CacheStore):
         self,
         token_ids: List[int],
         chunk_idx: int,
-        kv: torch.Tensor,
+        c_kv: torch.Tensor,
+        k_r: torch.Tensor,
+        source_position: int,
         layer_idx: int = 0,
-    ) -> str:
-        """SegmentedHashCache 호환 API. segment_key 반환."""
+    ) -> bytes:
+        """Irminsul 스타일 CDC 청킹 + 세그먼트 저장. segment_id(bytes) 반환."""
         ...
 
-    def get_segments(
-        self,
-        token_ids: List[int],
-        layer_idx: int = 0,
-    ) -> Tuple[List[Tuple[int, HitResult]], List[int]]:
-        """소프트 히트 경로 포함 세그먼트 조회.
+    def distributed_hit_rate_breakdown(self) -> dict:
+        """4단계 히트율 분리 집계 반환.
 
         Returns:
-          hits: [(chunk_idx, HitResult), ...] — hard + soft hit 모두 포함
-          miss_chunk_indices: [int, ...] — 완전 미스 청크 인덱스
+          {
+            "local_hard_hit_rate": float,
+            "pegaflow_local_hit_rate": float,
+            "rdma_remote_hit_rate": float,
+            "miss_rate": float,
+            "distributed_hit_rate": float,  # local + pegaflow_local + rdma_remote
+          }
         """
         ...
-
-    def noncontiguous_hit_rate(self) -> float:
-        """비연속 하드 히트율."""
-        ...
-
-    def soft_hit_rate(self) -> float:
-        """소프트 히트율: n_soft_hits / total."""
-        total = self._n_hard_hits + self._n_soft_hits + self._n_misses
-        return self._n_soft_hits / total if total > 0 else 0.0
-
-    def weighted_hit_rate(self) -> float:
-        """가중 히트율: (n_hard + beta_weight × n_soft) / total."""
-        total = self._n_hard_hits + self._n_soft_hits + self._n_misses
-        if total == 0:
-            return 0.0
-        return (
-            self._n_hard_hits + self.config.beta_weight * self._n_soft_hits
-        ) / total
 ```
 
 ---
 
-### 5. WeightedHitRateMetrics (변경) — `src/metrics/hit_rate.py`에 추가
+### 5. DistributedHitRateMetrics (변경) — `src/metrics/hit_rate.py`에 추가
 
 ```python
 @dataclass
-class WeightedHitRateMetrics:
-    """소프트 히트 경로 포함 가중 히트율 지표. 기존 HitRateMetrics와 별개."""
-    total_requests: int = 0
-    total_chunks: int = 0
-    hard_hit_chunks: int = 0
-    soft_hit_chunks: int = 0
-    noncontiguous_hard_hits: int = 0
-    noncontiguous_soft_hits: int = 0
-    beta_weight: float = 0.5         # 소프트 히트 가중치 (config에서 주입)
+class DistributedHitRateMetrics:
+    """4단계 분산 비연속 히트율 지표.
+    기존 WeightedHitRateMetrics, HitRateMetrics와 독립적.
+    """
+    total_lookups: int = 0
+    local_hard_hits: int = 0
+    pegaflow_local_hits: int = 0
+    rdma_remote_hits: int = 0
 
-    def record(
-        self,
-        n_hard_hits: int,
-        n_soft_hits: int,
-        n_misses: int,
-        noncontiguous_hard: int = 0,
-        noncontiguous_soft: int = 0,
-    ) -> None: ...
+    def record(self, hit_type: str) -> None:
+        """hit_type: "local_hard_hit" | "pegaflow_local_hit" | "rdma_remote_hit" | "miss"."""
+        self.total_lookups += 1
+        if hit_type == "local_hard_hit":
+            self.local_hard_hits += 1
+        elif hit_type == "pegaflow_local_hit":
+            self.pegaflow_local_hits += 1
+        elif hit_type == "rdma_remote_hit":
+            self.rdma_remote_hits += 1
 
-    def hard_hit_rate(self) -> float: ...
-    def soft_hit_rate(self) -> float: ...
+    def distributed_hit_rate(self) -> float:
+        """(local + pegaflow_local + rdma_remote) / total."""
+        if self.total_lookups == 0:
+            return 0.0
+        return (
+            self.local_hard_hits + self.pegaflow_local_hits + self.rdma_remote_hits
+        ) / self.total_lookups
 
-    def weighted_hit_rate(self) -> float:
-        """(n_hard + beta_weight × n_soft) / total"""
-        ...
+    def noncontiguous_rdma_fraction(self) -> float:
+        """RDMA 원격 히트 / 전체 히트. 0이면 분산 재사용 없음."""
+        total_hits = self.local_hard_hits + self.pegaflow_local_hits + self.rdma_remote_hits
+        if total_hits == 0:
+            return 0.0
+        return self.rdma_remote_hits / total_hits
 
-    def noncontiguous_weighted_fraction(self) -> float:
-        """비연속 (하드 + 소프트 가중) / 전체 (하드 + 소프트 가중)"""
-        ...
-
-    def reset(self) -> None: ...
+    def reset(self) -> None:
+        self.total_lookups = 0
+        self.local_hard_hits = 0
+        self.pegaflow_local_hits = 0
+        self.rdma_remote_hits = 0
 
     def summary(self) -> dict:
         return {
-            "hard_hit_rate": self.hard_hit_rate(),
-            "soft_hit_rate": self.soft_hit_rate(),
-            "weighted_hit_rate": self.weighted_hit_rate(),
-            "noncontiguous_weighted_fraction": self.noncontiguous_weighted_fraction(),
-            "hard_hit_chunks": self.hard_hit_chunks,
-            "soft_hit_chunks": self.soft_hit_chunks,
-            "miss_chunks": self.total_chunks - self.hard_hit_chunks - self.soft_hit_chunks,
-            "soft_hit_beta_weight": self.beta_weight,
+            "local_hard_hit_rate": self.local_hard_hits / max(1, self.total_lookups),
+            "pegaflow_local_hit_rate": self.pegaflow_local_hits / max(1, self.total_lookups),
+            "rdma_remote_hit_rate": self.rdma_remote_hits / max(1, self.total_lookups),
+            "miss_rate": 1.0 - self.distributed_hit_rate(),
+            "distributed_hit_rate": self.distributed_hit_rate(),
+            "noncontiguous_rdma_fraction": self.noncontiguous_rdma_fraction(),
+            "total_lookups": self.total_lookups,
         }
 ```
 
 ---
 
-### 6. IndexMemBCIntegrationPipeline (Cross-1) — `src/engine/indexmem_bc_pipeline.py`
+### 6. HexAGeTIrminsulPegaFlowPipeline (Cross-1) — `src/engine/hexagent_irminsul_pegaflow_pipeline.py`
 
 ```python
 @dataclass
-class BCPipelineConfig:
-    segment_latent_pool_mb: float = 128.0   # 세그먼트 레벨 잠재 풀 메모리 상한 (YAML 외부화)
-    token_latent_pool_mb: float = 64.0      # 토큰 레벨 잠재 풀 메모리 상한 (YAML 외부화)
-    unified_weighted_hit_weights: Tuple[float, float, float] = (1.0, 0.7, 0.4)
-    # (hard_weight, segment_soft_weight, token_soft_weight)
-    budget_ratio: float = 0.5
-    beta_readout: float = 0.1
+class CrossABPipelineConfig:
+    prefetch_confidence_threshold: float = 0.7   # 선제 확보 신뢰도 임계값
+    prefetch_hbm_budget_ratio: float = 0.10       # HBM의 10%를 선제 확보 예약
+    async_prefetch: bool = True                   # 비동기 선제 확보 (현재 태스크 블로킹 방지)
     seed: int = 42
 
 
-class UnifiedLatentPool:
-    """세그먼트-레벨(B-1)과 토큰-레벨(C-1) 잠재 상태 통합 관리.
+class HexAGeTIrminsulPegaFlowPipeline:
+    """HexAGenT DAG 스케줄링 + PegaFlow RDMA + Irminsul δ-회전 A+B 통합 파이프라인.
 
-    segment_id → segment_latent (세그먼트 전체 KV 집약 표현)
-    (segment_id, evicted_token_range) → token_latent (개별 퇴거 토큰 표현)
+    5단계 처리 흐름:
+      Step 1 (DAG 구성 + SLO 위험 우선순위 배정, A-1):
+        에이전틱 세션 수신 → WorkflowDAG 초기화
+        → SLO 위험 가중 정렬 → build_batch (KV 용량 제약 포함)
 
-    메모리 상한: segment_latent_pool_mb + token_latent_pool_mb (YAML 외부화)
-    퇴거 정책: LRU (풀 용량 초과 시)
-    """
+      Step 2 (다음 단계 세그먼트 선제 예측 + 확보, A-1/B-1):
+        현재 태스크 prefill 완료 → 후속 ready 태스크의 CDC 세그먼트 ID 예측
+        confidence > prefetch_confidence_threshold 이면 PegaFlow 비동기 선제 확보 트리거
+        prefetch_hbm_budget_ratio HBM 예약 공간 내에서 관리
 
-    def __init__(self, config: BCPipelineConfig) -> None: ...
+      Step 3 (세그먼트 분산 검색, B-1):
+        태스크 실행 시 PegaFlowIrminsulDistributedSegmentCache.get_distributed() 호출
+        로컬 HBM → PegaFlow 로컬 → PegaFlow RDMA 원격 순서
 
-    def put_segment_latent(
-        self, segment_id: str, latent: torch.Tensor
-    ) -> None: ...
+      Step 4 (δ-회전 위치 수정, B-1/Irminsul):
+        원격 수신 세그먼트의 k_r에 δ-회전 적용. c_KV 즉시 재사용.
 
-    def put_token_latent(
-        self,
-        segment_id: str,
-        token_range: Tuple[int, int],
-        latent: torch.Tensor,
-    ) -> None: ...
+      Step 5 (DAG 갱신 + 다음 사이클):
+        태스크 완료 → reveal_dag_edges() → 우선순위 재계산 → Step 1 반복
 
-    def lookup_segment(self, segment_id: str) -> Optional[torch.Tensor]: ...
-    def lookup_token(self, segment_id: str, token_range: Tuple[int, int]) -> Optional[torch.Tensor]: ...
-
-    def memory_bytes(self) -> int: ...
-
-
-class SharedLatentEncoder:
-    """B-1과 C-1 파라미터를 공유하는 통합 잠재 인코더.
-
-    B-1의 IndexMemLatentMemoryModule과 C-1의 동일 아키텍처 인코더가
-    파라미터를 공유해 학습 효율 2배 향상.
-    """
-    def __init__(self, config: LatentMemoryConfig) -> None: ...
-    def encode(self, kv: torch.Tensor) -> torch.Tensor: ...  # [n_tokens, kv_dim] → [latent_dim]
-
-
-class IndexMemBCIntegrationPipeline:
-    """IndexMem B+C 통합 파이프라인 (Cross-1).
-
-    UnifiedLatentPool로 세그먼트-레벨 소프트 히트(B-1)와
-    토큰-레벨 잔차 리드아웃(C-1)을 2레이어 잠재 보존으로 통합.
-
-    처리 흐름:
-      Step 1 (B-1 조회): UnifiedLatentPool.lookup()
-        → 하드 히트(물리적 KV) / 소프트 히트(세그먼트 잠재) / 미스 3단계
-      Step 2 (하드 히트): IndexMemEvictionCodec.encode()로 토큰 중요도 계산
-        → 낮은 중요도 토큰 → Latent Memory 인코딩 → UnifiedLatentPool 저장
-      Step 3 (소프트 히트): 세그먼트 잠재 기반 잔차 + 토큰 잠재 추가 잔차
-      Step 4 (미스): 재계산 → UnifiedLatentPool에 잠재 상태 등록
-
-    통합 가중 히트율:
-      unified_weighted_hit_rate = (n_hard + 0.7×n_seg_soft + 0.4×n_token_soft) / total
+    비동기 파이프라이닝:
+      Step 2 선제 확보(asyncio.create_task)와 Step 3 분산 검색이 중첩 가능.
+      Step 2에서 시작된 확보가 Step 3 시점에 완료되면 HBM에서 즉시 히트.
     """
 
     def __init__(
         self,
-        soft_hit_cache: IndexMemSoftHitSegmentCache,
-        eviction_codec: IndexMemEvictionCodec,
-        unified_pool: UnifiedLatentPool,
-        shared_encoder: SharedLatentEncoder,
-        config: BCPipelineConfig,
+        dag_scheduler: HexAGeTWorkflowScheduler,
+        distributed_cache: PegaFlowIrminsulDistributedSegmentCache,
+        rdma_router: PegaFlowRDMACrossNodeRouter,
+        config: CrossABPipelineConfig,
     ) -> None: ...
 
-    def get_segments(
+    async def process_workflow_session(
         self,
-        token_ids: List[int],
-        layer_idx: int = 0,
-    ) -> Tuple[List[Tuple[int, HitResult]], List[int]]:
-        """InferenceRunner 호환 API. B+C 통합 조회."""
-        ...
-
-    def put_segment(
-        self,
-        token_ids: List[int],
-        chunk_idx: int,
-        kv: torch.Tensor,
-        layer_idx: int = 0,
+        workflow_id: str,
+        initial_tasks: List[TaskNode],
     ) -> None:
-        """InferenceRunner 호환 API."""
+        """워크플로우 세션 처리 (비동기 5단계 루프)."""
         ...
 
-    def unified_weighted_hit_rate(self) -> float:
-        """(n_hard + 0.7×n_seg_soft + 0.4×n_token_soft) / total"""
+    def _predict_next_segment_ids(
+        self,
+        dag: WorkflowDAG,
+        current_task_id: str,
+    ) -> List[Tuple[bytes, float]]:
+        """후속 태스크 CDC 세그먼트 ID + 신뢰도 예측.
+
+        알고리즘:
+          next_tasks = dag.get_successors(current_task_id)
+          branch_factor = len(next_tasks)
+          confidence = 1.0 / branch_factor if branch_factor > 0 else 0.0
+          for task in next_tasks if confidence > 0:
+              predicted_input = concat(
+                  shared_system_prompt,
+                  current_task_output_estimate,
+                  task_type_template[task.task_type]
+              )
+              segment_ids = cdc_chunk(predicted_input)  # Irminsul CDC 재사용
+              yield (segment_id, confidence)
+        """
+        ...
+
+    async def _async_prefetch_segment(
+        self,
+        segment_id: bytes,
+        confidence: float,
+    ) -> None:
+        """비동기 선제 확보 — 현재 태스크 실행 블로킹 없음.
+
+        PegaFlow 로컬 → PegaFlow RDMA 원격 순서로 비동기 확보.
+        HBM 예약 공간(prefetch_hbm_budget_ratio × HBM_total) 내에서 관리.
+        공간 부족 시 가장 낮은 confidence 선제 확보 항목 제거.
+        """
         ...
 ```
-
----
-
-### 7. Cross-2: VeriCache + IndexMem 플러그인 연결 (신규 코드 최소)
-
-```python
-# 사용 예시 — 별도 파일 없이 실험 스크립트에서 연결
-from src.cache.vericache_speculative_codec import VeriCacheSpeculativeCodec, VeriCacheConfig
-from src.cache.indexmem_eviction_codec import IndexMemEvictionCodec, IndexMemEvictionConfig
-
-vericache = VeriCacheSpeculativeCodec(VeriCacheConfig(d_head=128, seed=42))
-indexmem_codec = IndexMemEvictionCodec(
-    IndexMemEvictionConfig(budget_ratio=0.5, zero_shot_mode=True)
-)
-vericache.set_draft_codec(indexmem_codec)  # 플러그인 연결
-
-# 비교 실험:
-# 1. vericache.set_draft_codec(Int8DraftCodec())     → 기존 INT8 드래프트 수락률
-# 2. vericache.set_draft_codec(TokenEvictionDraftCodec(keep_ratio=0.5))  → 기존 퇴거 드래프트
-# 3. vericache.set_draft_codec(indexmem_codec)       → IndexMem 잠재 기억 드래프트
-```
-
-`IndexMemEvictionCodec`은 `DraftCodec` 인터페이스(`compress()`, `decompress()`,
-`compression_ratio` property)를 구현하므로 추가 코드 없이 `set_draft_codec()`에 바로 전달 가능.
-
----
-
-## Activity C — Accuracy Preservation 검증 계획 (MANDATORY)
-
-### perplexity 측정
-
-- **데이터셋**: WikiText-2 (test split, 2,048 토큰 시퀀스 단위)
-- **모델 패밀리**: Qwen2-7B / Mistral-7B-v0.3 / Llama-3.1-8B (3개 모델)
-  - 테스트 환경 (GPU/모델 없는 경우): d_head=128, n_heads=8, n_layers=32, n_tokens=512 합성 모델
-- **허용 오차**: perplexity 변화 ±1% 이내 (필수 기준)
-- **목표 오차**: ±0.3~0.8% (IndexMem 원논문 근거)
-- **비교 기준**:
-  - Baseline: 압축 없는 전체 KV
-  - Learnable Indexer 단독 (latent_memory.beta_readout=0, alpha_ema=0)
-  - Latent Memory 단독 (zero_shot_mode=True, indexer.retention_prob=budget_ratio for all tokens)
-  - Combined (Learnable Indexer + Latent Memory, 표준 설정)
-
-### 태스크 정확도 측정 (벤치마크)
-
-- **벤치마크 1**: RULER-4K — 바늘 깊이 15 / 25 / 50 / 75 / 95% 각각 정확도 측정
-- **벤치마크 2**: RULER-16K — 동일 바늘 깊이 5개 정확도 측정
-- **벤치마크 3**: LongBench 8개 서브태스크
-  (NarrativeQA, Qasper, MultiFieldQA-EN, MultiFieldQA-ZH, HotpotQA, 2WikiMultihopQA, GovReport, QMSum)
-- **허용 오차**: ±1% 이내 (필수 기준; evaluation_criteria.md §4)
-- **비교 기준**: SnapKV (budget_ratio=0.5 동일 조건) 대비 정확도 delta
-
-### 파라미터 스윕 계획
-
-1. **budget_ratio 스윕**: [0.3, 0.4, 0.5, 0.6, 0.7]
-   - 각 값에서 (memory_reduction, perplexity_delta, RULER-4K 정확도) 3-way 측정
-   - accuracy-memory 트레이드오프 곡선 작성
-
-2. **beta_readout 스윕**: [0.05, 0.10, 0.15, 0.20]
-   - 각 값에서 (perplexity_delta, RULER-4K 정확도) 2-way 측정
-   - beta > 0.15 시 accuracy delta > 1% 위험 → YAML 외부화 경고
-
-3. **3-way ablation** (필수):
-   - Learnable Indexer 단독 vs. Latent Memory 단독 vs. Combined
-   - 각 모듈의 accuracy 기여 분리 검증
-
-### Fallback 메커니즘
-
-```python
-# 자동 fallback (IndexMemEvictionCodec.auto_adjust_on_accuracy_delta() 내부)
-if abs(measured_accuracy_delta) > 0.01:  # > 1%
-    budget_ratio → 0.6   (더 많은 KV 보존)
-    beta_readout → 0.05  (잔차 기여 축소)
-```
-
-### 검증 테스트 파일
-
-`tests/unit/test_compression_accuracy.py` — 기존 파일에 추가:
-
-```python
-def test_indexmem_learnable_indexer_only_accuracy():
-    """Learnable Indexer 단독: 동일 budget_ratio에서 SnapKV 대비 accuracy 동등 이상."""
-    ...
-
-def test_indexmem_latent_memory_only_accuracy():
-    """Latent Memory 단독: beta_readout=0.1에서 perplexity delta < 1%."""
-    ...
-
-def test_indexmem_combined_accuracy_within_tolerance():
-    """Combined: WikiText-2 perplexity delta ±1% 이내, budget_ratio=0.5."""
-    ...
-
-def test_indexmem_budget_ratio_sweep():
-    """budget_ratio [0.3..0.7] 전 범위에서 accuracy delta 측정. 0.4 이상에서 ±1% 이내."""
-    ...
-
-def test_indexmem_beta_sweep():
-    """beta_readout [0.05..0.20] 전 범위에서 perplexity delta 측정."""
-    ...
-
-def test_indexmem_fallback_adjusts_on_high_delta():
-    """accuracy delta > 1% 시 budget_ratio + beta 자동 조정 동작 검증."""
-    ...
-
-def test_indexmem_ruler_needle_depth_accuracy():
-    """RULER-4K 바늘 깊이 15/50/95%에서 accuracy delta 측정 (합성 롱컨텍스트)."""
-    ...
-
-def test_indexmem_vericache_draft_acceptance_rate():
-    """Cross-2: IndexMem 드래프트 수락률 > Int8DraftCodec 수락률."""
-    ...
-```
-
----
-
-## Learnable Indexer 학습 절차
-
-1. **학습 데이터**: `data/processed/` 내 대표 샘플 (없으면 합성 데이터 자동 생성)
-   - 입력 피처: [k_norm, v_norm, cumul_attn_score, position_decay, query_sim]
-   - 라벨: cumul_attn_score 기반 자기지도 (상위 budget_ratio 토큰 = 1, 나머지 = 0)
-
-2. **학습 방법**: LoRA rank=4, 어텐션 레이어만 업데이트, 에폭 3~5
-   - Learnable Indexer 자체는 225파라미터이므로 LoRA 없이 직접 AdamW로 학습 가능
-   - 모델 가중치 동결 + indexer MLP만 최적화
-
-3. **가중치 저장**: `configs/indexmem_indexer_weights.yaml`
-   ```yaml
-   # configs/indexmem_indexer_weights.yaml
-   # Learnable Indexer 학습 완료 가중치 (2026-05-27 사이클)
-   # 형식: YAML-직렬화된 PyTorch 텐서 (base64 또는 float 리스트)
-   w1: [...]   # shape: [32, 5]
-   b1: [...]   # shape: [32]
-   w2: [...]   # shape: [1, 32]
-   b2: [...]   # shape: [1]
-   trained_epochs: 5
-   training_date: "2026-05-27"
-   ```
-
-4. **zero-shot fallback**: `zero_shot_mode=True` 시 Learnable Indexer를 DapQ 방식으로 대체
-   ```python
-   retention_prob = Sigmoid(query_sim * cumul_attn_score)
-   ```
-   학습 데이터 없이 즉시 동작. 기본 설정에서 활성화.
 
 ---
 
 ## 설정 파라미터
 
 ```yaml
-# configs/experiments/2026-05-27.yaml
+# configs/experiments/2026-05-28.yaml
 experiment:
-  date: "2026-05-27"
-  activity: "B+C"
-  cache_type: "indexmem_soft_hit_segment"    # Activity B-1
-  compression_method: "indexmem_eviction"    # Activity C-1
-  scheduler_type: "default"                  # Activity A 미포함
+  date: "2026-05-28"
+  activity: "A+B"
+  cache_type: "pegaflow_irminsul_distributed"    # Activity B-1
+  compression_method: "none"                      # Activity C 미포함
+  scheduler_type: "hexagent_workflow"             # Activity A-1
   seed: 42
 
-# Activity C-1 IndexMem Eviction 설정
-indexmem_eviction:
-  budget_ratio: 0.5                    # 기본 KV 보존 비율
-  base_eviction_policy: "snapkv"       # "h2o" | "snapkv" | "dapq" | "learned"
-  alpha_ema: 0.3                       # Latent Memory 온라인 갱신 EMA
-  beta_readout: 0.1                    # 잔차 리드아웃 강도
-  latent_dim: 64                       # 잠재 상태 차원
+# Activity A-1: HexAGenT Workflow Scheduler
+hexagent_scheduler:
+  schedule_cycle_ms: 50.0            # 배치 결정 주기
+  risk_weight: 2.0                   # SLO 위험 가중치
+  alpha_gpu_affinity: 0.5            # GPU 어피니티 가중치
+  heartbeat_interval_ms: 100.0       # gRPC heartbeat 주기
+  kv_size_per_token_bytes: 512       # 토큰당 KV 바이트 추정값
   n_layers: 32
-  kv_dim: 128                          # head_dim × n_heads
-  zero_shot_mode: true                 # DapQ fallback 기본값 (학습 없이 동작)
-  max_accuracy_delta: 0.01             # accuracy fallback 임계값
-  fallback_budget_ratio: 0.6
-  fallback_beta: 0.05
+  ema_decay: 0.9                     # 실행 시간 EMA 감쇠
+  rdma_bandwidth_table_path: "configs/gpu_rdma_bandwidth_table.yaml"
 
-  # Accuracy 검증 스윕 설정
-  budget_ratio_sweep: [0.3, 0.4, 0.5, 0.6, 0.7]
-  beta_sweep: [0.05, 0.10, 0.15, 0.20]
+# Activity A-2: PegaFlow KV Connector
+pegaflow_connector:
+  socket_path: "/tmp/pegaflow.sock"
+  async_put: true
+  timeout_ms: 100
+  use_mock: true                     # 테스트 환경: MockPegaFlowConnector 사용
 
-# Activity B-1 Soft Hit Segment Cache 설정
-indexmem_soft_hit:
-  chunk_size: 128
-  max_physical_entries: 1000
-  latent_pool_max_segments: 10000      # 잠재 풀 최대 세그먼트 수
-  beta_soft: 0.1                       # 소프트 히트 잔차 기여 강도
-  beta_weight: 0.5                     # weighted_hit_rate 소프트 히트 가중치
-  latent_dim: 64
-  kv_dim: 128
-  n_layers: 32
+# Activity A-2: PegaFlow RDMA Router
+pegaflow_rdma_router:
+  peer_nodes_config_path: "configs/pegaflow_peer_nodes.yaml"
+  bloom_filter_capacity: 100000
+  bloom_filter_error_rate: 0.01
+  bloom_sync_interval_ms: 500.0      # Bloom Filter 동기화 주기
+  rdma_reuse_discount: 0.8           # RDMA 재사용 결정 임계값
 
-# Cross-1 B+C 통합 파이프라인 설정
-bc_pipeline:
-  segment_latent_pool_mb: 128.0
-  token_latent_pool_mb: 64.0
-  unified_hit_weights: [1.0, 0.7, 0.4]  # [hard, seg_soft, token_soft]
+# Activity B-1: 분산 비연속 세그먼트 캐시
+distributed_segment_cache:
+  rdma_reuse_discount: 0.8
+  bloom_sync_interval_ms: 500.0
+  local_max_entries: 5000
+  avg_chunk_size: 256                # CDC 청킹 평균 크기 (Irminsul 기본값)
 
-# Learnable Indexer 학습 설정
-learnable_indexer:
-  weights_path: "configs/indexmem_indexer_weights.yaml"
-  zero_shot_mode: true       # 기본: DapQ fallback (학습 필요 없음)
-  lora_rank: 4               # 학습 시 LoRA rank
-  epochs: 5
-  lr: 1.0e-3
+# Cross-1 A+B Pipeline
+cross_ab_pipeline:
+  prefetch_confidence_threshold: 0.7
+  prefetch_hbm_budget_ratio: 0.10    # HBM 10% 선제 확보 예약
+  async_prefetch: true
 
 # 측정 지표 저장 경로
 metrics:
-  output_dir: "results/2026-05-27"
-  metrics_file: "results/2026-05-27/metrics.json"
+  output_dir: "results/2026-05-28"
+  metrics_file: "results/2026-05-28/metrics.json"
+```
+
+```yaml
+# configs/gpu_rdma_bandwidth_table.yaml
+# A100/H100/H200 간 RDMA 대역폭 사전 측정값 (GB/s)
+# 실제 클러스터 측정값으로 교체 필요 (현재는 이론값 기반 기본값)
+rdma_bandwidth_gbps:
+  A100_to_A100: 200.0    # InfiniBand HDR (200Gbps)
+  A100_to_H100: 200.0
+  A100_to_H200: 200.0
+  H100_to_H100: 400.0    # InfiniBand NDR (400Gbps)
+  H100_to_H200: 400.0
+  H200_to_H200: 800.0    # NVLink 900GB/s 기준 inter-node 추정
+  default: 100.0          # 미등록 GPU 쌍 fallback
+```
+
+```yaml
+# configs/pegaflow_peer_nodes.yaml
+# 피어 노드 등록 목록 (테스트 환경에서는 빈 리스트 사용)
+peer_nodes: []
+# 실제 멀티 노드 환경 예시:
+# peer_nodes:
+#   - node_id: "node-1"
+#     rdma_address: "192.168.1.101"
+#     port: 9000
+#   - node_id: "node-2"
+#     rdma_address: "192.168.1.102"
+#     port: 9000
 ```
 
 ---
 
-## results/2026-05-27/metrics.json 저장 지표
+## results/2026-05-28/metrics.json 저장 지표
 
 ```json
 {
-  "experiment_date": "2026-05-27",
-  "activity": "B+C",
+  "experiment_date": "2026-05-28",
+  "activity": "A+B",
 
-  "compression_accuracy": {
-    "wikitext2_perplexity_baseline": null,
-    "wikitext2_perplexity_compressed": null,
-    "wikitext2_perplexity_delta_pct": null,
-    "ruler_4k_depth15_accuracy_delta": null,
-    "ruler_4k_depth25_accuracy_delta": null,
-    "ruler_4k_depth50_accuracy_delta": null,
-    "ruler_4k_depth75_accuracy_delta": null,
-    "ruler_4k_depth95_accuracy_delta": null,
-    "ruler_16k_depth15_accuracy_delta": null,
-    "ruler_16k_depth95_accuracy_delta": null,
-    "longbench_8task_mean_accuracy_delta": null,
-    "accuracy_within_1pct_tolerance": null
+  "scheduling": {
+    "tokens_per_sec_baseline": null,
+    "tokens_per_sec_hexagent": null,
+    "throughput_improvement_pct": null,
+    "ttft_p50_baseline_ms": null,
+    "ttft_p50_hexagent_ms": null,
+    "ttft_p50_delta_pct": null,
+    "dag_schedule_overhead_ms_mean": null,
+    "dag_schedule_overhead_ms_p50": null,
+    "dag_schedule_overhead_ms_p99": null,
+    "slo_achievement_rate_95pct": null,
+    "slo_achievement_rate_99pct": null,
+    "kv_eviction_rate_baseline": null,
+    "kv_eviction_rate_hexagent": null
+  },
+
+  "hit_rate": {
+    "local_hard_hit_rate": null,
+    "pegaflow_local_hit_rate": null,
+    "rdma_remote_hit_rate": null,
+    "miss_rate": null,
+    "distributed_hit_rate": null,
+    "noncontiguous_rdma_fraction": null,
+    "noncontiguous_hit_rate_vs_total_30pct_target": null
+  },
+
+  "pegaflow_connector": {
+    "gil_contention_rate_pct": null,
+    "async_put_latency_p50_ms": null,
+    "async_put_latency_p99_ms": null,
+    "local_throughput_improvement_pct": null
+  },
+
+  "rdma_routing": {
+    "rdma_transfer_latency_p50_ms": null,
+    "rdma_transfer_latency_p99_ms": null,
+    "recompute_latency_p50_ms": null,
+    "rdma_reuse_decision_rate_pct": null,
+    "bloom_filter_false_positive_rate": null
+  },
+
+  "cross_ab_pipeline": {
+    "prefetch_hit_rate": null,
+    "prefetch_confidence_threshold": 0.7,
+    "prefetch_hbm_budget_used_ratio": null,
+    "combined_throughput_improvement_pct": null,
+    "single_activity_a_improvement_pct": null,
+    "single_activity_b_improvement_pct": null
   },
 
   "kv_memory": {
     "baseline_kv_bytes": null,
-    "compressed_kv_bytes": null,
-    "latent_state_bytes": null,
-    "memory_reduction_pct": null,
-    "effective_context_length_ratio": null
-  },
-
-  "hit_rate": {
-    "hard_hit_rate": null,
-    "soft_hit_rate": null,
-    "weighted_hit_rate": null,
-    "noncontiguous_fraction": null,
-    "noncontiguous_weighted_fraction": null,
-    "soft_hit_beta_weight": 0.5
-  },
-
-  "latent_memory": {
-    "latent_readout_score_mean": null,
-    "latent_readout_score_p50": null,
-    "latent_readout_score_p95": null,
-    "latent_memory_bytes_per_request": null,
-    "online_update_alpha": 0.3,
-    "beta_readout_effective": null
-  },
-
-  "throughput": {
-    "tokens_per_sec_baseline": null,
-    "tokens_per_sec_compressed": null,
-    "throughput_improvement_pct": null,
-    "ttft_p50_baseline_ms": null,
-    "ttft_p50_compressed_ms": null,
-    "ttft_p50_delta_pct": null
-  },
-
-  "ablation": {
-    "indexer_only_accuracy_delta": null,
-    "latent_only_accuracy_delta": null,
-    "combined_accuracy_delta": null
-  },
-
-  "budget_ratio_sweep": {
-    "0.3": {"memory_reduction_pct": null, "perplexity_delta_pct": null},
-    "0.4": {"memory_reduction_pct": null, "perplexity_delta_pct": null},
-    "0.5": {"memory_reduction_pct": null, "perplexity_delta_pct": null},
-    "0.6": {"memory_reduction_pct": null, "perplexity_delta_pct": null},
-    "0.7": {"memory_reduction_pct": null, "perplexity_delta_pct": null}
-  },
-
-  "beta_sweep": {
-    "0.05": {"perplexity_delta_pct": null},
-    "0.10": {"perplexity_delta_pct": null},
-    "0.15": {"perplexity_delta_pct": null},
-    "0.20": {"perplexity_delta_pct": null}
-  },
-
-  "cross2_vericache": {
-    "int8_draft_acceptance_rate": null,
-    "token_eviction_draft_acceptance_rate": null,
-    "indexmem_draft_acceptance_rate": null,
-    "indexmem_vs_int8_acceptance_delta": null
+    "distributed_cache_kv_bytes": null,
+    "memory_footprint_delta_pct": null
   }
 }
 ```
@@ -1190,108 +1036,101 @@ metrics:
 
 ### 필수 단위 테스트
 
-- [ ] `tests/unit/test_indexmem_learnable_indexer.py`
-  - `test_predict_output_shape()`: predict() 반환이 [n_tokens] float32 [0,1] 범위
-  - `test_predict_zero_shot_mode()`: zero_shot_mode=True에서 DapQ fallback 동작
-  - `test_select_tokens_by_budget()`: budget_ratio=0.5에서 n_keep = n_tokens//2
-  - `test_update_cumul_attn_ema()`: EMA 갱신이 alpha_ema 계수로 정확하게 동작
-  - `test_select_tokens_deterministic()`: 동일 입력 + seed → 동일 kept_idx
-  - `test_save_load_weights()`: save_weights → load_weights 왕복 일치
+- [ ] `tests/unit/test_hexagent_workflow_scheduler.py`
+  - `test_workflow_dag_init_from_tasks()`: TaskNode + dependency_ids로 WorkflowDAG 생성
+  - `test_standalone_completion_horizon_basic()`: horizon > current_time 검증
+  - `test_slo_risk_score_zero_when_slack()`: horizon < deadline → risk = 0.0
+  - `test_slo_risk_score_positive_when_overdue()`: horizon > deadline → risk > 0.0
+  - `test_build_batch_kv_capacity_constraint()`: kv_available_bytes 초과 태스크 제외
+  - `test_build_batch_priority_ordering()`: 높은 SLO risk 태스크가 먼저 선택
+  - `test_reveal_dag_edges_updates_ready_status()`: 의존성 해소 후 pending → ready 전환
+  - `test_gpu_affinity_score_prefers_low_transfer_cost()`: 전송 비용 낮은 GPU 선호
+  - `test_ema_update_execution_time()`: EMA 갱신이 ema_decay 계수로 수렴
+  - `test_schedule_interface_returns_list()`: BaseScheduler.schedule() 반환 타입 검증
+  - `test_schedule_deterministic_with_seed()`: 동일 seed + 동일 입력 → 동일 배치
 
-- [ ] `tests/unit/test_indexmem_latent_memory_module.py`
-  - `test_encode_evicted_output_shape()`: encode_evicted 반환이 [latent_dim]
-  - `test_online_update_ema_alpha()`: alpha=0.3 EMA 갱신 정확성
-  - `test_residual_readout_output_shape()`: readout 반환이 query_states와 동일 shape
-  - `test_readout_zero_before_encode()`: encode 전 readout → zeros
-  - `test_latent_state_persists_across_calls()`: 동일 request_key로 누적 갱신 동작
-  - `test_clear_removes_latent_state()`: clear() 후 readout → zeros
-  - `test_latent_memory_bytes()`: 잠재 상태 메모리 크기 = n_layers × latent_dim × 2
+- [ ] `tests/unit/test_pegaflow_kv_connector.py`
+  - `test_mock_connector_cache_store_interface()`: CacheStore 추상 메서드 전부 동작
+  - `test_mock_put_get_round_trip()`: put → get 동일 텐서 반환
+  - `test_mock_get_returns_none_on_miss()`: 저장 안 된 key → None
+  - `test_mock_hit_rate_tracking()`: put/get 후 hit_rate() 계산
+  - `test_mock_evict_frees_memory()`: evict() 후 memory_bytes() 감소
+  - `test_mock_delete_removes_key()`: delete 후 get → None
+  - `test_mock_reset_stats_clears_counters()`: reset_stats() 후 hit_rate() = 0.0
+  - `test_connector_factory_uses_mock_when_configured()`: use_mock=True → MockPegaFlowConnector
 
-- [ ] `tests/unit/test_indexmem_eviction_codec.py`
-  - `test_encode_output_smaller_than_input()`: encode 후 n_tokens × budget_ratio 크기
-  - `test_encode_preserves_important_tokens()`: 높은 retention_prob 토큰이 to_keep에 포함
-  - `test_get_readout_after_encode()`: encode 후 get_readout() → non-zero tensor
-  - `test_auto_adjust_fallback_on_high_delta()`: accuracy_delta=0.02 → budget_ratio 증가
-  - `test_draft_codec_interface_compress()`: compress() 반환 타입이 (Tensor, str)
-  - `test_draft_codec_interface_decompress()`: decompress(compress(kv)) shape 유효
-  - `test_compression_ratio_property()`: compression_ratio_float == 1/budget_ratio
-  - `test_base_eviction_policy_h2o()`: base_eviction_policy="h2o" 설정 시 정상 동작
-  - `test_compression_stats_json_serializable()`: compression_stats() dict JSON 직렬화
+- [ ] `tests/unit/test_pegaflow_rdma_router.py`
+  - `test_peer_registry_has_segment_false_for_unknown()`: 등록 안 된 세그먼트 → False
+  - `test_peer_registry_has_segment_true_after_register()`: 등록 후 → True
+  - `test_route_returns_pegaflow_local_on_local_hit()`: 로컬 히트 → "pegaflow_local"
+  - `test_route_returns_miss_when_no_peers()`: 피어 없음 + 로컬 미스 → "miss"
+  - `test_rdma_reuse_decision_below_discount()`: RDMA 비용 < 재계산 × discount → RDMA 선택
+  - `test_rdma_reuse_decision_above_discount()`: RDMA 비용 >= 재계산 × discount → 미스
+  - `test_estimate_rdma_latency_formula()`: segment_size / bandwidth × 1000 수치 검증
+  - `test_estimate_recompute_latency_formula()`: token_count / throughput 수치 검증
+  - `test_schedule_returns_input_unchanged()`: schedule() 입력 그대로 반환
 
-- [ ] `tests/unit/test_indexmem_soft_hit_segment_cache.py`
+- [ ] `tests/unit/test_pegaflow_irminsul_distributed_cache.py`
   - `test_cache_store_interface_all_methods()`: CacheStore 추상 메서드 전부 동작
-  - `test_hard_hit_returns_kv_tensor()`: put → get_hit_result → type="hard"
-  - `test_soft_hit_after_eviction()`: put → evict → get_hit_result → type="soft"
-  - `test_miss_no_physical_no_latent()`: 미저장 key → type="miss"
-  - `test_soft_hit_residual_output_shape()`: soft_hit_residual 반환 shape = query shape
-  - `test_weighted_hit_rate_formula()`: (n_hard + beta_weight×n_soft)/total 수치 검증
-  - `test_soft_hit_rate()`: n_soft / total 수치 검증
-  - `test_latent_pool_lru_eviction()`: latent_pool_max_segments 초과 시 LRU 퇴거
-  - `test_put_segment_returns_key()`: put_segment() segment_key 반환
-  - `test_get_segments_returns_hit_results()`: get_segments() 반환이 (hits, misses) 형식
+  - `test_get_distributed_local_hard_hit()`: 로컬 HBM 히트 → "local_hard_hit"
+  - `test_get_distributed_pegaflow_local_hit()`: PegaFlow 로컬 히트 → "pegaflow_local_hit"
+  - `test_get_distributed_miss_all_layers()`: 전 계층 미스 → "miss"
+  - `test_delta_rotation_c_kv_unchanged()`: c_KV는 δ와 무관하게 동일
+  - `test_delta_rotation_k_r_changes_with_delta()`: δ≠0이면 k_r 변환됨
+  - `test_hit_rate_breakdown_sums_to_one()`: 4단계 비율 합 = 1.0
+  - `test_distributed_hit_rate_above_local_only()`: 로컬 + 원격 히트율 > 로컬 히트율
+  - `test_evict_offloads_to_pegaflow()`: evict() 후 PegaFlow에 비동기 put 호출됨
 
 ### 필수 통합 테스트
 
-- [ ] `tests/integration/test_indexmem_bc_pipeline_e2e.py`
-  - `test_bc_pipeline_hard_hit_flow()`: B+C 통합 파이프라인 하드 히트 전체 흐름
-  - `test_bc_pipeline_soft_hit_flow()`: 세그먼트 퇴거 후 소프트 히트 잔차 리드아웃 제공
-  - `test_bc_pipeline_unified_weighted_hit_rate()`: 통합 가중 히트율이 이진 히트율 이상
-  - `test_bc_pipeline_memory_reduction_above_40pct()`: budget_ratio=0.5에서 −40% 이상
-  - `test_bc_pipeline_inference_runner_compat()`: InferenceRunner가 IndexMemBCIntegrationPipeline을
-    `cache`로 받아 get_segments/put_segment API를 통해 정상 동작
-  - `test_cross2_vericache_indexmem_plugin()`: VeriCacheSpeculativeCodec.set_draft_codec(IndexMem)
-    연결 후 draft_and_verify() 정상 동작
-
-### Activity C 검증 테스트 (기존 파일 추가)
-
-- [ ] `tests/unit/test_compression_accuracy.py` — 추가 케이스 (기존 케이스 보존):
-  - `test_indexmem_learnable_indexer_only_accuracy()`
-  - `test_indexmem_latent_memory_only_accuracy()`
-  - `test_indexmem_combined_accuracy_within_tolerance()`
-  - `test_indexmem_budget_ratio_sweep()`
-  - `test_indexmem_beta_sweep()`
-  - `test_indexmem_fallback_adjusts_on_high_delta()`
-  - `test_indexmem_ruler_needle_depth_accuracy()`
-  - `test_indexmem_vericache_draft_acceptance_rate()`
+- [ ] `tests/integration/test_hexagent_irminsul_pegaflow_pipeline_e2e.py`
+  - `test_cross_ab_pipeline_full_workflow_flow()`: 5단계 파이프라인 완전 흐름 (Mock 환경)
+  - `test_cross_ab_dag_scheduling_improves_throughput()`: DAG 스케줄러 적용 후 처리량 향상
+  - `test_cross_ab_distributed_hit_rate_above_local()`: 분산 히트율 > 로컬 히트율
+  - `test_cross_ab_prefetch_reduces_miss_rate()`: 선제 확보로 미스율 감소 확인
+  - `test_cross_ab_ttft_overhead_within_5pct()`: TTFT p50 증가 +5% 이내
+  - `test_cross_ab_cachestore_interface_compat()`: PegaFlowIrminsulDistributedSegmentCache를
+    InferenceRunner가 CacheStore로 사용 가능
+  - `test_cross_ab_base_scheduler_interface_compat()`: HexAGeTWorkflowScheduler.schedule()이
+    BaseScheduler 인터페이스를 통해 정상 동작
 
 ---
 
 ## 완료 기준 (Definition of Done)
 
 1. **단위 테스트 100% 통과**: 위 명시된 모든 단위 테스트 케이스 통과
-2. **통합 테스트 100% 통과**: `test_indexmem_bc_pipeline_e2e.py` 전체 통과
+2. **통합 테스트 100% 통과**: `test_hexagent_irminsul_pegaflow_pipeline_e2e.py` 전체 통과
 3. **기존 테스트 회귀 없음**: 이전 사이클 구현의 모든 단위·통합 테스트 계속 통과
-4. **evaluation_criteria.md §4 (Activity C) 필수 항목 모두 Pass**:
-   - WikiText-2 perplexity delta ±1% 이내
-   - RULER-4K/16K 정확도 delta ±1% 이내
-   - LongBench 8개 서브태스크 accuracy delta ±1% 이내
-   - KV Memory Reduction −30% 이상 (목표 −40%)
+4. **evaluation_criteria.md §2 (Activity A) 필수 항목 모두 Pass**:
+   - Scheduling Overhead TTFT p50 증가 +5% 이내 (필수)
+   - 캐시 히트율 향상 스케줄링 미적용 대비 +10%p 이상 (높음)
+   - 요청 처리 공정성 최대 대기 시간 2× 미초과 (높음)
 5. **evaluation_criteria.md §3 (Activity B) 기준 충족**:
-   - 가중 비연속 히트율(weighted_hit_rate) 베이스라인 대비 +15%p 이상
-   - Soft Hit Rate 측정 및 보고
+   - 전체 Cache Hit Rate 베이스라인 대비 +5%p 이상 (높음)
+   - 비연속 세그먼트 히트율 전체 히트의 30% 이상 (높음)
+   - KV Memory Footprint 베이스라인 대비 +20% 이내 (높음)
 6. **evaluation_criteria.md §5 (크로스 조합) 기준**:
-   - Accuracy 보존 복합 적용 후에도 ±1% 이내 (C 포함 필수)
-7. **CacheStore 인터페이스 준수**: IndexMemSoftHitSegmentCache 추상 메서드 전부 구현
-8. **CompressionCodec 호환**: IndexMemEvictionCodec이 encode()/decode()/compression_ratio() 구현
-9. **DraftCodec 호환**: IndexMemEvictionCodec이 compress()/decompress()/compression_ratio_float 구현
-10. **설정 파일 존재**: `configs/experiments/2026-05-27.yaml` + `configs/indexmem_indexer_weights.yaml`
-11. **metrics.json 생성**: `results/2026-05-27/metrics.json`에 모든 지표 기록
-12. **시드 고정 재현성**: seed=42로 동일 결과 재현 가능
+   - 복합 Throughput 향상 단일 Activity 대비 추가 +5% 이상 (높음)
+7. **CacheStore 인터페이스 준수**: PegaFlowKVConnector, PegaFlowIrminsulDistributedSegmentCache 추상 메서드 전부 구현
+8. **BaseScheduler 인터페이스 준수**: HexAGeTWorkflowScheduler.schedule(), PegaFlowRDMACrossNodeRouter.schedule() 구현
+9. **설정 파일 존재**: `configs/experiments/2026-05-28.yaml`, `configs/gpu_rdma_bandwidth_table.yaml`, `configs/pegaflow_peer_nodes.yaml`
+10. **metrics.json 생성**: `results/2026-05-28/metrics.json`에 모든 지표 기록
+11. **시드 고정 재현성**: seed=42로 동일 결과 재현 가능
+12. **MockPegaFlowConnector 제공**: PegaFlow 프로세스 없는 환경에서 단위 테스트 전부 통과
 
 ---
 
 ## 구현 우선순위 순서
 
-1. C-1: `IndexMemLearnableIndexer` (zero_shot_mode=True 기본값으로 학습 없이 즉시 동작)
-2. C-1: `IndexMemLatentMemoryModule` (encode_evicted + residual_readout)
-3. C-1: `IndexMemEvictionCodec` (두 모듈 통합 + DraftCodec 인터페이스)
-4. Cross-2: VeriCacheSpeculativeCodec.set_draft_codec(IndexMemEvictionCodec) 연결 (1줄)
-5. B-1: `HitResult` dataclass + `WeightedHitRateMetrics` (metrics/hit_rate.py 추가)
-6. B-1: `IndexMemSoftHitSegmentCache` (소프트 히트 경로 + CacheStore 구현)
-7. Cross-1: `UnifiedLatentPool` + `SharedLatentEncoder` + `IndexMemBCIntegrationPipeline`
-8. 설정 파일: `configs/experiments/2026-05-27.yaml`, `configs/indexmem_indexer_weights.yaml`
-9. 단위 테스트 전부 (C-1 → B-1 → Cross-1 순서)
-10. 통합 테스트 + accuracy 검증 테스트
+1. A-1: `TaskNode`, `WorkflowDAG` 자료구조 + `HexAGeTWorkflowScheduler` (DAG 초기화, horizon 추정, SLO-risk 우선순위, build_batch)
+2. A-2: `MockPegaFlowConnector` + `PegaFlowKVConnector` (use_mock=True 기본값으로 즉시 동작)
+3. A-2: `PeerRegistry` + `PegaFlowRDMACrossNodeRouter` (Bloom Filter 인덱스, RDMA 라우팅)
+4. B-1: `IrminsulKVEntry`, `DistributedSegmentCacheConfig` + `PegaFlowIrminsulDistributedSegmentCache` (4단계 조회, δ-회전)
+5. 지표: `DistributedHitRateMetrics` (src/metrics/hit_rate.py 추가)
+6. Cross-1: `CrossABPipelineConfig` + `HexAGeTIrminsulPegaFlowPipeline` (5단계 비동기 파이프라인)
+7. 설정 파일: `configs/experiments/2026-05-28.yaml`, `configs/gpu_rdma_bandwidth_table.yaml`, `configs/pegaflow_peer_nodes.yaml`
+8. 단위 테스트 전부 (A-1 → A-2 → B-1 → Cross-1 순서)
+9. 통합 테스트
 
 ---
 
@@ -1299,16 +1138,18 @@ metrics:
 
 이전 사이클 구현 파일은 수정하지 않는다:
 
-- `src/cache/irminsul_mla_segment_cache.py` (05-26 B-1)
-- `src/cache/arch_aware_noncontiguous_router.py` (05-26 B-1)
-- `src/cache/cdc_content_hash_interface.py` (05-26 B-2)
+- `src/cache/irminsul_mla_segment_cache.py` (05-26 B-1) — 로컬 Irminsul 캐시, B-1에서 import만
+- `src/cache/cdc_content_hash_interface.py` (05-26 B-2) — CDC 주소 체계, 재사용만
+- `src/cache/arch_aware_noncontiguous_router.py` (05-26)
 - `src/cache/mla_two_axis_compression_codec.py` (05-26 C-1)
 - `src/scheduler/objectcache_s3_tier_router.py` (05-26 A-1)
 - `src/engine/irminsul_objectcache_pipeline.py` (05-26 Cross-1)
-- `src/cache/vericache_speculative_codec.py` (05-25 C-1)
-- `src/cache/kv_packet.py`, `src/cache/kv_packet_adapter.py` (05-25 B-1)
-- `src/cache/segmented.py` (베이스라인)
+- `src/cache/indexmem_eviction_codec.py` (05-27 C-1)
+- `src/cache/indexmem_latent_memory_module.py` (05-27 C-1)
+- `src/cache/indexmem_learnable_indexer.py` (05-27 C-1)
+- `src/cache/indexmem_soft_hit_segment_cache.py` (05-27 B-1)
+- `src/engine/indexmem_bc_pipeline.py` (05-27 Cross-1)
 - 기타 모든 이전 사이클 파일 — 기존 단위·통합 테스트 회귀 없이 통과해야 한다.
 
-**주의**: `src/metrics/hit_rate.py`에는 `WeightedHitRateMetrics` 클래스만 추가한다.
-기존 `HitRateMetrics` 클래스와 메서드는 수정하지 않는다.
+**주의**: `src/metrics/hit_rate.py`에는 `DistributedHitRateMetrics` 클래스만 추가한다.
+기존 `WeightedHitRateMetrics`, `HitRateMetrics` 클래스와 메서드는 수정하지 않는다.
