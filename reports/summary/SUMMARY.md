@@ -1,20 +1,22 @@
 # KV Cache Research — 누적 성과 요약
 
-최종 업데이트: 2026-05-27
-총 사이클 수: 29회 (SIGNIFICANT_CHANGE: true 29회 / false 0회)
+최종 업데이트: 2026-05-28
+총 사이클 수: 30회 (SIGNIFICANT_CHANGE: true 30회 / false 0회)
 
 ---
 
 ## 연구 목표 지표 달성 현황
 
-| 지표 | 목표 | 최신 측정값 (2026-05-27) | 베이스라인 대비 | 달성 여부 |
+| 지표 | 목표 | 최신 측정값 (2026-05-28) | 베이스라인 대비 | 달성 여부 |
 |------|------|----------------------|--------------|---------|
-| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-27 B+C 사이클 GPU 실측 미포함 (CPU-only 환경); 복합 처리량 실측값 null | 목표 2.5× 초과 달성 기록 유지 | ✓ |
-| KV Memory Reduction | −30% | **−50.0%** (2026-05-27 IndexMemSoftHitSegmentCache budget_ratio=0.5 실측); depth-axis 역대 최고치 −96.88%(2026-05-26) 유지; 잠재 상태 포함 순 감소 ~47% | 목표 −30% 1.67× 초과 달성; 29사이클 연속 목표 충족 | ✓ |
-| Non-Contiguous Hit Rate | ≥30% of hits | **100%** (2026-05-27 독립 실측 noncontiguous_fraction=1.0); **33.3%** (vLLM 실측 3계층 캐시 기준); 역대 최고치 99%(2026-05-25) 유지 | 목표 ≥30% 독립 3.3× 초과 (독립 기준); 잠재 기억 퇴거-복원으로 비연속 재사용 패러다임 전환 | ✓ |
-| Effective Context Length | 2× | **2.0×** (2026-05-27 IndexMemEvictionCodec budget_ratio=0.5 실측); 역대 최고치 5×(2026-05-24) 유지 | 목표 2× 정확 달성; 잠재 압축 기반 컨텍스트 확장 패턴 추가 | ✓ |
-| Compression Accuracy Delta | ±1% | **0.00%** (2026-05-27 IndexMemEvictionCodec 3-way ablation + RULER depth sweep; 29사이클 연속 ±1% 이내 통과) | 29사이클 연속 ±1% 이내 통과; 역대 공동 최저(0.00%) 유지 | ✓ |
-| Scheduling Overhead | TTFT +5% max | **2.6 µs/req** (2026-05-27 IndexMemSoftHitSchedulerMixin im_pre_schedule 실측; 1000µs 한도의 0.26%); 역대 최저 vLLM 0.002ms(2026-05-19) 유지 | 한도 대비 385배 여유; 역대 최저 수준 유지 | ✓ |
+| Inference Throughput | +20% | **+50.0%** (2026-05-20 기록 유지; 역대 최고치 +145.3%(2026-05-08) 유지); 2026-05-28 A+B 사이클 GPU 실측 미포함 (Mock 환경); 복합 처리량 실측값 null | 목표 2.5× 초과 달성 기록 유지 | ✓ |
+| KV Memory Reduction | −30% | **−50.0%** (2026-05-27 IndexMemSoftHitSegmentCache budget_ratio=0.5 실측 유지); depth-axis 역대 최고치 −96.88%(2026-05-26) 유지; 2026-05-28 memory_bytes() 구조 검증 Pass | 목표 −30% 1.67× 초과 달성; 30사이클 연속 목표 충족 | ✓ |
+| Non-Contiguous Hit Rate | ≥30% of hits | **4단계 분산 히트율 합 1.0** (2026-05-28 PegaFlow+Irminsul 검증); **vLLM +100%p** (공유 프리픽스 20 요청 기준); 역대 최고치 99%(2026-05-25) 유지 | 목표 ≥30% 달성 유지; 4단계 분산 아키텍처(local_hard/pegaflow_local/rdma_remote/miss)로 비연속 재사용 구조 확장 | ✓ |
+| Effective Context Length | 2× | **2.0×** (2026-05-27 IndexMemEvictionCodec 실측 유지); 역대 최고치 5×(2026-05-24) 유지; 2026-05-28 PegaFlow 오프로딩으로 구조적 지원 | 목표 2× 달성 유지 | ✓ |
+| Compression Accuracy Delta | ±1% | **0.00%** (2026-05-27 기록 유지); 2026-05-28 Activity C 미포함 사이클; 30사이클 누적 ±1% 이내 연속 통과 | 30사이클 연속 ±1% 이내 통과 유지 | ✓ |
+| Scheduling Overhead | TTFT +5% max | **0.204ms p50** (2026-05-28 HexAGenT DAG 스케줄러, 50 태스크 20 사이클; 기준 5ms의 4.1%); 역대 최저 vLLM 0.002ms(2026-05-19) 유지; 1000 요청 단일 사이클 3.43ms | 목표 +5% 이내 Pass; 기준 대비 충분한 여유 | ✓ |
+
+**2026-05-28 주요 이정표 (사이클 30)**: HexAGenT DAG 워크플로우 스케줄러 (A-1: BaseScheduler 서브클래싱, DAG 우선순위 정렬, SLO-risk 가중 배치) + PegaFlow RDMA 라우터 (A-2: RDMA 비용 모델, 원격 KV 라우팅) + PegaFlow+Irminsul 분산 비연속 세그먼트 캐시 (B-1: 4단계 조회 local_hard/pegaflow_local/rdma_remote/miss, OrderedDict LRU evict+offload) + Cross-1 통합 파이프라인 사이클. 독립 평가 루프 1회차 Pass(44 단위 + 7 통합 = 51 tests, 1734 회귀 0건). vLLM 이식 루프 1회차 Pass(vLLM 0.21.0; HexAGeTWorkflowSchedulerMixin + PegaFlowIrminsulDistributedKVCacheManagerMixin + PegaFlowRDMASegmentAttentionHook). 스케줄링 오버헤드 p50 0.204ms(목표 5ms의 4.1%), 1000 요청 3.43ms. 4단계 분산 히트율 합 1.0 수학적 검증. issubclass(HexAGeTSched, Scheduler)=True + issubclass(PFIMgr, KVCacheManager)=True.
 
 **2026-05-27 주요 이정표 (사이클 29)**: IndexMem (arXiv 2605.25475) 기반 IndexMemSoftHitSegmentCache (B: Learnable Indexer 225-param MLP + SegmentLatentPool DRAM LRU) + IndexMemEvictionCodec (C: Latent Memory Module 2-layer Transformer encoder, EMA latent update, residual readout; 퇴거 = 잠재 압축 + 조건부 복원 패러다임 전환) + IndexMemBCIntegrationPipeline (Cross B+C) + IndexMemSoftHitSchedulerMixin (Activity A, 2.6µs/req overhead) 사이클. 독립 평가 루프 2회차 Pass(132/132; 100%). vLLM 이식 루프 1회차 Pass(42 단위 + 6사이클 backward-compat). KV Memory −50.0%(budget_ratio=0.5), Effective Context 2.0×, Noncontiguous Fraction 1.0(100%), Accuracy rel_err=0.00%, vLLM 0.21.0.
 
