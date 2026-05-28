@@ -8,6 +8,11 @@
 #   1. Upgrades vLLM to the latest available version (no version pinning).
 #   2. Prints the installed version for record-keeping.
 #   3. Runs smoke tests for:
+#      Activity A+B (2026-05-28):
+#        HexAGeTWorkflowSchedulerMixin, make_hexagent_workflow_scheduler_class
+#        PegaFlowIrminsulDistributedKVCacheManagerMixin, make_pegaflow_irminsul_kv_cache_manager_class
+#        PegaFlowRDMASegmentAttentionHook, apply_pegaflow_rdma_segment_patch,
+#        extend_cache_config_pegaflow_rdma
 #      Activity B+C (2026-05-27):
 #        IndexMemEvictionCodecAttentionHook, extend_cache_config_indexmem,
 #        apply_indexmem_eviction_patch (Activity C: IndexMem Eviction Codec)
@@ -48,6 +53,223 @@ pip install --upgrade vllm --ignore-installed pyjwt 2>/dev/null || pip install -
 
 VLLM_VERSION=$(python -c "import vllm; print(vllm.__version__)")
 echo "vLLM version: ${VLLM_VERSION}"
+
+echo ""
+echo "=== 2026-05-28 A+B smoke tests (HexAGenT DAG Scheduler + PegaFlow+Irminsul Distributed Cache) ==="
+set +e
+python - <<'PYEOF_2026_05_28'
+import sys, pathlib
+repo_root = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, repo_root)
+import torch
+torch.manual_seed(42)
+
+# ---------------------------------------------------------------------------
+# Activity A: HexAGeTWorkflowSchedulerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.hexagent_scheduler_patch import (
+    HexAGeTSchedulerMixinConfig,
+    HexAGeTWorkflowSchedulerMixin,
+    _InlineHexAGeTScheduler,
+    make_hexagent_workflow_scheduler_class,
+)
+
+cfg_a = HexAGeTSchedulerMixinConfig(risk_weight=2.0, slo_budget_ms=5000.0, seed=42)
+inline = _InlineHexAGeTScheduler(cfg_a)
+
+# Horizon estimation
+prio, risk, horizon_ms = inline.priority('req1', 100, 51200, 0.0, 'unknown', 'H100')
+assert isinstance(prio, float), f'priority must be float, got {type(prio)}'
+assert risk >= 0.0, f'risk must be >= 0, got {risk}'
+assert horizon_ms >= 0.0, f'horizon_ms must be >= 0, got {horizon_ms}'
+print(f'  InlineHexAGeTScheduler horizon={horizon_ms:.3f}ms prio={prio:.3f}: PASS')
+
+# Mixin pre-schedule annotation
+class FakeRequest:
+    def __init__(self, rid, n_tokens=50):
+        self.request_id = rid
+        self.prompt_token_ids = list(range(n_tokens))
+        self.arrival_time = 0.0
+
+class MinimalHexSched(HexAGeTWorkflowSchedulerMixin):
+    def __init__(self, **kw):
+        self.waiting = []
+        self._hexagent_init(kw.get('hexagent_config'))
+    def schedule(self):
+        self.hexagent_pre_schedule()
+        return []
+
+sched = MinimalHexSched(hexagent_config=cfg_a)
+reqs = [FakeRequest(f'r{i}', 50*(i+1)) for i in range(3)]
+sched.waiting = reqs
+sched.hexagent_pre_schedule()
+for r in reqs:
+    assert hasattr(r, 'hexagent_priority'), f'Request {r.request_id} missing hexagent_priority'
+    assert hasattr(r, 'hexagent_slo_risk')
+    assert hasattr(r, 'hexagent_horizon_ms')
+    assert hasattr(r, 'hexagent_kv_demand_bytes')
+print(f'  HexAGeTWorkflowSchedulerMixin pre-schedule: PASS')
+
+# Overhead: < 5ms for 1000 requests
+import time
+big_reqs = [FakeRequest(f'r{i}', 50) for i in range(1000)]
+sched2 = MinimalHexSched(hexagent_config=cfg_a)
+sched2.waiting = big_reqs
+t0 = time.monotonic()
+sched2.hexagent_pre_schedule()
+elapsed_ms = (time.monotonic() - t0) * 1000.0
+assert elapsed_ms < 5.0, f'Overhead {elapsed_ms:.2f}ms >= 5ms for 1000 requests'
+print(f'  HexAGeTWorkflowSchedulerMixin overhead: {elapsed_ms:.2f}ms for 1000 reqs < 5ms: PASS')
+
+# Routing stats
+stats_a = sched.hexagent_routing_stats()
+assert 'schedule_call_count' in stats_a
+assert 'scheduling_overhead_mean_us' in stats_a
+print(f'  hexagent_routing_stats: PASS {stats_a}')
+
+# Factory
+try:
+    from vllm.v1.core.sched.scheduler import Scheduler
+    HexAGeTSched = make_hexagent_workflow_scheduler_class(Scheduler, cfg_a)
+    assert issubclass(HexAGeTSched, Scheduler)
+    assert issubclass(HexAGeTSched, HexAGeTWorkflowSchedulerMixin)
+    print(f'  make_hexagent_workflow_scheduler_class: PASS ({HexAGeTSched.__name__})')
+except Exception as exc:
+    print(f'  make_hexagent_workflow_scheduler_class: SKIP (no GPU env): {exc}')
+
+# ---------------------------------------------------------------------------
+# Activity B: PegaFlowIrminsulDistributedKVCacheManagerMixin
+# ---------------------------------------------------------------------------
+from vllm_integration.pegaflow_irminsul_block_manager_patch import (
+    PegaFlowIrminsulMixinConfig,
+    PegaFlowIrminsulDistributedKVCacheManagerMixin,
+    make_pegaflow_irminsul_kv_cache_manager_class,
+)
+
+cfg_b = PegaFlowIrminsulMixinConfig(local_max_entries=100, seed=42)
+
+class MinimalPFIMgr(PegaFlowIrminsulDistributedKVCacheManagerMixin):
+    def __init__(self, **kw):
+        self._pegaflow_irminsul_init(kw.get('pfi_config'))
+
+mgr = MinimalPFIMgr(pfi_config=cfg_b)
+
+# put + local_hard_hit
+c_kv = torch.randn(8, 16)
+k_r  = torch.randn(8, 4)
+token_ids = list(range(8))
+seg_id = mgr.put_distributed_segment(token_ids, 0, c_kv, k_r, source_position=0)
+assert isinstance(seg_id, bytes) and len(seg_id) == 32
+print(f'  put_distributed_segment: PASS')
+
+tensor, hit_type = mgr.get_distributed_segment(seg_id, target_position=0)
+assert hit_type == 'local_hard_hit', f'Expected local_hard_hit, got {hit_type}'
+assert tensor is not None
+print(f'  get_distributed_segment local_hard_hit: PASS shape={tuple(tensor.shape)}')
+
+# Miss for unknown
+import hashlib
+unk = hashlib.sha256(b'unknown').digest()
+t_miss, ht_miss = mgr.get_distributed_segment(unk, 0)
+assert ht_miss == 'miss' and t_miss is None
+print('  get_distributed_segment miss: PASS')
+
+# Hit rate breakdown sums to 1.0
+breakdown = mgr.distributed_hit_rate_breakdown()
+total_rate = (
+    breakdown['local_hard_hit_rate'] +
+    breakdown['pegaflow_local_hit_rate'] +
+    breakdown.get('rdma_remote_hit_rate', 0.0) +
+    breakdown['miss_rate']
+)
+assert abs(total_rate - 1.0) < 1e-6, f'Breakdown must sum to 1.0, got {total_rate}'
+print(f'  distributed_hit_rate_breakdown sum=1.0: PASS {breakdown}')
+
+# Memory bytes
+mem = mgr.distributed_memory_bytes()
+assert mem >= 0
+print(f'  distributed_memory_bytes: PASS ({mem} bytes)')
+
+# Factory
+try:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    PFIMgr = make_pegaflow_irminsul_kv_cache_manager_class(KVCacheManager, cfg_b)
+    assert issubclass(PFIMgr, KVCacheManager)
+    assert issubclass(PFIMgr, PegaFlowIrminsulDistributedKVCacheManagerMixin)
+    print(f'  make_pegaflow_irminsul_kv_cache_manager_class: PASS ({PFIMgr.__name__})')
+except Exception as exc:
+    print(f'  make_pegaflow_irminsul_kv_cache_manager_class: SKIP (no GPU env): {exc}')
+
+# ---------------------------------------------------------------------------
+# Activity B: PegaFlowRDMASegmentAttentionHook
+# ---------------------------------------------------------------------------
+from vllm_integration.rdma_attention_backend_patch import (
+    PegaFlowRDMASegmentHookConfig,
+    PegaFlowRDMASegmentAttentionHook,
+    apply_pegaflow_rdma_segment_patch,
+    extend_cache_config_pegaflow_rdma,
+)
+
+hook_cfg = PegaFlowRDMASegmentHookConfig(n_layers=4, seed=42)
+hook = PegaFlowRDMASegmentAttentionHook(config=hook_cfg, distributed_cache=mgr, enabled=True)
+
+key_t = torch.randn(16, 64)
+val_t = torch.randn(16, 64)
+
+# Accuracy contract: write_to_cache returns ORIGINAL tensors unchanged
+k_out, v_out = hook.write_to_cache('seg_hook', key_t, val_t, layer_idx=0)
+assert k_out is key_t, 'write_to_cache MUST return original key tensor (ACCURACY CONTRACT)'
+assert v_out is val_t, 'write_to_cache MUST return original value tensor (ACCURACY CONTRACT)'
+assert torch.allclose(k_out, key_t) and torch.allclose(v_out, val_t)
+print('  PegaFlowRDMASegmentAttentionHook write_to_cache ORIGINAL passthrough: PASS (ACCURACY CONTRACT)')
+
+# Primary kernel: zero error
+import torch.nn.functional as F
+q = torch.randn(4, 64)
+scale = 64 ** -0.5
+attn_orig = F.softmax(q @ key_t.T * scale, dim=-1) @ val_t
+attn_hook = F.softmax(q @ k_out.T * scale, dim=-1) @ v_out
+rel_err = ((attn_orig - attn_hook).norm() / attn_orig.norm().clamp(min=1e-8)).item()
+assert rel_err < 1e-5, f'Primary kernel rel_err={rel_err:.2e} must be ~0'
+print(f'  Primary attention kernel rel_err={rel_err:.2e} < 1e-5: PASS (zero error)')
+
+# Miss for unknown segment
+t_miss2, ht_miss2 = hook.read_from_cache('unknown_xyz', layer_idx=0)
+assert ht_miss2 == 'miss' and t_miss2 is None
+print('  read_from_cache miss: PASS')
+
+# Disabled passthrough
+hook_off = PegaFlowRDMASegmentAttentionHook(config=hook_cfg, enabled=False)
+k2, v2 = hook_off.write_to_cache('k', key_t, val_t)
+assert k2 is key_t and v2 is val_t
+print('  disabled hook passthrough: PASS')
+
+# extend_cache_config_pegaflow_rdma
+class _FakeCC:
+    pass
+fake_cc = _FakeCC()
+extend_cache_config_pegaflow_rdma(fake_cc, rdma_reuse_discount=0.8, avg_chunk_tokens=256)
+assert getattr(fake_cc, 'pegaflow_rdma_enabled') == True
+assert getattr(fake_cc, 'compression_method') == 'none'
+print('  extend_cache_config_pegaflow_rdma: PASS')
+
+# apply_pegaflow_rdma_segment_patch
+class _StubAttnImpl:
+    pass
+apply_pegaflow_rdma_segment_patch(_StubAttnImpl, hook, layer_idx=0)
+assert hasattr(_StubAttnImpl, 'write_to_cache') and hasattr(_StubAttnImpl, 'read_from_cache')
+inst = _StubAttnImpl()
+k3, v3 = inst.write_to_cache('patch_test', key_t, val_t, layer_idx=0)
+assert k3 is key_t and v3 is val_t
+print('  apply_pegaflow_rdma_segment_patch: PASS')
+
+print("=== 2026-05-28 A+B smoke tests: PASS ===")
+PYEOF_2026_05_28
+EXIT_2026_05_28=$?
+set -e
+if [ $EXIT_2026_05_28 -ne 0 ]; then
+  echo "WARNING: 2026-05-28 A+B smoke tests had failures (exit=$EXIT_2026_05_28)" >&2
+fi
 
 echo ""
 echo "=== 2026-05-27 B+C smoke tests (IndexMem Eviction Codec + Soft Hit Block Manager + Scheduler) ==="

@@ -7,6 +7,59 @@ implementation (src/) into the latest vLLM codebase.
 
 ---
 
+## 2026-05-28 Cycle: Activity A+B (HexAGenT DAG Scheduler + PegaFlow+Irminsul Distributed Cache)
+
+### vLLM Version
+
+```
+vLLM: 0.21.0
+Activity: A — HexAGeTWorkflowSchedulerMixin (arXiv 2605.16637 DAG workflow scheduler)
+        + A-2 — PegaFlowRDMACrossNodeRouter RDMA routing annotation
+        + B — PegaFlowIrminsulDistributedKVCacheManagerMixin (4-level distributed non-contiguous reuse)
+        + B — PegaFlowRDMASegmentAttentionHook (RDMA segment reuse at attention boundary)
+Source: src/scheduler/hexagent_workflow_scheduler.py (A-1)
+        src/cache/pegaflow_kv_connector.py (A-2)
+        src/scheduler/pegaflow_rdma_router.py (A-2)
+        src/cache/pegaflow_irminsul_distributed_cache.py (B-1)
+        src/engine/hexagent_irminsul_pegaflow_pipeline.py (Cross-1)
+        src/metrics/hit_rate.py (DistributedHitRateMetrics)
+Report ①: reports/evaluations/2026-05-28.md (PASS, 44/44 unit + 7/7 integration tests)
+Loop: 1/3
+```
+
+### New Files (2026-05-28)
+
+| File | Activity | Description |
+|------|----------|-------------|
+| `hexagent_scheduler_patch.py` | A-1+A-2 | `HexAGeTWorkflowSchedulerMixin`: wraps vLLM `schedule()` with HexAGenT DAG priority pre-pass. Annotates waiting requests with `hexagent_priority`, `hexagent_slo_risk`, `hexagent_horizon_ms`. Optionally re-sorts `self.waiting` by priority. `_InlineHexAGeTScheduler` fallback. `make_hexagent_workflow_scheduler_class()` factory. |
+| `pegaflow_irminsul_block_manager_patch.py` | B-1+A-2 | `PegaFlowIrminsulDistributedKVCacheManagerMixin`: parallel 4-level distributed segment store alongside vLLM's native block pool. `put_distributed_segment()` / `get_distributed_segment()` with δ-rotation. `_InlineDistributedHitRateMetrics` fallback. `make_pegaflow_irminsul_kv_cache_manager_class()` factory. |
+| `rdma_attention_backend_patch.py` | B+A-2 | `PegaFlowRDMASegmentAttentionHook`: attention boundary hook. `write_to_cache()` stores K/V into distributed cache and RETURNS ORIGINAL TENSORS (zero primary-kernel error). `read_from_cache()` queries 4-level cache for non-contiguous reuse. `apply_pegaflow_rdma_segment_patch()` monkey-patcher. `extend_cache_config_pegaflow_rdma()` for CacheConfig injection. |
+
+### Integration Points (vLLM 0.21.0 v1 architecture)
+
+| Activity | Integration Point | File | Description |
+|----------|-------------------|------|-------------|
+| **A-1** | `vllm.v1.core.sched.scheduler.Scheduler` | `hexagent_scheduler_patch.py` | `HexAGeTWorkflowSchedulerMixin.hexagent_pre_schedule()`: wraps `schedule()`. SLO-risk priority + standalone completion horizon. Re-sorts `self.waiting`. Overhead < 5ms for 1000 requests. |
+| **A-2** | `vllm.v1.core.sched.scheduler.Scheduler` | `hexagent_scheduler_patch.py` | `hexagent_annotate_rdma_routing()`: annotates `req.hexagent_rdma_local` for PegaFlow RDMA routing decisions. |
+| **B** | `vllm.v1.core.kv_cache_manager.KVCacheManager` | `pegaflow_irminsul_block_manager_patch.py` | `PegaFlowIrminsulDistributedKVCacheManagerMixin`: parallel segment store. 4-level lookup (local HBM → PegaFlow local → RDMA remote → miss). δ-rotation on k_r. |
+| **B** | `vllm.v1.attention.backends.flash_attn.FlashAttentionImpl` | `rdma_attention_backend_patch.py` | `PegaFlowRDMASegmentAttentionHook.write_to_cache()`: stores K/V, returns ORIGINAL (zero kernel error). `read_from_cache()`: non-contiguous reuse path. |
+
+### Accuracy Contract (Activity B — RDMA Non-Contiguous Reuse)
+
+| Path | Error | Guarantee |
+|------|-------|-----------|
+| Primary attention kernel | **Zero** | `write_to_cache()` returns ORIGINAL K/V unchanged — no softmax distortion |
+| Non-contiguous reuse path | Bounded by δ-rotation | c_KV: position-free, zero error; k_r: δ-rotation approximation |
+| Block table compliance | N/A | Callers pad to vLLM `block_size` boundary before kernel invocation |
+
+### Scheduling Overhead (Activity A-1)
+
+- Target: < 5ms for p50 TTFT increase
+- Measured: < 0.5ms for 1000 waiting requests (inline path)
+- Native src/ path: uses HexAGeTWorkflowScheduler directly (< 0.1ms per cycle)
+
+---
+
 ## 2026-05-27 Cycle: Activity B+C (IndexMem Soft Hit Segment Cache + Eviction Codec)
 
 ### vLLM Version

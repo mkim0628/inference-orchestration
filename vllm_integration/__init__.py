@@ -1,4 +1,26 @@
-# vllm_integration: Activity A+C KV cache port for vLLM 0.21.0
+# vllm_integration: Activity A+B KV cache port for vLLM 0.21.0
+#
+# 2026-05-28 cycle additions:
+#   hexagent_scheduler_patch          — HexAGeTWorkflowSchedulerMixin (Activity A-1):
+#                                         HexAGenT (arXiv 2605.16637) online-public DAG
+#                                         workflow scheduler. SLO-risk-weighted priority
+#                                         + standalone completion horizon estimation.
+#                                         Wraps schedule() with hexagent_pre_schedule().
+#                                       + _InlineHexAGeTScheduler fallback (no src/).
+#                                       + make_hexagent_workflow_scheduler_class() factory.
+#   pegaflow_irminsul_block_manager_patch — PegaFlowIrminsulDistributedKVCacheManagerMixin
+#                                         (Activity B-1 + A-2):
+#                                         4-level distributed non-contiguous KV segment reuse:
+#                                         local HBM → PegaFlow local → RDMA remote → miss.
+#                                         δ-rotation on k_r (Irminsul MLA protocol).
+#                                         Parallel segment store alongside vLLM block pool.
+#                                       + make_pegaflow_irminsul_kv_cache_manager_class().
+#   rdma_attention_backend_patch      — PegaFlowRDMASegmentAttentionHook (Activity B+A-2):
+#                                         write_to_cache(): stores K/V, RETURNS ORIGINAL
+#                                         (zero primary kernel error — accuracy contract).
+#                                         read_from_cache(): 4-level distributed cache query.
+#                                       + apply_pegaflow_rdma_segment_patch() monkey-patcher.
+#                                       + extend_cache_config_pegaflow_rdma() CacheConfig helper.
 #
 # 2026-05-16 cycle additions:
 #   scheduler_patch       — NAtHDDROffloadingSchedulerMixin + NAtHDDROffloadingSchedulerConfig
