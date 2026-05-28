@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Literal
 
 
 @dataclass
@@ -119,4 +119,63 @@ class HitRateMetrics:
             "noncontiguous_fraction": self.noncontiguous_fraction(),
             "hit_chunks": self.hit_chunks,
             "miss_chunks": self.total_chunks - self.hit_chunks,
+        }
+
+
+@dataclass
+class DistributedHitRateMetrics:
+    """4-level distributed non-contiguous hit rate metrics.
+
+    Tracks local HBM, PegaFlow local, RDMA remote, and miss counts.
+    Independent of WeightedHitRateMetrics and HitRateMetrics.
+    """
+
+    total_lookups: int = 0
+    local_hard_hits: int = 0
+    pegaflow_local_hits: int = 0
+    rdma_remote_hits: int = 0
+
+    def record(self, hit_type: str) -> None:
+        """Record one lookup result.
+
+        hit_type: "local_hard_hit" | "pegaflow_local_hit" | "rdma_remote_hit" | "miss"
+        """
+        self.total_lookups += 1
+        if hit_type == "local_hard_hit":
+            self.local_hard_hits += 1
+        elif hit_type == "pegaflow_local_hit":
+            self.pegaflow_local_hits += 1
+        elif hit_type == "rdma_remote_hit":
+            self.rdma_remote_hits += 1
+
+    def distributed_hit_rate(self) -> float:
+        """(local + pegaflow_local + rdma_remote) / total."""
+        if self.total_lookups == 0:
+            return 0.0
+        return (
+            self.local_hard_hits + self.pegaflow_local_hits + self.rdma_remote_hits
+        ) / self.total_lookups
+
+    def noncontiguous_rdma_fraction(self) -> float:
+        """RDMA remote hits / total hits. 0.0 means no distributed reuse."""
+        total_hits = self.local_hard_hits + self.pegaflow_local_hits + self.rdma_remote_hits
+        if total_hits == 0:
+            return 0.0
+        return self.rdma_remote_hits / total_hits
+
+    def reset(self) -> None:
+        self.total_lookups = 0
+        self.local_hard_hits = 0
+        self.pegaflow_local_hits = 0
+        self.rdma_remote_hits = 0
+
+    def summary(self) -> dict:
+        return {
+            "local_hard_hit_rate": self.local_hard_hits / max(1, self.total_lookups),
+            "pegaflow_local_hit_rate": self.pegaflow_local_hits / max(1, self.total_lookups),
+            "rdma_remote_hit_rate": self.rdma_remote_hits / max(1, self.total_lookups),
+            "miss_rate": 1.0 - self.distributed_hit_rate(),
+            "distributed_hit_rate": self.distributed_hit_rate(),
+            "noncontiguous_rdma_fraction": self.noncontiguous_rdma_fraction(),
+            "total_lookups": self.total_lookups,
         }

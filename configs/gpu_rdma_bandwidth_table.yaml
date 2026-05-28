@@ -1,0 +1,10 @@
+# A100/H100/H200 RDMA bandwidth pre-measured values (GB/s)
+# Replace with actual cluster measurements. Current values are theory-based defaults.
+rdma_bandwidth_gbps:
+  A100_to_A100: 200.0    # InfiniBand HDR (200 Gbps)
+  A100_to_H100: 200.0
+  A100_to_H200: 200.0
+  H100_to_H100: 400.0    # InfiniBand NDR (400 Gbps)
+  H100_to_H200: 400.0
+  H200_to_H200: 800.0    # NVLink 900 GB/s inter-node estimate
+  default: 100.0          # Fallback for unregistered GPU pairs
