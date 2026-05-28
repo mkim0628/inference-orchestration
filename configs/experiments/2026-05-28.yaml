@@ -1,0 +1,51 @@
+experiment:
+  date: "2026-05-28"
+  activity: "A+B"
+  cache_type: "pegaflow_irminsul_distributed"
+  compression_method: "none"
+  scheduler_type: "hexagent_workflow"
+  seed: 42
+
+# Activity A-1: HexAGenT Workflow Scheduler
+hexagent_scheduler:
+  schedule_cycle_ms: 50.0
+  risk_weight: 2.0
+  alpha_gpu_affinity: 0.5
+  heartbeat_interval_ms: 100.0
+  kv_size_per_token_bytes: 512
+  n_layers: 32
+  ema_decay: 0.9
+  rdma_bandwidth_table_path: "configs/gpu_rdma_bandwidth_table.yaml"
+
+# Activity A-2: PegaFlow KV Connector
+pegaflow_connector:
+  socket_path: "/tmp/pegaflow.sock"
+  async_put: true
+  timeout_ms: 100
+  use_mock: true
+
+# Activity A-2: PegaFlow RDMA Router
+pegaflow_rdma_router:
+  peer_nodes_config_path: "configs/pegaflow_peer_nodes.yaml"
+  bloom_filter_capacity: 100000
+  bloom_filter_error_rate: 0.01
+  bloom_sync_interval_ms: 500.0
+  rdma_reuse_discount: 0.8
+
+# Activity B-1: Distributed Non-Contiguous Segment Cache
+distributed_segment_cache:
+  rdma_reuse_discount: 0.8
+  bloom_sync_interval_ms: 500.0
+  local_max_entries: 5000
+  avg_chunk_size: 256
+
+# Cross-1 A+B Pipeline
+cross_ab_pipeline:
+  prefetch_confidence_threshold: 0.7
+  prefetch_hbm_budget_ratio: 0.10
+  async_prefetch: true
+
+# Metrics output paths
+metrics:
+  output_dir: "results/2026-05-28"
+  metrics_file: "results/2026-05-28/metrics.json"

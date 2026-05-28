@@ -1,0 +1,12 @@
+# Peer node registry for PegaFlow RDMA cross-node routing.
+# Use empty list for single-node / test environments.
+peer_nodes: []
+
+# Multi-node cluster example:
+# peer_nodes:
+#   - node_id: "node-1"
+#     rdma_address: "192.168.1.101"
+#     port: 9000
+#   - node_id: "node-2"
+#     rdma_address: "192.168.1.102"
+#     port: 9000
