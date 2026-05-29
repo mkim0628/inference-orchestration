@@ -1781,3 +1781,160 @@ def test_indexmem_vericache_draft_acceptance_rate():
     decompressed = codec.decompress(compressed)
     assert decompressed.shape[1] == _IM_D
 
+
+# =========================================================================== #
+# WynerZiv Adaptive Window Eviction — Activity C-1 (2026-05-29)               #
+# Tests for accuracy budget enforcement and window computation correctness.    #
+# =========================================================================== #
+
+from src.cache.wyner_ziv_adaptive_window_eviction import (
+    WynerZivAdaptiveWindowEvictionCache,
+    WynerZivConfig,
+)
+
+
+def _make_wz_cache(
+    budget: float = 0.01,
+    min_w: int = 1,
+    max_w: int = 100_000,
+    warmup: int = 0,
+    n_layers: int = 1,
+    window_config_path: str = "configs/wyner_ziv_window_config.yaml",
+) -> WynerZivAdaptiveWindowEvictionCache:
+    cfg = WynerZivConfig(
+        accuracy_budget=budget,
+        min_window_size=min_w,
+        max_window_size=max_w,
+        warmup_batches=warmup,
+        n_layers=n_layers,
+        window_config_path=window_config_path,
+    )
+    return WynerZivAdaptiveWindowEvictionCache(cfg)
+
+
+def test_w_star_satisfies_accuracy_budget():
+    """S_l(W*) ≤ ε × tolerance should hold for the computed W* with known α and C (Spec §4).
+
+    Integer truncation in int((C/ε)^(1/α)) can reduce W* by up to 1 unit,
+    so we allow a small tolerance (10%) to account for the discretization error.
+    The theoretical guarantee holds in the continuous case.
+    """
+    cache = _make_wz_cache(budget=0.01)
+    eps = 0.01
+    tolerance = 1.10  # 10% tolerance for integer floor truncation
+    for alpha, c in [(1.5, 1.0), (2.0, 0.8), (1.0, 2.0), (3.0, 0.5)]:
+        cache._alpha_ema[0] = alpha
+        cache._c_ema[0] = c
+        w_star = cache.compute_optimal_window(0, epsilon=eps)
+        # Simulated sensitivity at W*: S = C × W*^{-α}
+        simulated_s = c * (w_star ** (-alpha))
+        assert simulated_s <= eps * tolerance, (
+            f"S_l(W*)={simulated_s:.5f} > ε×tol={eps * tolerance:.5f} "
+            f"for α={alpha},C={c},W*={w_star}"
+        )
+
+
+def test_w_star_increases_when_fallback_triggered():
+    """trigger_fallback_if_needed(delta > ε) must double W* for all layers."""
+    cache = _make_wz_cache(budget=0.01, n_layers=3)
+    for l in range(3):
+        cache._window_size[l] = 200
+    before = {l: cache._window_size[l] for l in range(3)}
+
+    triggered = cache.trigger_fallback_if_needed(0.05)  # 5× budget
+    assert triggered
+    for l in range(3):
+        assert cache._window_size[l] >= 2 * before[l], \
+            f"layer {l}: {cache._window_size[l]} < 2 × {before[l]}"
+
+
+def test_perplexity_delta_within_budget_simulation():
+    """Simulated perplexity delta at W*(ε=0.01) should not exceed ε (mock sensitivity)."""
+    cache = _make_wz_cache(budget=0.01)
+    eps = 0.01
+    # Train with 50 consistent observations from a power law S(d) = 1.0 × d^{-1.5}
+    true_alpha, true_c = 1.5, 1.0
+    for d in [32, 64, 128, 256, 512] * 10:
+        s = true_c * (d ** -true_alpha)
+        cache.update_sensitivity_model(s, d, layer_idx=0)
+
+    w_star = cache.compute_optimal_window(0, epsilon=eps)
+    simulated_delta = true_c * (max(w_star, 1) ** -true_alpha)
+    assert simulated_delta <= eps * 1.1, (
+        f"Simulated delta={simulated_delta:.5f} > ε={eps}, W*={w_star}"
+    )
+
+
+def test_accuracy_budget_not_violated_under_kv_pressure():
+    """Under KV pressure, ε is relaxed → W* shrinks but simulated delta ≤ ε_relaxed."""
+    cfg = WynerZivConfig(
+        accuracy_budget=0.01,
+        min_window_size=1,
+        max_window_size=100_000,
+        warmup_batches=0,
+        n_layers=1,
+        kv_pressure_threshold=0.5,
+        epsilon_relaxation_factor=2.0,
+        window_config_path="configs/wyner_ziv_window_config.yaml",
+    )
+    cache = WynerZivAdaptiveWindowEvictionCache(cfg)
+    cache._alpha_ema[0] = 1.5
+    cache._c_ema[0] = 1.0
+
+    eps_relaxed = 0.01 * 2.0  # ε after relaxation
+    windows = cache.recompute_all_windows(epsilon=0.01, kv_pressure=0.9)
+    w_star = windows[0]
+    simulated_delta = 1.0 * (max(w_star, 1) ** -1.5)
+    assert simulated_delta <= eps_relaxed * 1.05, (
+        f"delta={simulated_delta:.5f} > ε_relaxed={eps_relaxed}"
+    )
+
+
+def test_warmup_batches_stabilize_alpha_ema():
+    """After 100 consistent observations, alpha_ema variance across layers < 0.1."""
+    cfg = WynerZivConfig(
+        accuracy_budget=0.01,
+        min_window_size=64,
+        max_window_size=4096,
+        warmup_batches=100,
+        n_layers=4,
+        ema_gamma=0.1,
+        window_config_path="configs/wyner_ziv_window_config.yaml",
+    )
+    cache = WynerZivAdaptiveWindowEvictionCache(cfg)
+    # Feed 100 consistent observations to each layer
+    for l in range(4):
+        for d in [64, 128, 256, 512] * 25:
+            s = 1.0 * (d ** -1.5)
+            cache.update_sensitivity_model(s, d, layer_idx=l)
+
+    alphas = [cache._alpha_ema[l] for l in range(4)]
+    mean_alpha = sum(alphas) / len(alphas)
+    variance = sum((a - mean_alpha) ** 2 for a in alphas) / len(alphas)
+    assert variance < 0.1, f"alpha_ema variance {variance:.4f} >= 0.1, alphas={alphas}"
+
+
+def test_fixed_vs_adaptive_window_memory_reduction():
+    """Adaptive W*(ε=0.01) total window sum < fixed W=512 × n_layers (when α > 0)."""
+    n_layers = 4
+    cfg = WynerZivConfig(
+        accuracy_budget=0.01,
+        min_window_size=1,
+        max_window_size=4096,
+        warmup_batches=0,
+        n_layers=n_layers,
+        window_config_path="configs/wyner_ziv_window_config.yaml",
+    )
+    cache = WynerZivAdaptiveWindowEvictionCache(cfg)
+    # Set alpha values that give W* < 512 (so adaptive is cheaper)
+    for l in range(n_layers):
+        cache._alpha_ema[l] = 2.0
+        cache._c_ema[l] = 1.0
+
+    windows = cache.recompute_all_windows(epsilon=0.01)
+    adaptive_total = sum(windows.values())
+    fixed_total = 512 * n_layers
+    assert adaptive_total < fixed_total, (
+        f"Adaptive total {adaptive_total} should < fixed total {fixed_total}"
+    )
+

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Literal
+from typing import Dict, List, Literal
 
 
 @dataclass
@@ -179,3 +179,62 @@ class DistributedHitRateMetrics:
             "noncontiguous_rdma_fraction": self.noncontiguous_rdma_fraction(),
             "total_lookups": self.total_lookups,
         }
+
+
+@dataclass
+class SafetyGatedHitRateMetrics:
+    """5-level safety gate hit rate metrics. Independent of other metrics classes."""
+    total_lookups: int = 0
+    safe_reuse_hits: int = 0
+    partial_reuse_hits: int = 0
+    gate_rejections: int = 0
+    stale_evictions: int = 0
+    misses: int = 0
+
+    def record(self, outcome: str) -> None:
+        """Record a single lookup outcome (HitOutcome literal value)."""
+        self.total_lookups += 1
+        if outcome == "safe_reuse_hit":
+            self.safe_reuse_hits += 1
+        elif outcome == "partial_reuse_hit":
+            self.partial_reuse_hits += 1
+        elif outcome == "gate_rejected":
+            self.gate_rejections += 1
+        elif outcome == "stale_evicted":
+            self.stale_evictions += 1
+        else:
+            self.misses += 1
+
+    def safety_gate_pass_rate(self) -> float:
+        """safe_reuse / (safe_reuse + gate_rejected + stale_evicted). Target: ≥80%."""
+        denom = self.safe_reuse_hits + self.gate_rejections + self.stale_evictions
+        return self.safe_reuse_hits / denom if denom > 0 else 0.0
+
+    def effective_hit_rate(self) -> float:
+        """(safe_reuse + partial_reuse) / total_lookups."""
+        if self.total_lookups == 0:
+            return 0.0
+        return (self.safe_reuse_hits + self.partial_reuse_hits) / self.total_lookups
+
+    def stale_eviction_rate(self) -> float:
+        return self.stale_evictions / self.total_lookups if self.total_lookups > 0 else 0.0
+
+    def summary(self) -> dict:
+        return {
+            "total_lookups": self.total_lookups,
+            "safe_reuse_hit_rate": self.safe_reuse_hits / max(1, self.total_lookups),
+            "partial_reuse_hit_rate": self.partial_reuse_hits / max(1, self.total_lookups),
+            "gate_rejection_rate": self.gate_rejections / max(1, self.total_lookups),
+            "stale_eviction_rate": self.stale_eviction_rate(),
+            "miss_rate": self.misses / max(1, self.total_lookups),
+            "safety_gate_pass_rate": self.safety_gate_pass_rate(),
+            "effective_hit_rate": self.effective_hit_rate(),
+        }
+
+    def reset(self) -> None:
+        self.total_lookups = 0
+        self.safe_reuse_hits = 0
+        self.partial_reuse_hits = 0
+        self.gate_rejections = 0
+        self.stale_evictions = 0
+        self.misses = 0

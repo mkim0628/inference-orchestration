@@ -1,0 +1,44 @@
+experiment:
+  date: "2026-05-29"
+  activity: "B+C"
+  cache_type: "grounded_safety_gated"        # Activity B-1
+  compression_method: "wyner_ziv_adaptive_window"  # Activity C-1
+  scheduler_type: "default"                  # Activity A not included
+  seed: 42
+
+# Activity C-1: WynerZiv Adaptive Window Eviction
+wyner_ziv:
+  accuracy_budget: 0.01                      # ε: perplexity delta upper bound (1%)
+  min_window_size: 64
+  max_window_size: 4096
+  fitting_interval: 1000                     # W* recompute period (batches)
+  sensitivity_sample_ratio: 0.05             # 5% of batches measure sensitivity
+  ema_gamma: 0.1                             # α_l EMA coefficient (slow update)
+  warmup_batches: 100
+  kv_pressure_threshold: 0.8
+  epsilon_relaxation_factor: 2.0
+  n_layers: 32
+  truncation_distances: [32, 64, 128, 256, 512]
+  window_config_path: "configs/wyner_ziv_window_config.yaml"
+
+# Activity B-1: GroundedSafetyGated Segment Cache
+grounded_safety_gated:
+  gate_thresholds:
+    content_sim_threshold: 0.85              # Gate 1: n-gram Jaccard
+    evidence_overlap_threshold: 0.60         # Gate 2: TF-IDF Jaccard
+    attn_support_threshold: 0.50             # Gate 4: cosine similarity
+    ngram_n: 3
+    tfidf_top_k: 20
+  chunk_size: 128
+  max_entries: 1000
+
+# Cross-1 B+C Pipeline
+bc_pipeline:
+  shared_accuracy_budget: 0.01              # shared ε budget for B-1 + C-1
+  perplexity_sample_ratio: 0.01             # 1% of requests trigger ε monitoring
+  auto_fallback: true
+
+# Metrics output
+metrics:
+  output_dir: "results/2026-05-29"
+  metrics_file: "results/2026-05-29/metrics.json"

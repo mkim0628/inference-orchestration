@@ -1,0 +1,16 @@
+# Wyner-Ziv Adaptive Window Eviction — per-layer initial parameters.
+# C_l_init, alpha_l_init: initial values for the Wyner-Ziv power-law fit.
+#   α ~ 1~3 is the normal range (lower α → less steep decay → larger W*).
+# window_size: initial sliding window size used before warmup completes.
+#   After warmup_batches, W*(ε) replaces this value.
+layer_defaults:
+  C_l_init: 1.0
+  alpha_l_init: 1.5    # polynomial exponent initial value
+  window_size: 512     # initial window size (pre-warmup)
+
+# Optional per-layer overrides.  Leave empty to use layer_defaults for all layers.
+# Example:
+#   layer_overrides:
+#     0: {C_l_init: 1.2, alpha_l_init: 1.0, window_size: 1024}
+#     31: {C_l_init: 0.8, alpha_l_init: 2.0, window_size: 256}
+layer_overrides: {}
