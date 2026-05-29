@@ -31,7 +31,7 @@ class WynerZivConfig:
     max_window_size: int = 4096             # W* upper clamp
     fitting_interval: int = 1000            # W* recompute period (batches)
     sensitivity_sample_ratio: float = 0.05  # fraction of batches to measure sensitivity
-    ema_gamma: float = 0.1                  # EMA coefficient for α_l / C_l
+    ema_gamma: float = 0.1                  # EMA coefficient for α_l / C_l (slow update)
     warmup_batches: int = 100               # batches before W* is used (use max_window_size)
     kv_pressure_threshold: float = 0.8      # KV memory pressure threshold
     epsilon_relaxation_factor: float = 2.0  # ε multiplier under KV pressure
@@ -74,10 +74,15 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
     # ------------------------------------------------------------------ #
 
     def _init_from_config(self) -> None:
-        """Load per-layer (C_l_init, alpha_l_init, window_size) from YAML config."""
+        """Load per-layer (C_l_init, alpha_l_init, window_size) from YAML config.
+
+        During warmup, max_window_size is used regardless of config file value
+        to avoid premature eviction before α/C estimates stabilize.
+        """
         c_default = 1.0
         alpha_default = 1.5
-        window_default = self._config.max_window_size  # use max during warmup
+        # During warmup we always use max_window_size
+        window_default = self._config.max_window_size
 
         layer_overrides: Dict = {}
         config_path = self._config.window_config_path
@@ -88,14 +93,15 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
                 defaults = cfg_yaml.get("layer_defaults", {})
                 c_default = defaults.get("C_l_init", c_default)
                 alpha_default = defaults.get("alpha_l_init", alpha_default)
-                window_default = defaults.get("window_size", window_default)
+                # window_size from yaml is post-warmup default; still use max during warmup
                 layer_overrides = cfg_yaml.get("layer_overrides") or {}
 
         for l in range(self._config.n_layers):
             override = layer_overrides.get(l, {}) or {}
             self._alpha_ema[l] = override.get("alpha_l_init", alpha_default)
             self._c_ema[l] = override.get("C_l_init", c_default)
-            self._window_size[l] = override.get("window_size", window_default)
+            # Use max_window_size during warmup (Spec.md EMA warmup requirement)
+            self._window_size[l] = window_default
             self._kv_store[l] = OrderedDict()
 
     # ------------------------------------------------------------------ #
@@ -125,7 +131,7 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
             self.update_sensitivity_model(perplexity_delta, len(window), layer_idx)
 
         self._batch_count += 1
-        # Check warmup completion
+        # Check warmup completion once threshold is crossed
         if not self._warmup_done and self._batch_count >= self._config.warmup_batches:
             self._warmup_done = True
             self.recompute_all_windows()
@@ -137,7 +143,7 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         ):
             self.recompute_all_windows()
 
-        # Evict excess tokens
+        # Evict excess tokens beyond current window
         w_max = self._window_size[layer_idx]
         while len(window) > w_max:
             self._evict_oldest(layer_idx)
@@ -156,7 +162,6 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         """Evict oldest token from the largest layer window; return bytes freed."""
         if not self._kv_store:
             return 0
-        # Find the layer with the most entries
         largest_layer = max(self._kv_store, key=lambda l: len(self._kv_store[l]))
         return self._evict_oldest(largest_layer)
 
@@ -185,12 +190,13 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         truncation_length: int,
         layer_idx: int = 0,
     ) -> None:
-        """EMA update of power-law parameters for layer l.
+        """EMA update of power-law parameters (α_l, C_l) for layer l.
 
         Power law: S_l(d) = C_l × d^{-α_l}
-        Single measurement estimate:
-          α_measured = -log(S) / log(d)   (assuming C=1 for α estimation)
+        Single measurement estimate from (perplexity_delta, truncation_length):
+          α_measured = -log(S) / log(d)
           C_measured  = S × d^α_measured
+        EMA with γ=0.1 suppresses variance (slow update per Spec.md).
         """
         if truncation_length <= 1 or perplexity_delta <= 0:
             return
@@ -198,7 +204,7 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         safe_delta = max(perplexity_delta, 1e-9)
         log_d = math.log(max(truncation_length, 1))
         alpha_measured = max(0.1, -math.log(safe_delta) / log_d)
-        c_measured = perplexity_delta * (truncation_length ** alpha_measured)
+        c_measured = safe_delta * (truncation_length ** alpha_measured)
 
         gamma = self._config.ema_gamma
         prev_alpha = self._alpha_ema.get(layer_idx, 1.5)
@@ -211,7 +217,11 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         layer_idx: int,
         epsilon: Optional[float] = None,
     ) -> int:
-        """W*_l(ε) = (C_l / ε)^(1/α_l), clamped to [min_window_size, max_window_size]."""
+        """Compute W*_l(ε) = (C_l / ε)^(1/α_l), clamped to [min_window_size, max_window_size].
+
+        Global W* = max_l W*_l ensures the most sensitive layer drives the bound.
+        Layer-wise application: window_size[l] = W*_l for independent sizing.
+        """
         eps = epsilon if epsilon is not None else self._config.accuracy_budget
         alpha = self._alpha_ema.get(layer_idx, 1.5)
         c = self._c_ema.get(layer_idx, 1.0)
@@ -219,7 +229,13 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         if alpha <= 0 or eps <= 0:
             return self._config.max_window_size
 
-        w_star = int((c / eps) ** (1.0 / alpha))
+        try:
+            # Use ceiling to preserve the S_l(W*) ≤ ε guarantee:
+            # int() (floor) can produce W* s.t. S(W*) > ε for small values.
+            w_star = math.ceil((c / eps) ** (1.0 / alpha))
+        except (OverflowError, ZeroDivisionError):
+            return self._config.max_window_size
+
         return max(
             self._config.min_window_size,
             min(w_star, self._config.max_window_size),
@@ -234,6 +250,7 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
 
         Under KV pressure (kv_pressure > kv_pressure_threshold),
         apply ε_relaxed = ε × epsilon_relaxation_factor to allow smaller windows.
+        Called automatically every fitting_interval batches after warmup.
         """
         eps = epsilon if epsilon is not None else self._config.accuracy_budget
         if (
@@ -253,9 +270,10 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         self,
         observed_perplexity_delta: float,
     ) -> bool:
-        """If observed delta > ε, double all window sizes (fallback).
+        """If observed delta > ε, double all window sizes (accuracy fallback).
 
-        Returns True if fallback was triggered.
+        Returns True if fallback was triggered, False otherwise.
+        Window is clamped to max_window_size to prevent unbounded growth.
         """
         if observed_perplexity_delta > self._config.accuracy_budget:
             for l in list(self._window_size.keys()):
@@ -268,7 +286,7 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
         return False
 
     def get_stats(self) -> dict:
-        """Return current state summary."""
+        """Return current state summary dict."""
         return {
             "window_sizes": dict(self._window_size),
             "alpha_ema": dict(self._alpha_ema),
@@ -285,13 +303,11 @@ class WynerZivAdaptiveWindowEvictionCache(CacheStore):
     # ------------------------------------------------------------------ #
 
     def _evict_oldest(self, layer_idx: int) -> int:
-        """Evict the oldest (first) entry from the given layer's window."""
+        """Evict the oldest (first inserted) entry from the given layer's window."""
         window = self._kv_store.get(layer_idx)
         if not window:
             return 0
-        _, oldest_val = next(iter(window.items()))
-        bytes_freed = oldest_val.nbytes
-        # Remove the first key (oldest in insertion order)
         oldest_key = next(iter(window))
+        bytes_freed = window[oldest_key].nbytes
         del window[oldest_key]
         return bytes_freed
